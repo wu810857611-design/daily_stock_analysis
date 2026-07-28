@@ -1,0 +1,457 @@
+name: 分钟级盘中模拟监控
+
+on:
+  schedule:
+    # GitHub cron 使用 UTC；刻意避开整点，降低排队延迟概率。
+    - cron: '17 1 * * 1-5'   # 北京时间 09:17，覆盖 A/H 上午交易
+    - cron: '47 4 * * 1-5'   # 北京时间 12:47，覆盖 A/H 下午交易
+  workflow_dispatch:
+    inputs:
+      session:
+        description: '监控时段'
+        required: true
+        default: auto
+        type: choice
+        options:
+          - auto
+          - morning
+          - afternoon
+      max_cycles:
+        description: '测试轮数；0 表示运行到该时段绝对结束时间'
+        required: false
+        default: '0'
+        type: string
+
+concurrency:
+  group: intraday-session-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    environment: STOCK_LIST
+    timeout-minutes: 210
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v5
+
+      - name: 设置 Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: 安装轻量监控依赖
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install 'exchange-calendars>=4.13.0'
+
+      - name: 创建目录并确定时段
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p data/intraday reports logs
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            case "${{ github.event.schedule }}" in
+              "17 1 * * 1-5") SESSION="morning" ;;
+              "47 4 * * 1-5") SESSION="afternoon" ;;
+              *) SESSION="auto" ;;
+            esac
+            MAX_CYCLES="0"
+          else
+            SESSION="${{ github.event.inputs.session || 'auto' }}"
+            MAX_CYCLES="${{ github.event.inputs.max_cycles || '0' }}"
+          fi
+          echo "SESSION=$SESSION" >> "$GITHUB_ENV"
+          echo "MAX_CYCLES=$MAX_CYCLES" >> "$GITHUB_ENV"
+          echo "监控时段: $SESSION；测试轮数: $MAX_CYCLES"
+
+      - name: 恢复最近收盘数据库
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            data/stock_analysis.db
+            data/paper_trade/
+          key: intraday-close-reference-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            paper-close-state-
+
+      - name: 缓存缺失时恢复最新收盘数据库备份
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          STATE_BRANCH: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [ -f data/stock_analysis.db ]; then
+            echo "✅ 已从 Actions cache 恢复收盘数据库"
+          else
+            STATE_TMP_DIR="$(mktemp -d)"
+            gh api --method GET \
+              -H "Accept: application/vnd.github+json" \
+              "/repos/${GITHUB_REPOSITORY}/actions/artifacts?name=paper-close-state&per_page=100" \
+              > "$STATE_TMP_DIR/artifacts.json"
+            ARTIFACT_ID="$(
+              python3 - "$STATE_TMP_DIR/artifacts.json" "$STATE_BRANCH" <<'PY'
+          import json
+          import sys
+
+          path, branch = sys.argv[1:3]
+          with open(path, encoding="utf-8") as handle:
+              artifacts = json.load(handle).get("artifacts", [])
+          candidates = [
+              item for item in artifacts
+              if not item.get("expired")
+              and item.get("name") == "paper-close-state"
+              and (item.get("workflow_run") or {}).get("head_branch") == branch
+          ]
+          candidates.sort(key=lambda item: item.get("created_at", ""), reverse=True)
+          print(candidates[0]["id"] if candidates else "")
+          PY
+            )"
+            if [ -n "$ARTIFACT_ID" ]; then
+              mkdir -p "$STATE_TMP_DIR/unpacked"
+              gh api \
+                -H "Accept: application/vnd.github+json" \
+                "/repos/${GITHUB_REPOSITORY}/actions/artifacts/${ARTIFACT_ID}/zip" \
+                > "$STATE_TMP_DIR/state.zip"
+              unzip -q "$STATE_TMP_DIR/state.zip" -d "$STATE_TMP_DIR/unpacked"
+              test -f "$STATE_TMP_DIR/unpacked/paper-close-state.tar.gz"
+              python3 - "$STATE_TMP_DIR/unpacked/paper-close-state.tar.gz" "$GITHUB_WORKSPACE" <<'PY'
+          import pathlib
+          import sys
+          import tarfile
+
+          archive_path, workspace = sys.argv[1:3]
+          with tarfile.open(archive_path, "r:gz") as archive:
+              selected = []
+              for member in archive.getmembers():
+                  path = pathlib.PurePosixPath(member.name)
+                  allowed = member.name == "data/stock_analysis.db"
+                  if (
+                      path.is_absolute()
+                      or ".." in path.parts
+                      or member.issym()
+                      or member.islnk()
+                  ):
+                      raise SystemExit(f"unsafe close-state entry: {member.name}")
+                  if allowed:
+                      selected.append(member)
+              if not selected:
+                  raise SystemExit("paper-close-state 中缺少 stock_analysis.db")
+              archive.extractall(workspace, members=selected)
+          PY
+              echo "✅ 已从同分支最新 paper-close-state artifact 恢复数据库"
+            else
+              echo "::warning::没有可恢复的收盘数据库；本轮仅执行日内涨跌监控并明确降级"
+            fi
+          fi
+
+          if [ -f data/stock_analysis.db ]; then
+            python3 - <<'PY'
+          import sqlite3
+
+          connection = sqlite3.connect("file:data/stock_analysis.db?mode=ro", uri=True)
+          try:
+              result = connection.execute("PRAGMA quick_check").fetchone()
+              if not result or result[0] != "ok":
+                  raise SystemExit(f"SQLite quick_check failed: {result}")
+          finally:
+              connection.close()
+          PY
+            echo "✅ 收盘数据库完整性校验通过"
+          fi
+
+      - name: 恢复全市场候选计划缓存
+        uses: actions/cache/restore@v4
+        with:
+          path: data/market_scan/
+          key: market-scan-state-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            market-scan-state-
+
+      - name: 缓存缺失时恢复最新候选计划备份
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          STATE_BRANCH: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [ -f data/market_scan/latest.json ]; then
+            echo "✅ 已恢复全市场候选计划"
+            exit 0
+          fi
+          SCAN_TMP_DIR="$(mktemp -d)"
+          gh api --method GET \
+            -H "Accept: application/vnd.github+json" \
+            "/repos/${GITHUB_REPOSITORY}/actions/artifacts?name=market-scan-state&per_page=100" \
+            > "$SCAN_TMP_DIR/artifacts.json"
+          ARTIFACT_ID="$(
+            python3 - "$SCAN_TMP_DIR/artifacts.json" "$STATE_BRANCH" <<'PY'
+          import json
+          import sys
+
+          path, branch = sys.argv[1:3]
+          with open(path, encoding="utf-8") as handle:
+              artifacts = json.load(handle).get("artifacts", [])
+          candidates = [
+              item for item in artifacts
+              if not item.get("expired")
+              and item.get("name") == "market-scan-state"
+              and (item.get("workflow_run") or {}).get("head_branch") == branch
+          ]
+          candidates.sort(key=lambda item: item.get("created_at", ""), reverse=True)
+          print(candidates[0]["id"] if candidates else "")
+          PY
+          )"
+          if [ -z "$ARTIFACT_ID" ]; then
+            echo "ℹ️ 尚无同分支 market-scan-state；本轮只监控原配置标的"
+            exit 0
+          fi
+          mkdir -p "$SCAN_TMP_DIR/unpacked"
+          gh api \
+            -H "Accept: application/vnd.github+json" \
+            "/repos/${GITHUB_REPOSITORY}/actions/artifacts/${ARTIFACT_ID}/zip" \
+            > "$SCAN_TMP_DIR/state.zip"
+          unzip -q "$SCAN_TMP_DIR/state.zip" -d "$SCAN_TMP_DIR/unpacked"
+          test -f "$SCAN_TMP_DIR/unpacked/market-scan-state.tar.gz"
+          python3 - "$SCAN_TMP_DIR/unpacked/market-scan-state.tar.gz" "$GITHUB_WORKSPACE" <<'PY'
+          import pathlib
+          import sys
+          import tarfile
+
+          archive_path, workspace = sys.argv[1:3]
+          with tarfile.open(archive_path, "r:gz") as archive:
+              selected = []
+              for member in archive.getmembers():
+                  path = pathlib.PurePosixPath(member.name)
+                  allowed = (
+                      member.name == "data/market_scan"
+                      or member.name.startswith("data/market_scan/")
+                  )
+                  if (
+                      path.is_absolute()
+                      or ".." in path.parts
+                      or member.issym()
+                      or member.islnk()
+                  ):
+                      raise SystemExit(f"unsafe market-scan entry: {member.name}")
+                  if allowed:
+                      selected.append(member)
+              if not selected:
+                  raise SystemExit("market-scan-state 中缺少 data/market_scan")
+              archive.extractall(workspace, members=selected)
+          PY
+          test -f data/market_scan/latest.json
+          echo "✅ 已从同分支最新 market-scan-state artifact 恢复候选计划"
+
+      - name: 恢复盘中状态缓存
+        uses: actions/cache/restore@v4
+        with:
+          path: data/intraday/
+          key: intraday-session-state-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            intraday-session-state-
+            intraday-alert-state-
+
+      - name: 缓存缺失时恢复最新盘中状态备份
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          STATE_BRANCH: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [ -f data/intraday/session_state.json ]; then
+            echo "✅ 已从 Actions cache 恢复盘中状态"
+            exit 0
+          fi
+
+          TMP_DIR="$(mktemp -d)"
+          gh api --method GET \
+            -H "Accept: application/vnd.github+json" \
+            "/repos/${GITHUB_REPOSITORY}/actions/artifacts?name=intraday-alert-state&per_page=100" \
+            > "$TMP_DIR/artifacts.json"
+          ARTIFACT_ID="$(
+            python3 - "$TMP_DIR/artifacts.json" "$STATE_BRANCH" <<'PY'
+          import json
+          import sys
+
+          path, branch = sys.argv[1:3]
+          with open(path, encoding="utf-8") as handle:
+              artifacts = json.load(handle).get("artifacts", [])
+          candidates = [
+              item for item in artifacts
+              if not item.get("expired")
+              and item.get("name") == "intraday-alert-state"
+              and (item.get("workflow_run") or {}).get("head_branch") == branch
+          ]
+          candidates.sort(key=lambda item: item.get("created_at", ""), reverse=True)
+          print(candidates[0]["id"] if candidates else "")
+          PY
+          )"
+          if [ -z "$ARTIFACT_ID" ]; then
+            echo "ℹ️ 没有可恢复的同分支盘中状态，本轮创建 v2 状态"
+            exit 0
+          fi
+
+          mkdir -p "$TMP_DIR/unpacked"
+          gh api \
+            -H "Accept: application/vnd.github+json" \
+            "/repos/${GITHUB_REPOSITORY}/actions/artifacts/${ARTIFACT_ID}/zip" \
+            > "$TMP_DIR/state.zip"
+          unzip -q "$TMP_DIR/state.zip" -d "$TMP_DIR/unpacked"
+          test -f "$TMP_DIR/unpacked/intraday-alert-state.tar.gz"
+          python3 - "$TMP_DIR/unpacked/intraday-alert-state.tar.gz" "$GITHUB_WORKSPACE" <<'PY'
+          import pathlib
+          import sys
+          import tarfile
+
+          archive_path, workspace = sys.argv[1:3]
+          with tarfile.open(archive_path, "r:gz") as archive:
+              members = archive.getmembers()
+              for member in members:
+                  path = pathlib.PurePosixPath(member.name)
+                  allowed = (
+                      member.name == "data/intraday"
+                      or member.name.startswith("data/intraday/")
+                  )
+                  if (
+                      path.is_absolute()
+                      or ".." in path.parts
+                      or not allowed
+                      or member.issym()
+                      or member.islnk()
+                  ):
+                      raise SystemExit(f"unsafe intraday state entry: {member.name}")
+              archive.extractall(workspace, members=members)
+          PY
+          test -f data/intraday/session_state.json
+          echo "✅ 已从最新固定 artifact 恢复盘中状态"
+
+      - name: 运行分钟级 A/H 盘中模拟监控
+        shell: bash
+        env:
+          STOCK_LIST_CONFIG: ${{ vars.STOCK_LIST || secrets.STOCK_LIST }}
+          PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
+          PUSHPLUS_TOPIC: ${{ vars.PUSHPLUS_TOPIC || secrets.PUSHPLUS_TOPIC }}
+          INTRADAY_NORMAL_INTERVAL_SECONDS: ${{ vars.INTRADAY_NORMAL_INTERVAL_SECONDS || '60' }}
+          INTRADAY_FAST_INTERVAL_SECONDS: ${{ vars.INTRADAY_FAST_INTERVAL_SECONDS || '30' }}
+          INTRADAY_DEGRADED_INTERVAL_SECONDS: ${{ vars.INTRADAY_DEGRADED_INTERVAL_SECONDS || '120' }}
+          INTRADAY_QUOTE_FRESHNESS_SECONDS: ${{ vars.INTRADAY_QUOTE_FRESHNESS_SECONDS || '90' }}
+          INTRADAY_MIN_QUOTE_COVERAGE: ${{ vars.INTRADAY_MIN_QUOTE_COVERAGE || '0.8' }}
+          INTRADAY_DROP_ALERT_PCT: ${{ vars.INTRADAY_DROP_ALERT_PCT || '3.0' }}
+          INTRADAY_RISE_ALERT_PCT: ${{ vars.INTRADAY_RISE_ALERT_PCT || '5.0' }}
+          INTRADAY_NEAR_LEVEL_PCT: ${{ vars.INTRADAY_NEAR_LEVEL_PCT || '0.75' }}
+          INTRADAY_NEAR_CHANGE_POINTS: ${{ vars.INTRADAY_NEAR_CHANGE_POINTS || '0.5' }}
+          INTRADAY_ALERT_COOLDOWN_SECONDS: ${{ vars.INTRADAY_ALERT_COOLDOWN_SECONDS || '900' }}
+          INTRADAY_DETERIORATION_PCT: ${{ vars.INTRADAY_DETERIORATION_PCT || '1.0' }}
+          INTRADAY_CANDIDATE_PLANS_PATH: ${{ vars.INTRADAY_CANDIDATE_PLANS_PATH || 'data/market_scan/latest.json' }}
+        run: |
+          set -euo pipefail
+          STOCK_LIST="${STOCK_LIST_CONFIG:-${STOCK_LIST:-}}"
+          if [ -z "$STOCK_LIST" ]; then
+            echo "❌ 未配置 STOCK_LIST"
+            exit 1
+          fi
+          PLAN_ARGS=()
+          if [ -n "${INTRADAY_CANDIDATE_PLANS_PATH:-}" ]; then
+            if [ -f "$INTRADAY_CANDIDATE_PLANS_PATH" ]; then
+              PLAN_ARGS=(--candidate-plans "$INTRADAY_CANDIDATE_PLANS_PATH")
+            else
+              echo "::warning::候选计划路径不存在；本轮不生成自适应人工复核事件"
+            fi
+          fi
+          python3 scripts/intraday_session.py \
+            --stocks "$STOCK_LIST" \
+            --session "$SESSION" \
+            --db data/stock_analysis.db \
+            --state data/intraday/session_state.json \
+            --report reports/intraday_session.md \
+            --normal-interval "$INTRADAY_NORMAL_INTERVAL_SECONDS" \
+            --fast-interval "$INTRADAY_FAST_INTERVAL_SECONDS" \
+            --degraded-interval "$INTRADAY_DEGRADED_INTERVAL_SECONDS" \
+            --freshness-seconds "$INTRADAY_QUOTE_FRESHNESS_SECONDS" \
+            --min-quote-coverage "$INTRADAY_MIN_QUOTE_COVERAGE" \
+            --down-threshold "$INTRADAY_DROP_ALERT_PCT" \
+            --up-threshold "$INTRADAY_RISE_ALERT_PCT" \
+            --near-level-pct "$INTRADAY_NEAR_LEVEL_PCT" \
+            --near-change-points "$INTRADAY_NEAR_CHANGE_POINTS" \
+            --cooldown-seconds "$INTRADAY_ALERT_COOLDOWN_SECONDS" \
+            --deterioration-pct "$INTRADAY_DETERIORATION_PCT" \
+            --max-cycles "$MAX_CYCLES" \
+            "${PLAN_ARGS[@]}"
+
+      - name: 打包盘中状态
+        if: always()
+        id: package_state
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p reports
+          if [ -f data/intraday/session_state.json ]; then
+            if python3 - <<'PY'
+          from datetime import datetime
+          from pathlib import Path
+          from zoneinfo import ZoneInfo
+
+          from scripts.intraday_session import load_state_v2
+
+          load_state_v2(
+              Path("data/intraday/session_state.json"),
+              now=datetime.now(ZoneInfo("Asia/Shanghai")),
+          )
+          PY
+            then
+              tar -czf intraday-alert-state.tar.gz data/intraday
+              echo "available=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "::error::盘中状态校验失败；不上传、不缓存损坏状态"
+              echo "available=false" >> "$GITHUB_OUTPUT"
+              {
+                echo "# 盘中状态无效"
+                echo
+                echo "恢复或运行后的状态未通过 schema 校验；本轮不会覆盖最近有效备份。"
+              } > reports/intraday_state_missing.md
+            fi
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            {
+              echo "# 盘中状态未生成"
+              echo
+              echo "前置恢复或监控初始化失败；未创建空状态，也未覆盖历史有效备份。"
+            } > reports/intraday_state_missing.md
+          fi
+
+      - name: 上传固定名盘中状态备份
+        if: ${{ always() && steps.package_state.outputs.available == 'true' }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: intraday-alert-state
+          path: intraday-alert-state.tar.gz
+          if-no-files-found: error
+          retention-days: 90
+          compression-level: 0
+
+      - name: 保存盘中状态缓存
+        if: ${{ always() && steps.package_state.outputs.available == 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          path: data/intraday/
+          key: intraday-session-state-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: 上传盘中监控报告
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: intraday-session-report-${{ github.run_number }}-${{ github.run_attempt }}
+          path: |
+            reports/intraday_session.md
+            reports/intraday_state_missing.md
+            data/intraday/session_state.json
+          if-no-files-found: warn
+          retention-days: 30
