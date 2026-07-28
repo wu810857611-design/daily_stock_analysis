@@ -6,10 +6,12 @@ from pathlib import Path
 
 from scripts.export_paper_signals import (
     CoverageError,
+    ExportError,
     build_snapshot,
     canonicalize_symbol,
     main,
     map_action,
+    normalise_analysis_since,
 )
 from scripts.paper_trade_tracker import normalise_snapshot
 
@@ -295,6 +297,65 @@ class ExportPaperSignalsTests(unittest.TestCase):
             snapshot["metadata"]["missing_details"],
             [{"symbol": "300408", "reasons": ["stale_stock_daily_price:2026-07-27"]}],
         )
+
+    def test_analysis_since_selects_next_utc_day_records_for_previous_trade_date(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            db_path = Path(temporary_directory) / "analysis.db"
+            connection = new_database(db_path)
+            connection.execute(
+                """
+                INSERT INTO analysis_history
+                    (id, code, name, operation_advice, analysis_summary,
+                     raw_result, context_snapshot, created_at)
+                VALUES (1, '300408', '三环集团', '买入', 'next UTC day analysis',
+                        '{}', '{}', '2026-07-28 00:15:00')
+                """
+            )
+            connection.execute(
+                """
+                INSERT INTO decision_signals
+                    (id, stock_code, stock_name, market, source_report_id,
+                     action, action_label, reason, created_at)
+                VALUES (1, '300408', '三环集团', 'cn', 1, 'buy', '买入',
+                        'next UTC day decision', '2026-07-28 00:16:00')
+                """
+            )
+            connection.execute(
+                "INSERT INTO stock_daily (id, code, date, close) VALUES (1, '300408', '2026-07-27', 39.5)"
+            )
+            connection.commit()
+
+            with self.assertRaises(CoverageError):
+                build_snapshot(
+                    connection,
+                    stocks=["300408"],
+                    trade_date="2026-07-27",
+                    min_coverage=1.0,
+                )
+
+            snapshot = build_snapshot(
+                connection,
+                stocks=["300408"],
+                trade_date="2026-07-27",
+                min_coverage=1.0,
+                analysis_since="2026-07-28T00:00:00Z",
+            )
+            connection.close()
+
+        self.assertEqual(snapshot["trade_date"], "2026-07-27")
+        self.assertEqual(snapshot["signals"][0]["signal"], "buy")
+        self.assertEqual(snapshot["signals"][0]["close"], 39.5)
+        self.assertEqual(snapshot["signals"][0]["price_source"], "stock_daily:2026-07-27")
+        self.assertEqual(snapshot["signals"][0]["source"], "decision_signals")
+        self.assertEqual(snapshot["metadata"]["analysis_since"], "2026-07-28 00:00:00")
+
+    def test_analysis_since_requires_explicit_utc_timezone(self):
+        self.assertEqual(
+            normalise_analysis_since("2026-07-28T00:00:00+00:00"),
+            "2026-07-28 00:00:00",
+        )
+        with self.assertRaisesRegex(ExportError, "UTC timezone"):
+            normalise_analysis_since("2026-07-28T00:00:00")
 
     def test_cli_writes_diagnostic_snapshot_when_coverage_is_too_low(self):
         with tempfile.TemporaryDirectory() as temporary_directory:

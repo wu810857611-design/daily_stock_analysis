@@ -690,6 +690,8 @@ jobs:
 
           # 收盘个股分析分成 A 股、港股两批。某一批失败时仍继续另一批，
           # 最终由覆盖率校验决定本交易日是否能写入模拟台账。
+          ANALYSIS_SINCE_UTC="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+          echo "🕐 本轮个股分析起点（UTC）: $ANALYSIS_SINCE_UTC"
           ANALYSIS_STATUS=0
           if [ -n "$CN_STOCKS" ]; then
             echo "🇨🇳 A股批次: $CN_STOCKS"
@@ -735,6 +737,7 @@ jobs:
             --db "$DATABASE_PATH" \
             --stocks "$STOCK_LIST" \
             --trade-date "$TRADE_DATE" \
+            --analysis-since "$ANALYSIS_SINCE_UTC" \
             --min-coverage 1.0 \
             --output data/paper_trade/daily_signals.json \
             || ANALYSIS_STATUS=1
@@ -800,6 +803,7 @@ jobs:
             reports/
             logs/
             data/paper_trade/daily_signals.json
+            data/stock_analysis.db
           if-no-files-found: warn
           retention-days: 90
       

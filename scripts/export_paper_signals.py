@@ -13,7 +13,7 @@ import math
 import re
 import sqlite3
 import sys
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
@@ -86,6 +86,23 @@ def normalise_trade_date(raw: str) -> str:
         return date.fromisoformat(str(raw or "").strip()).isoformat()
     except ValueError as exc:
         raise ExportError("--trade-date must use YYYY-MM-DD") from exc
+
+
+def normalise_analysis_since(raw: Optional[str]) -> Optional[str]:
+    """Validate an ISO-8601 UTC timestamp for selecting this run's records."""
+
+    if raw is None or not str(raw).strip():
+        return None
+    value = str(raw).strip()
+    if value.endswith(("Z", "z")):
+        value = value[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise ExportError("--analysis-since must be an ISO-8601 UTC timestamp") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() != timedelta(0):
+        raise ExportError("--analysis-since must include the UTC timezone (Z or +00:00)")
+    return parsed.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def map_action(raw: Any) -> str:
@@ -241,19 +258,29 @@ def _load_analysis_rows(
     connection: sqlite3.Connection,
     trade_date: str,
     requested: set[str],
+    analysis_since: Optional[str] = None,
 ) -> Dict[str, sqlite3.Row]:
     if not _table_exists(connection, "analysis_history"):
         return {}
-    rows = connection.execute(
-        """
+    if analysis_since is None:
+        query = """
         SELECT id, code, name, operation_advice, analysis_summary,
                raw_result, context_snapshot, created_at
         FROM analysis_history
         WHERE date(created_at) = ?
         ORDER BY created_at DESC, id DESC
-        """,
-        (trade_date,),
-    )
+        """
+        query_params = (trade_date,)
+    else:
+        query = """
+        SELECT id, code, name, operation_advice, analysis_summary,
+               raw_result, context_snapshot, created_at
+        FROM analysis_history
+        WHERE datetime(created_at) >= datetime(?)
+        ORDER BY created_at DESC, id DESC
+        """
+        query_params = (analysis_since,)
+    rows = connection.execute(query, query_params)
     latest: Dict[str, sqlite3.Row] = {}
     for row in rows:
         symbol = canonicalize_symbol(row["code"])
@@ -266,9 +293,17 @@ def _load_decision_rows(
     connection: sqlite3.Connection,
     trade_date: str,
     requested: set[str],
+    analysis_since: Optional[str] = None,
 ) -> Dict[str, sqlite3.Row]:
     if not _table_exists(connection, "decision_signals"):
         return {}
+
+    if analysis_since is None:
+        where_clause = "date(ds.created_at) = ?"
+        query_params = (trade_date,)
+    else:
+        where_clause = "datetime(ds.created_at) >= datetime(?)"
+        query_params = (analysis_since,)
 
     if _table_exists(connection, "analysis_history"):
         query = """
@@ -281,9 +316,9 @@ def _load_decision_rows(
                    ah.context_snapshot AS joined_context_snapshot
             FROM decision_signals AS ds
             LEFT JOIN analysis_history AS ah ON ah.id = ds.source_report_id
-            WHERE date(ds.created_at) = ?
+            WHERE {where_clause}
             ORDER BY ds.created_at DESC, ds.id DESC
-        """
+        """.format(where_clause=where_clause)
     else:
         query = """
             SELECT ds.id, ds.stock_code, ds.stock_name, ds.market, ds.action,
@@ -294,12 +329,12 @@ def _load_decision_rows(
                    NULL AS joined_raw_result,
                    NULL AS joined_context_snapshot
             FROM decision_signals AS ds
-            WHERE date(ds.created_at) = ?
+            WHERE {where_clause}
             ORDER BY ds.created_at DESC, ds.id DESC
-        """
+        """.format(where_clause=where_clause)
 
     latest: Dict[str, sqlite3.Row] = {}
-    for row in connection.execute(query, (trade_date,)):
+    for row in connection.execute(query, query_params):
         symbol = canonicalize_symbol(row["stock_code"], row["market"])
         if symbol in requested and symbol not in latest:
             latest[symbol] = row
@@ -398,18 +433,30 @@ def build_snapshot(
     stocks: Sequence[str],
     trade_date: str,
     min_coverage: float = DEFAULT_MIN_COVERAGE,
+    analysis_since: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Build one tracker-compatible snapshot or raise ``CoverageError``."""
 
     if not 0 < min_coverage <= 1:
         raise ExportError("--min-coverage must be greater than 0 and at most 1")
     trade_date = normalise_trade_date(trade_date)
+    analysis_since = normalise_analysis_since(analysis_since)
     requested = parse_stocks(",".join(str(item) for item in stocks))
     requested_set = set(requested)
 
     connection.row_factory = sqlite3.Row
-    analysis_rows = _load_analysis_rows(connection, trade_date, requested_set)
-    decision_rows = _load_decision_rows(connection, trade_date, requested_set)
+    analysis_rows = _load_analysis_rows(
+        connection,
+        trade_date,
+        requested_set,
+        analysis_since=analysis_since,
+    )
+    decision_rows = _load_decision_rows(
+        connection,
+        trade_date,
+        requested_set,
+        analysis_since=analysis_since,
+    )
     daily_prices, stale_price_dates = _load_close_prices(connection, trade_date, requested_set)
 
     signals: List[Dict[str, Any]] = []
@@ -480,6 +527,7 @@ def build_snapshot(
             "coverage": coverage,
             "min_coverage": float(min_coverage),
             "source_counts": source_counts,
+            "analysis_since": analysis_since,
         },
     }
     if coverage < min_coverage:
@@ -508,6 +556,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--stocks", required=True, help="comma-separated stock codes")
     parser.add_argument("--trade-date", required=True, help="trade date in YYYY-MM-DD form")
     parser.add_argument(
+        "--analysis-since",
+        help=(
+            "optional ISO-8601 UTC run-start timestamp; when set, analysis rows are selected "
+            "from this timestamp instead of by trade-date"
+        ),
+    )
+    parser.add_argument(
         "--min-coverage",
         type=float,
         default=DEFAULT_MIN_COVERAGE,
@@ -532,6 +587,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 stocks=parse_stocks(args.stocks),
                 trade_date=args.trade_date,
                 min_coverage=args.min_coverage,
+                analysis_since=args.analysis_since,
             )
         _write_snapshot(args.output, snapshot)
     except CoverageError as exc:
