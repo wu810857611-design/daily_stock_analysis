@@ -56,7 +56,8 @@ def create_reference_database(path: Path) -> None:
                 status TEXT,
                 stop_loss REAL,
                 target_price REAL,
-                created_at TEXT
+                created_at TEXT,
+                expires_at TEXT
             );
             """
         )
@@ -72,8 +73,8 @@ def create_reference_database(path: Path) -> None:
             """
             INSERT INTO decision_signals
                 (stock_code, stock_name, source_type, status, stop_loss,
-                 target_price, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+                 target_price, created_at, expires_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 "00981.HK",
@@ -83,6 +84,7 @@ def create_reference_database(path: Path) -> None:
                 50.0,
                 70.0,
                 "2026-07-28 09:00:00",
+                None,
             ),
         )
         connection.commit()
@@ -103,6 +105,31 @@ class IntradayMonitorTests(unittest.TestCase):
         self.assertEqual(levels.target_price, 70.0)
         self.assertEqual(levels.stop_source, "decision_signals")
         self.assertEqual(levels.target_source, "decision_signals")
+
+    def test_expired_signal_and_old_history_are_not_actionable(self):
+        fixed_now = datetime(2026, 7, 28, 10, 30, tzinfo=SHANGHAI_TZ)
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            database_path = Path(temporary_directory) / "analysis.db"
+            create_reference_database(database_path)
+            connection = sqlite3.connect(database_path)
+            connection.execute(
+                "UPDATE decision_signals "
+                "SET expires_at = '2026-07-28 01:00:00'"
+            )
+            connection.execute(
+                "UPDATE analysis_history SET created_at = '2026-07-01 00:00:00'"
+            )
+            connection.commit()
+            connection.close()
+
+            levels = load_reference_levels(
+                database_path,
+                "HK00981",
+                now=fixed_now,
+            )
+
+        self.assertIsNone(levels.stop_loss)
+        self.assertIsNone(levels.target_price)
 
     def test_emits_only_conservative_risk_and_volatility_conditions(self):
         quote = QuoteSnapshot(

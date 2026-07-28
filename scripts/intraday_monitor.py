@@ -18,7 +18,7 @@ import sqlite3
 import sys
 import tempfile
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence
 from urllib import request
@@ -38,6 +38,7 @@ SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
 STATE_SCHEMA_VERSION = 1
 PUSHPLUS_URL = "https://www.pushplus.plus/send"
 DEFAULT_MIN_QUOTE_COVERAGE = 0.8
+DEFAULT_REFERENCE_SIGNAL_MAX_AGE_DAYS = 7
 
 
 class MonitorError(RuntimeError):
@@ -195,6 +196,9 @@ def _latest_row(
     code_column: str,
     aliases: Iterable[str],
     analysis_only: bool = False,
+    fresh_only: bool = False,
+    now: Optional[datetime] = None,
+    max_signal_age_days: int = DEFAULT_REFERENCE_SIGNAL_MAX_AGE_DAYS,
 ) -> Optional[sqlite3.Row]:
     columns = _table_columns(connection, table)
     if code_column not in columns:
@@ -207,9 +211,66 @@ def _latest_row(
         filters.append("(source_type IS NULL OR source_type = 'analysis')")
     if analysis_only and "status" in columns:
         filters.append("(status IS NULL OR status = 'active')")
+    if analysis_only:
+        current = now or datetime.now(SHANGHAI_TZ)
+        if current.tzinfo is None:
+            current = current.replace(tzinfo=SHANGHAI_TZ)
+        current_utc = current.astimezone(timezone.utc)
+        cutoff_utc = current_utc - timedelta(days=max(0, max_signal_age_days))
+        current_text = current_utc.strftime("%Y-%m-%d %H:%M:%S")
+        cutoff_text = cutoff_utc.strftime("%Y-%m-%d %H:%M:%S")
+        if "expires_at" in columns:
+            if "created_at" in columns:
+                filters.append(
+                    "((expires_at IS NOT NULL "
+                    "AND datetime(expires_at) > datetime(?)) "
+                    "OR (expires_at IS NULL AND created_at IS NOT NULL "
+                    "AND datetime(created_at) >= datetime(?)))"
+                )
+                parameters.extend([current_text, cutoff_text])
+            else:
+                # Without created_at, a signal is usable only when it carries
+                # a still-valid explicit expiry.  Missing dates never become
+                # timeless stop/target instructions.
+                filters.append(
+                    "(expires_at IS NOT NULL "
+                    "AND datetime(expires_at) > datetime(?))"
+                )
+                parameters.append(current_text)
+        elif "created_at" in columns:
+            filters.append(
+                "(created_at IS NOT NULL AND datetime(created_at) >= datetime(?))"
+            )
+            parameters.append(cutoff_text)
+        else:
+            return None
+    elif fresh_only:
+        current = now or datetime.now(SHANGHAI_TZ)
+        if current.tzinfo is None:
+            current = current.replace(tzinfo=SHANGHAI_TZ)
+        cutoff_local = current.astimezone(SHANGHAI_TZ).replace(tzinfo=None) - timedelta(
+            days=max(0, max_signal_age_days)
+        )
+        cutoff_text = cutoff_local.strftime("%Y-%m-%d %H:%M:%S")
+        date_column = (
+            "created_at"
+            if "created_at" in columns
+            else "trade_date"
+            if "trade_date" in columns
+            else ""
+        )
+        if not date_column:
+            return None
+        filters.append(
+            f'("{date_column}" IS NOT NULL '
+            f'AND datetime("{date_column}") >= datetime(?))'
+        )
+        parameters.append(cutoff_text)
     order_parts = []
     if "created_at" in columns:
         order_parts.append("datetime(created_at) DESC")
+    elif "trade_date" in columns:
+        order_parts.append("datetime(trade_date) DESC")
     if "id" in columns:
         order_parts.append("id DESC")
     order_sql = ", ".join(order_parts) if order_parts else "rowid DESC"
@@ -235,7 +296,13 @@ def _row_text(row: Optional[sqlite3.Row], field: str) -> str:
     return str(row[field] or "").strip()
 
 
-def load_reference_levels(database_path: Path, symbol: str) -> ReferenceLevels:
+def load_reference_levels(
+    database_path: Path,
+    symbol: str,
+    *,
+    now: Optional[datetime] = None,
+    max_signal_age_days: int = DEFAULT_REFERENCE_SIGNAL_MAX_AGE_DAYS,
+) -> ReferenceLevels:
     """Load the newest active signal levels, falling back to analysis history."""
 
     if not database_path.exists():
@@ -253,12 +320,17 @@ def load_reference_levels(database_path: Path, symbol: str) -> ReferenceLevels:
             code_column="stock_code",
             aliases=aliases,
             analysis_only=True,
+            now=now,
+            max_signal_age_days=max_signal_age_days,
         )
         history = _latest_row(
             connection,
             table="analysis_history",
             code_column="code",
             aliases=aliases,
+            fresh_only=True,
+            now=now,
+            max_signal_age_days=max_signal_age_days,
         )
         signal_stop = _row_float(signal, "stop_loss")
         signal_target = _row_float(signal, "target_price")

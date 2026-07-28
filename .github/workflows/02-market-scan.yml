@@ -1,0 +1,192 @@
+name: 全市场分层选股（仅模拟）
+
+on:
+  schedule:
+    - cron: '30 2 * * 1-5'   # 北京时间 10:30
+    - cron: '30 6 * * 1-5'   # 北京时间 14:30
+    - cron: '15 11 * * 1-5'  # 北京时间 19:15，避开 18:00 收盘分析
+  workflow_dispatch:
+
+concurrency:
+  group: market-scan-simulation
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    environment: STOCK_LIST
+    timeout-minutes: 75
+    env:
+      MARKET_SCAN_MODE: simulation_only
+      MARKET_SCAN_STATE_DIR: data/market_scan
+      MARKET_SCAN_QWEN_MODEL: ${{ vars.MARKET_SCAN_QWEN_MODEL || secrets.MARKET_SCAN_QWEN_MODEL }}
+      MARKET_SCAN_DEEPSEEK_MODEL: ${{ vars.MARKET_SCAN_DEEPSEEK_MODEL || secrets.MARKET_SCAN_DEEPSEEK_MODEL }}
+      LLM_DASHSCOPE_BASE_URL: ${{ vars.LLM_DASHSCOPE_BASE_URL || secrets.LLM_DASHSCOPE_BASE_URL }}
+      LLM_DASHSCOPE_API_KEY: ${{ secrets.LLM_DASHSCOPE_API_KEY }}
+      LLM_DASHSCOPE_API_KEYS: ${{ secrets.LLM_DASHSCOPE_API_KEYS }}
+      LLM_DASHSCOPE_MODELS: ${{ vars.LLM_DASHSCOPE_MODELS || secrets.LLM_DASHSCOPE_MODELS }}
+      LLM_DASHSCOPE_EXTRA_HEADERS: ${{ vars.LLM_DASHSCOPE_EXTRA_HEADERS || secrets.LLM_DASHSCOPE_EXTRA_HEADERS }}
+      LLM_DEEPSEEK_BASE_URL: ${{ vars.LLM_DEEPSEEK_BASE_URL || secrets.LLM_DEEPSEEK_BASE_URL }}
+      LLM_DEEPSEEK_API_KEY: ${{ secrets.LLM_DEEPSEEK_API_KEY }}
+      LLM_DEEPSEEK_API_KEYS: ${{ secrets.LLM_DEEPSEEK_API_KEYS }}
+      LLM_DEEPSEEK_MODELS: ${{ vars.LLM_DEEPSEEK_MODELS || secrets.LLM_DEEPSEEK_MODELS }}
+      LLM_DEEPSEEK_EXTRA_HEADERS: ${{ vars.LLM_DEEPSEEK_EXTRA_HEADERS || secrets.LLM_DEEPSEEK_EXTRA_HEADERS }}
+      DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+      DEEPSEEK_API_KEYS: ${{ secrets.DEEPSEEK_API_KEYS }}
+      PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
+      PUSHPLUS_TOPIC: ${{ vars.PUSHPLUS_TOPIC || secrets.PUSHPLUS_TOPIC }}
+      MARKET_SCAN_TOP_A_HISTORY: ${{ vars.MARKET_SCAN_TOP_A_HISTORY || '40' }}
+      MARKET_SCAN_TOP_HK_HISTORY: ${{ vars.MARKET_SCAN_TOP_HK_HISTORY || '20' }}
+      MARKET_SCAN_FINAL_TOP_N: ${{ vars.MARKET_SCAN_FINAL_TOP_N || '12' }}
+      MARKET_SCAN_MIN_NET_RR: ${{ vars.MARKET_SCAN_MIN_NET_RR || '1.8' }}
+      MARKET_SCAN_A_CACHE_MAX_AGE_HOURS: ${{ vars.MARKET_SCAN_A_CACHE_MAX_AGE_HOURS || '6' }}
+      MARKET_SCAN_HK_CACHE_MAX_AGE_HOURS: ${{ vars.MARKET_SCAN_HK_CACHE_MAX_AGE_HOURS || '6' }}
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v5
+
+      - name: 设置 Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: 恢复全市场扫描独立状态
+        uses: actions/cache/restore@v4
+        with:
+          path: data/market_scan/
+          key: market-scan-state-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            market-scan-state-${{ github.run_id }}-
+            market-scan-state-
+
+      - name: 缓存缺失时恢复最新扫描状态备份
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          STATE_BRANCH: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [ -f data/market_scan/latest.json ]; then
+            echo "✅ 已从 Actions cache 恢复扫描状态"
+            exit 0
+          fi
+
+          STATE_TMP_DIR="$(mktemp -d)"
+          gh api --method GET \
+            -H "Accept: application/vnd.github+json" \
+            "/repos/${GITHUB_REPOSITORY}/actions/artifacts?name=market-scan-state&per_page=100" \
+            > "$STATE_TMP_DIR/artifacts.json"
+          ARTIFACT_ID="$(
+            python3 - "$STATE_TMP_DIR/artifacts.json" "$STATE_BRANCH" <<'PY'
+          import json
+          import sys
+
+          path, branch = sys.argv[1:3]
+          with open(path, encoding="utf-8") as handle:
+              artifacts = json.load(handle).get("artifacts", [])
+          candidates = [
+              item for item in artifacts
+              if not item.get("expired")
+              and item.get("name") == "market-scan-state"
+              and (item.get("workflow_run") or {}).get("head_branch") == branch
+          ]
+          candidates.sort(key=lambda item: item.get("created_at", ""), reverse=True)
+          print(candidates[0]["id"] if candidates else "")
+          PY
+          )"
+          if [ -z "$ARTIFACT_ID" ]; then
+            echo "ℹ️ 尚无同分支扫描状态，按首次运行处理"
+            exit 0
+          fi
+
+          mkdir -p "$STATE_TMP_DIR/unpacked"
+          gh api \
+            -H "Accept: application/vnd.github+json" \
+            "/repos/${GITHUB_REPOSITORY}/actions/artifacts/${ARTIFACT_ID}/zip" \
+            > "$STATE_TMP_DIR/state.zip"
+          unzip -q "$STATE_TMP_DIR/state.zip" -d "$STATE_TMP_DIR/unpacked"
+          test -f "$STATE_TMP_DIR/unpacked/market-scan-state.tar.gz"
+          python3 - "$STATE_TMP_DIR/unpacked/market-scan-state.tar.gz" "$GITHUB_WORKSPACE" <<'PY'
+          import pathlib
+          import sys
+          import tarfile
+
+          archive_path, workspace = sys.argv[1:3]
+          with tarfile.open(archive_path, "r:gz") as archive:
+              selected = []
+              for member in archive.getmembers():
+                  path = pathlib.PurePosixPath(member.name)
+                  allowed = (
+                      member.name == "data/market_scan"
+                      or member.name.startswith("data/market_scan/")
+                  )
+                  if (
+                      path.is_absolute()
+                      or ".." in path.parts
+                      or not allowed
+                      or member.issym()
+                      or member.islnk()
+                  ):
+                      raise SystemExit(f"unsafe market-scan entry: {member.name}")
+                  selected.append(member)
+              if not selected:
+                  raise SystemExit("market-scan-state 中缺少 data/market_scan")
+              archive.extractall(workspace, members=selected)
+          PY
+          test -f data/market_scan/latest.json
+          echo "✅ 已从同分支最新 artifact 恢复扫描与待推送状态"
+
+      - name: 执行分层选股（不连接券商）
+        run: |
+          python scripts/market_scan.py \
+            --state-dir "$MARKET_SCAN_STATE_DIR" \
+            --report reports/market_scan.md \
+            --result-json reports/market_scan.json \
+            --top-a-history "$MARKET_SCAN_TOP_A_HISTORY" \
+            --top-hk-history "$MARKET_SCAN_TOP_HK_HISTORY" \
+            --final-top-n "$MARKET_SCAN_FINAL_TOP_N" \
+            --min-net-rr "$MARKET_SCAN_MIN_NET_RR" \
+            --a-cache-max-age-hours "$MARKET_SCAN_A_CACHE_MAX_AGE_HOURS" \
+            --hk-cache-max-age-hours "$MARKET_SCAN_HK_CACHE_MAX_AGE_HOURS" \
+            --notify
+
+      - name: 保存全市场扫描状态缓存
+        uses: actions/cache/save@v4
+        with:
+          path: data/market_scan/
+          key: market-scan-state-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: 打包固定名扫描状态
+        run: |
+          test -f data/market_scan/latest.json
+          tar -czf market-scan-state.tar.gz data/market_scan/
+
+      - name: 上传固定名状态供其他模拟工作流恢复
+        uses: actions/upload-artifact@v6
+        with:
+          name: market-scan-state
+          path: market-scan-state.tar.gz
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: 上传本轮候选与报告
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: market-scan-report-${{ github.run_number }}-${{ github.run_attempt }}
+          path: |
+            reports/market_scan.md
+            reports/market_scan.json
+          if-no-files-found: warn
+          retention-days: 90
