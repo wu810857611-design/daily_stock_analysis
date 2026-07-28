@@ -1,9 +1,11 @@
 name: 每日股票分析
 
 on:
-  # 定时触发 - 每天北京时间 18:00 (UTC 10:00)
+  # 定时触发（GitHub cron 使用 UTC）
   schedule:
-    - cron: '0 10 * * 1-5'     # 周一到周五，UTC 10:00 = 北京时间 18:00
+    - cron: '30 2 * * 1-5'     # 北京时间 10:30：低频盘中检查
+    - cron: '30 6 * * 1-5'     # 北京时间 14:30：低频盘中检查
+    - cron: '0 10 * * 1-5'     # 北京时间 18:00：收盘分析与模拟记账
   
   # 手动触发
   workflow_dispatch:
@@ -17,6 +19,8 @@ on:
           - full          # 完整分析（股票+大盘）
           - market-only   # 仅大盘复盘
           - stocks-only   # 仅股票分析
+          - intraday-check # 盘中低频风险检查（不调用大模型）
+          - simulation-summary # 仅重新生成模拟汇总
       force_run:
         description: '强制运行（跳过交易日检查）'
         required: false
@@ -28,14 +32,18 @@ concurrency:
   group: stock-analysis
   cancel-in-progress: false
 
+permissions:
+  contents: read
+  actions: read
+
 jobs:
   analyze:
     runs-on: ubuntu-latest
     # 兼容误将 STOCK_LIST 配到同名 Environment variables 的场景；
     # 推荐位置仍是 Settings -> Secrets and variables -> Actions -> Repository variables。
     environment: STOCK_LIST
-    # 添加超时限制，防止任务卡死
-    timeout-minutes: ${{ fromJSON(vars.ANALYSIS_TIMEOUT_MINUTES || '30') }}
+    # 12 只股票分 A/H 两批执行，给免费行情源和模型调用留出余量。
+    timeout-minutes: ${{ fromJSON(vars.ANALYSIS_TIMEOUT_MINUTES || '90') }}
     
     steps:
       - name: 随机延迟（避免固定时间访问）
@@ -58,7 +66,128 @@ jobs:
       
       - name: 创建必要目录
         run: |
-          mkdir -p data logs reports
+          mkdir -p data/paper_trade data/intraday logs reports
+
+      - name: 确定运行阶段
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            case "${{ github.event.schedule }}" in
+              "30 2 * * 1-5"|"30 6 * * 1-5")
+                RUN_PHASE="intraday-check"
+                ;;
+              *)
+                RUN_PHASE="full"
+                ;;
+            esac
+          else
+            RUN_PHASE="${{ github.event.inputs.mode || 'full' }}"
+          fi
+          echo "RUN_PHASE=$RUN_PHASE" >> "$GITHUB_ENV"
+          echo "本轮阶段: $RUN_PHASE"
+
+      - name: 恢复收盘分析与模拟状态
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            data/stock_analysis.db
+            data/paper_trade/
+          key: paper-close-state-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            paper-close-state-${{ github.run_id }}-
+            paper-close-state-
+
+      - name: 缓存缺失时恢复最新收盘状态备份
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          STATE_BRANCH: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [ -f data/stock_analysis.db ] && [ -f data/paper_trade/state.json ]; then
+            echo "✅ 已从 GitHub Actions 缓存恢复完整状态"
+            exit 0
+          fi
+
+          STATE_TMP_DIR="$(mktemp -d)"
+          ARTIFACT_LIST="$STATE_TMP_DIR/artifacts.json"
+          gh api --method GET \
+            -H "Accept: application/vnd.github+json" \
+            "/repos/${GITHUB_REPOSITORY}/actions/artifacts?name=paper-close-state&per_page=100" \
+            > "$ARTIFACT_LIST"
+
+          ARTIFACT_ID="$(
+            python3 - "$ARTIFACT_LIST" "$STATE_BRANCH" <<'PY'
+          import json
+          import sys
+
+          payload_path, branch = sys.argv[1:3]
+          with open(payload_path, encoding="utf-8") as handle:
+              artifacts = json.load(handle).get("artifacts", [])
+          candidates = [
+              artifact
+              for artifact in artifacts
+              if not artifact.get("expired")
+              and artifact.get("name") == "paper-close-state"
+              and (artifact.get("workflow_run") or {}).get("head_branch") == branch
+          ]
+          candidates.sort(key=lambda item: item.get("created_at", ""), reverse=True)
+          print(candidates[0]["id"] if candidates else "")
+          PY
+          )"
+
+          if [ -z "$ARTIFACT_ID" ]; then
+            echo "ℹ️ 没有可恢复的同分支状态备份，本轮将创建首份模拟状态"
+            exit 0
+          fi
+
+          mkdir -p "$STATE_TMP_DIR/unpacked"
+          gh api \
+            -H "Accept: application/vnd.github+json" \
+            "/repos/${GITHUB_REPOSITORY}/actions/artifacts/${ARTIFACT_ID}/zip" \
+            > "$STATE_TMP_DIR/state.zip"
+          unzip -q "$STATE_TMP_DIR/state.zip" -d "$STATE_TMP_DIR/unpacked"
+          test -f "$STATE_TMP_DIR/unpacked/paper-close-state.tar.gz"
+
+          python3 - "$STATE_TMP_DIR/unpacked/paper-close-state.tar.gz" "$GITHUB_WORKSPACE" <<'PY'
+          import pathlib
+          import sys
+          import tarfile
+
+          archive_path, workspace = sys.argv[1:3]
+          with tarfile.open(archive_path, "r:gz") as archive:
+              members = archive.getmembers()
+              for member in members:
+                  path = pathlib.PurePosixPath(member.name)
+                  allowed = (
+                      member.name == "data/stock_analysis.db"
+                      or member.name == "data/paper_trade"
+                      or member.name.startswith("data/paper_trade/")
+                  )
+                  if (
+                      path.is_absolute()
+                      or ".." in path.parts
+                      or not allowed
+                      or member.issym()
+                      or member.islnk()
+                  ):
+                      raise SystemExit(f"unsafe state archive entry: {member.name}")
+              archive.extractall(workspace, members=members)
+          PY
+
+          test -f data/stock_analysis.db
+          test -f data/paper_trade/state.json
+          echo "✅ 已从最新未过期 artifact 恢复收盘数据库与20日模拟状态"
+
+      - name: 恢复盘中提醒去重状态
+        if: env.RUN_PHASE == 'intraday-check'
+        uses: actions/cache/restore@v4
+        with:
+          path: data/intraday/
+          key: intraday-alert-state-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            intraday-alert-state-${{ github.run_id }}-
+            intraday-alert-state-
       
       - name: 执行股票分析
         env:
@@ -291,7 +420,9 @@ jobs:
           MINIMAX_API_KEYS: ${{ secrets.MINIMAX_API_KEYS }}
           BRAVE_API_KEYS: ${{ secrets.BRAVE_API_KEYS }}
           SEARXNG_BASE_URLS: ${{ vars.SEARXNG_BASE_URLS || secrets.SEARXNG_BASE_URLS }}
-          SEARXNG_PUBLIC_INSTANCES_ENABLED: ${{ vars.SEARXNG_PUBLIC_INSTANCES_ENABLED || secrets.SEARXNG_PUBLIC_INSTANCES_ENABLED }}
+          # 公共 SearXNG 在 Actions 上频繁触发 429；没有自有搜索源时宁可明确降级，
+          # 也不要让 12 只股票反复等待不可用实例。
+          SEARXNG_PUBLIC_INSTANCES_ENABLED: ${{ vars.SEARXNG_PUBLIC_INSTANCES_ENABLED || secrets.SEARXNG_PUBLIC_INSTANCES_ENABLED || 'false' }}
           
           # ==========================================
           # 通知渠道（可同时配置多个，全部推送）
@@ -396,12 +527,20 @@ jobs:
           MARKET_REVIEW_ENABLED: ${{ vars.MARKET_REVIEW_ENABLED || secrets.MARKET_REVIEW_ENABLED || 'true' }}
           ANALYSIS_DELAY: ${{ vars.ANALYSIS_DELAY || secrets.ANALYSIS_DELAY || '0' }}
           TRADING_DAY_CHECK_ENABLED: ${{ vars.TRADING_DAY_CHECK_ENABLED || secrets.TRADING_DAY_CHECK_ENABLED || 'true' }}
+          DATABASE_PATH: ./data/stock_analysis.db
+          SQLITE_WAL_ENABLED: 'false'
+          BACKTEST_ENABLED: 'true'
+          BACKTEST_EVAL_WINDOW_DAYS: '20'
+          BACKTEST_MIN_AGE_DAYS: '28'
+          BACKTEST_ENGINE_VERSION: paper-20d-v1
+          INTRADAY_DROP_ALERT_PCT: ${{ vars.INTRADAY_DROP_ALERT_PCT || '3.0' }}
+          INTRADAY_RISE_ALERT_PCT: ${{ vars.INTRADAY_RISE_ALERT_PCT || '5.0' }}
           
           # ==========================================
           # 系统配置
           # ==========================================
           LOG_LEVEL: INFO
-          MAX_WORKERS: ${{ vars.MAX_WORKERS || secrets.MAX_WORKERS || '1' }}
+          MAX_WORKERS: ${{ vars.MAX_WORKERS || secrets.MAX_WORKERS || '2' }}
           # 筹码分布：默认 false（云端接口不稳定）；需启用时在 Settings → Variables 添加 ENABLE_CHIP_DISTRIBUTION=true
           ENABLE_CHIP_DISTRIBUTION: ${{ vars.ENABLE_CHIP_DISTRIBUTION || secrets.ENABLE_CHIP_DISTRIBUTION || 'false' }}
           # 实时行情数据源优先级（腾讯有量比且稳定，推荐首选）
@@ -420,6 +559,16 @@ jobs:
             export STOCK_LIST="600519"
           fi
 
+          # 把误填的 HK.00981 / 00981.HK 等形式统一成数据层支持的 HK00981。
+          NORMALIZED_STOCK_LIST="$(python3 scripts/normalize_stock_list.py "$STOCK_LIST")"
+          if [ -z "$NORMALIZED_STOCK_LIST" ]; then
+            echo "❌ 自选股列表规范化后为空"
+            exit 1
+          fi
+          export STOCK_LIST="$NORMALIZED_STOCK_LIST"
+          CN_STOCKS="$(python3 scripts/normalize_stock_list.py "$STOCK_LIST" --market cn)"
+          HK_STOCKS="$(python3 scripts/normalize_stock_list.py "$STOCK_LIST" --market hk)"
+
           # 处理 LITELLM YAML 配置文件
           if [ -n "$LITELLM_CONFIG_YAML" ] && [ -n "$LITELLM_CONFIG" ]; then
             echo "📝 使用 GitHub Actions Secrets/Variables 中的 LITELLM_CONFIG_YAML 配置"
@@ -430,8 +579,8 @@ jobs:
             echo "✅ LITELLM 配置文件已写入: $LITELLM_CONFIG"
           fi
 
-          # 判断运行模式
-          MODE="${{ github.event.inputs.mode || 'full' }}"
+          # “确定运行阶段”步骤已根据 cron / 手动输入写入 RUN_PHASE。
+          MODE="${RUN_PHASE:-full}"
           
           echo "=========================================="
           echo "🚀 A股自选股智能分析系统"
@@ -508,24 +657,155 @@ jobs:
             echo "⚡ 已启用强制运行模式（跳过交易日检查）"
           fi
 
-          # 执行分析
+          # 盘中只做两次轻量风险检查，不调用大模型、不做真实交易。
+          if [ "$MODE" = "intraday-check" ]; then
+            python3 scripts/intraday_monitor.py \
+              --stocks "$STOCK_LIST" \
+              --db "$DATABASE_PATH" \
+              --state data/intraday/alerts.json \
+              --report reports/intraday_check.md \
+              --down-threshold "$INTRADAY_DROP_ALERT_PCT" \
+              --up-threshold "$INTRADAY_RISE_ALERT_PCT" \
+              --min-quote-coverage 0.8 \
+              --notify
+            exit 0
+          fi
+
+          if [ "$MODE" = "simulation-summary" ]; then
+            python3 scripts/paper_trade_tracker.py \
+              --render-only \
+              --state data/paper_trade/state.json \
+              --summary reports/paper_trade_20d.md
+            python3 scripts/pushplus_notify.py \
+              --file reports/paper_trade_20d.md \
+              --title "20个交易日模拟跟踪进度" \
+              || echo "::warning::PushPlus 推送失败；模拟状态和报告仍会保留"
+            exit 0
+          fi
+
           if [ "$MODE" = "market-only" ]; then
             python main.py --market-review $FORCE_RUN_ARG
-          elif [ "$MODE" = "stocks-only" ]; then
-            python main.py --no-market-review $FORCE_RUN_ARG
+            exit 0
+          fi
+
+          # 收盘个股分析分成 A 股、港股两批。某一批失败时仍继续另一批，
+          # 最终由覆盖率校验决定本交易日是否能写入模拟台账。
+          ANALYSIS_SINCE_UTC="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+          echo "🕐 本轮个股分析起点（UTC）: $ANALYSIS_SINCE_UTC"
+          ANALYSIS_STATUS=0
+          if [ -n "$CN_STOCKS" ]; then
+            echo "🇨🇳 A股批次: $CN_STOCKS"
+            python main.py --stocks "$CN_STOCKS" --no-market-review --no-notify $FORCE_RUN_ARG \
+              || ANALYSIS_STATUS=1
+            mkdir -p reports/cn
+            cp reports/*.md reports/cn/ 2>/dev/null || true
+          fi
+
+          if [ -n "$HK_STOCKS" ]; then
+            echo "🇭🇰 港股批次: $HK_STOCKS"
+            python main.py --stocks "$HK_STOCKS" --no-market-review --no-notify $FORCE_RUN_ARG \
+              || ANALYSIS_STATUS=1
+            mkdir -p reports/hk
+            cp reports/*.md reports/hk/ 2>/dev/null || true
+          fi
+
+          if [ "$MODE" = "full" ]; then
+            python main.py --market-review --no-notify $FORCE_RUN_ARG \
+              || echo "::warning::大盘复盘失败；不影响已完成的个股分析与模拟记账"
+            mkdir -p reports/market
+            cp reports/*.md reports/market/ 2>/dev/null || true
+          fi
+
+          # 北京时间 18:00 后使用当天；18:00 前使用最近一个已经结束的工作日。
+          # 节假日不在这里猜测，由下面的严格覆盖率检查自然拒绝无有效分析的日期。
+          TRADE_DATE="$(
+            python3 - <<'PY'
+          from datetime import datetime, time, timedelta
+          from zoneinfo import ZoneInfo
+
+          now = datetime.now(ZoneInfo("Asia/Shanghai"))
+          trade_date = now.date()
+          if now.time() < time(18, 0):
+              trade_date -= timedelta(days=1)
+          while trade_date.weekday() >= 5:
+              trade_date -= timedelta(days=1)
+          print(trade_date.isoformat())
+          PY
+          )"
+          echo "📅 模拟记账交易日: $TRADE_DATE"
+          python3 scripts/export_paper_signals.py \
+            --db "$DATABASE_PATH" \
+            --stocks "$STOCK_LIST" \
+            --trade-date "$TRADE_DATE" \
+            --analysis-since "$ANALYSIS_SINCE_UTC" \
+            --min-coverage 1.0 \
+            --output data/paper_trade/daily_signals.json \
+            || ANALYSIS_STATUS=1
+
+          if [ "$ANALYSIS_STATUS" -eq 0 ]; then
+            python3 scripts/paper_trade_tracker.py \
+              --signals data/paper_trade/daily_signals.json \
+              --state data/paper_trade/state.json \
+              --summary reports/paper_trade_20d.md \
+              --target-days 20
+            python3 scripts/pushplus_notify.py \
+              --file reports/paper_trade_20d.md \
+              --title "收盘分析与20日模拟跟踪" \
+              || echo "::warning::PushPlus 推送失败；本交易日仍计入模拟，报告可从 artifact 下载"
           else
-            python main.py $FORCE_RUN_ARG
+            echo "❌ 本轮未覆盖全部股票，不计入20个交易日模拟"
+            exit 1
           fi
       
+      - name: 打包收盘分析与模拟状态
+        if: success() && (env.RUN_PHASE == 'full' || env.RUN_PHASE == 'stocks-only')
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f data/stock_analysis.db
+          test -f data/paper_trade/state.json
+          tar -czf paper-close-state.tar.gz \
+            data/stock_analysis.db \
+            data/paper_trade
+
+      - name: 上传固定名收盘状态备份
+        if: success() && (env.RUN_PHASE == 'full' || env.RUN_PHASE == 'stocks-only')
+        uses: actions/upload-artifact@v6
+        with:
+          name: paper-close-state
+          path: paper-close-state.tar.gz
+          if-no-files-found: error
+          retention-days: 90
+          compression-level: 0
+
+      - name: 保存收盘分析与模拟状态
+        if: success() && env.RUN_PHASE != 'intraday-check'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            data/stock_analysis.db
+            data/paper_trade/
+          key: paper-close-state-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: 保存盘中提醒去重状态
+        if: success() && env.RUN_PHASE == 'intraday-check'
+        uses: actions/cache/save@v4
+        with:
+          path: data/intraday/
+          key: intraday-alert-state-${{ github.run_id }}-${{ github.run_attempt }}
+
       - name: 上传分析报告
         uses: actions/upload-artifact@v6
         if: always()
         with:
-          name: analysis-reports-${{ github.run_number }}
+          name: analysis-${{ env.RUN_PHASE }}-${{ github.run_number }}-${{ github.run_attempt }}
           path: |
             reports/
             logs/
-          retention-days: 30
+            data/paper_trade/daily_signals.json
+            data/stock_analysis.db
+          if-no-files-found: warn
+          retention-days: 90
       
       - name: 显示运行结果
         if: always()
@@ -539,6 +819,11 @@ jobs:
             ls -la reports/
           else
             echo "⚠️ 未生成报告文件"
+          fi
+          if [ -f "reports/paper_trade_20d.md" ]; then
+            echo ""
+            echo "📈 20日模拟进度:"
+            sed -n '1,24p' reports/paper_trade_20d.md
           fi
           echo ""
           if [ -f "logs/stock_analysis_$(date +%Y%m%d).log" ]; then
