@@ -15,7 +15,6 @@ cadence instead of terminating the whole session.
 from __future__ import annotations
 
 import argparse
-import copy
 import hashlib
 import json
 import math
@@ -28,7 +27,7 @@ import time
 from dataclasses import asdict, dataclass
 from datetime import datetime, time as datetime_time, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence
+from typing import Any, Callable, Dict, List, Mapping, MutableMapping, Optional, Sequence
 from urllib import request
 from zoneinfo import ZoneInfo
 
@@ -48,6 +47,12 @@ from scripts.adaptive_signal_policy import (  # noqa: E402
     RISK_EXIT_REVIEW,
     evaluate_adaptive_signal,
     input_from_mapping as adaptive_input_from_mapping,
+)
+from scripts.level2_adapter import (  # noqa: E402
+    LEVEL2_AVAILABLE,
+    LEVEL2_PROVIDER_ERROR,
+    Level2Assessment,
+    Level2DataAdapter,
 )
 from scripts.normalize_stock_list import canonical_symbol, normalize_stock_list  # noqa: E402
 
@@ -105,6 +110,7 @@ class CycleResult:
     notified_event_count: int
     next_interval_seconds: float
     degraded: bool
+    level2_assessments: List[Level2Assessment]
 
 
 @dataclass(frozen=True)
@@ -1031,7 +1037,10 @@ def load_candidate_plans(
 
 
 def _candidate_plan_payload(
-    candidate: Mapping[str, Any], quote: RealtimeQuote
+    candidate: Mapping[str, Any],
+    quote: RealtimeQuote,
+    *,
+    confidence_multiplier: float = 1.0,
 ) -> Optional[Dict[str, Any]]:
     scope = str(candidate.get("scope") or "").strip().lower()
     if scope not in {"simulation", "watchlist"}:
@@ -1059,6 +1068,15 @@ def _candidate_plan_payload(
     plan_price = _positive_float(plan.get("plan_price", plan.get("entry_mid")))
     if plan_price is None and entry_low is not None and entry_high is not None:
         plan_price = (entry_low + entry_high) / 2
+    raw_confidence = _finite_float(candidate.get("confidence"))
+    multiplier = _finite_float(confidence_multiplier)
+    if multiplier is None or not 0 <= multiplier <= 1:
+        multiplier = 0.0
+    adjusted_confidence = (
+        min(1.0, max(0.0, raw_confidence * multiplier))
+        if raw_confidence is not None
+        else None
+    )
     payload = {
         "symbol": symbol,
         # Scanner markets use A/HK_CONNECT; the deterministic policy contract
@@ -1067,7 +1085,7 @@ def _candidate_plan_payload(
         "plan_price": plan_price,
         "stop_loss": plan.get("stop_loss"),
         "target_price": plan.get("target_price", plan.get("take_profit_1")),
-        "confidence": candidate.get("confidence"),
+        "confidence": adjusted_confidence,
         "data_quality": candidate.get("data_quality"),
         "market_costs": candidate.get("market_costs"),
         "expected_holding_days": candidate.get("expected_holding_days"),
@@ -1107,6 +1125,8 @@ def _candidate_plan_payload(
     payload["_name"] = str(candidate.get("name") or quote.name or "")
     payload["_entry_low"] = entry_low
     payload["_entry_high"] = entry_high
+    payload["_raw_confidence"] = raw_confidence
+    payload["_confidence_multiplier"] = multiplier
     if entry_low is None or entry_high is None or entry_low > entry_high:
         return None
     return payload
@@ -1147,6 +1167,7 @@ def enqueue_adaptive_plan_reviews(
     now: datetime,
     quotes: Sequence[RealtimeQuote],
     candidates: Sequence[Mapping[str, Any]],
+    confidence_multipliers: Optional[Mapping[str, float]] = None,
 ) -> int:
     """Queue deduplicated simulation/manual-review events from complete plans."""
 
@@ -1167,7 +1188,15 @@ def enqueue_adaptive_plan_reviews(
                 reason="candidate_quote_unavailable_before_delivery",
             )
             continue
-        payload = _candidate_plan_payload(candidate, quote)
+        payload = _candidate_plan_payload(
+            candidate,
+            quote,
+            confidence_multiplier=(
+                confidence_multipliers.get(symbol, 1.0)
+                if confidence_multipliers is not None
+                else 1.0
+            ),
+        )
         if payload is None:
             _clear_adaptive_entry_review(
                 state,
@@ -1188,6 +1217,8 @@ def enqueue_adaptive_plan_reviews(
                 "expected_holding_days",
                 "data_quality",
                 "market_costs",
+                "_raw_confidence",
+                "_confidence_multiplier",
                 "_entry_low",
                 "_entry_high",
                 "_scope",
@@ -1290,6 +1321,12 @@ def enqueue_adaptive_plan_reviews(
                 "并通过税费滑点后的风险收益门槛，仅供人工复核；"
                 "这不是买入指令，系统不会下单。"
             )
+            if payload["_confidence_multiplier"] < 1:
+                wording += (
+                    f" 当前缺少可验证的可靠 Level-2，置信度已按 "
+                    f"{payload['_confidence_multiplier']:.0%} 折减并使用"
+                    "基础行情、技术与研究数据降级评估。"
+                )
         elif decision.candidate_action == RISK_EXIT_REVIEW:
             if payload["_holding_state"] not in {"paper_held", "simulation_holding"}:
                 # A missing/real-world holding state must never be translated
@@ -1407,6 +1444,7 @@ def render_outbox(events: Sequence[Mapping[str, Any]], now: datetime) -> str:
         "target_reached": "到达目标参考区",
         "data_quality": "行情数据降级",
         "reference_data_quality": "参考位数据降级",
+        "schedule_late": "计划时段未执行",
         "adaptive_entry_review": "模拟候选人工复核",
         "adaptive_risk_review": "模拟持仓风险复核",
     }
@@ -1466,12 +1504,15 @@ def flush_outbox(
     *,
     now: datetime,
     sender: Callable[..., bool] = _default_notification_sender,
+    event_predicate: Optional[Callable[[Mapping[str, Any]], bool]] = None,
 ) -> int:
     # Defensive restart guard: an event retained by a prior failed delivery
     # must not be sent after a newer fresh quote has cleared its condition.
     _cancel_events_for_cleared_conditions(state, now=now)
     due: List[Dict[str, Any]] = []
     for event in state.get("outbox", []):
+        if event_predicate is not None and not event_predicate(event):
+            continue
         next_attempt = _parse_iso(event.get("next_attempt_at"))
         if next_attempt is None or next_attempt <= now:
             due.append(event)
@@ -1595,6 +1636,7 @@ def run_cycle(
     cooldown_seconds: float = DEFAULT_COOLDOWN_SECONDS,
     deterioration_pct: float = DEFAULT_DETERIORATION_PCT,
     candidate_plans: Sequence[Mapping[str, Any]] = (),
+    level2_adapter: Optional[Level2DataAdapter] = None,
     notification_sender: Callable[..., bool] = _default_notification_sender,
 ) -> CycleResult:
     clear_removed_adaptive_plan_reviews(
@@ -1621,6 +1663,76 @@ def run_cycle(
     valid = [quote for quote in quotes if quote.price is not None and not quote.is_stale]
     coverage = len(valid) / len(canonical) if canonical else 0.0
     provider = state.setdefault("provider", {})
+    depth_adapter = level2_adapter or Level2DataAdapter()
+    try:
+        level2_by_symbol = depth_adapter.assess(canonical, now=now)
+        if not isinstance(level2_by_symbol, Mapping):
+            raise TypeError("level2 assessment must be a mapping")
+        level2_by_symbol = dict(level2_by_symbol)
+    except Exception:
+        # An injected provider/adapter remains an external runtime boundary.
+        # Preserve the fresh L1 safety monitor even if that boundary fails in
+        # an unexpected way.
+        level2_by_symbol = {
+            symbol: Level2Assessment(
+                symbol=symbol,
+                status=LEVEL2_PROVIDER_ERROR,
+                usable_as_level2=False,
+                confidence_multiplier=0.60,
+                reason_codes=("level2_adapter_failed",),
+            )
+            for symbol in canonical
+        }
+    for symbol in canonical:
+        if not isinstance(level2_by_symbol.get(symbol), Level2Assessment):
+            level2_by_symbol[symbol] = Level2Assessment(
+                symbol=symbol,
+                status=LEVEL2_PROVIDER_ERROR,
+                usable_as_level2=False,
+                confidence_multiplier=0.60,
+                reason_codes=("level2_assessment_invalid",),
+            )
+    try:
+        level2_configured = bool(getattr(depth_adapter, "configured", False))
+    except Exception:
+        level2_configured = False
+    level2_assessments = [
+        level2_by_symbol[symbol]
+        for symbol in canonical
+        if symbol in level2_by_symbol
+    ]
+    level2_available = sum(
+        1 for assessment in level2_assessments if assessment.usable_as_level2
+    )
+    level2_statuses: Dict[str, int] = {}
+    for assessment in level2_assessments:
+        level2_statuses[assessment.status] = (
+            level2_statuses.get(assessment.status, 0) + 1
+        )
+    provider["level2"] = {
+        "configured": level2_configured,
+        "provider": str(
+            getattr(getattr(depth_adapter, "provider", None), "provider_name", "")
+            or ""
+        ),
+        "usable_symbols": level2_available,
+        "total_symbols": len(canonical),
+        "coverage": level2_available / len(canonical) if canonical else 0.0,
+        "statuses": level2_statuses,
+        "assessments": {
+            assessment.symbol: assessment.as_dict()
+            for assessment in level2_assessments
+        },
+        "fallback_active": level2_available < len(canonical),
+        "last_checked_at": _iso(now),
+    }
+    provider.setdefault("data_capabilities", {})["level2_order_book"] = (
+        "authorized_fresh_complete"
+        if level2_available == len(canonical) and canonical
+        else "partial_authorized_fresh_complete"
+        if level2_available
+        else "unavailable_using_declared_fallback"
+    )
     if not valid or coverage < min_quote_coverage:
         provider["consecutive_low_coverage"] = (
             int(provider.get("consecutive_low_coverage") or 0) + 1
@@ -1697,6 +1809,10 @@ def run_cycle(
         now=now,
         quotes=quotes,
         candidates=candidate_plans,
+        confidence_multipliers={
+            symbol: assessment.confidence_multiplier
+            for symbol, assessment in level2_by_symbol.items()
+        },
     )
     provider["last_coverage"] = coverage
     provider["last_checked_at"] = _iso(now)
@@ -1726,6 +1842,7 @@ def run_cycle(
         notified_event_count=notified,
         next_interval_seconds=interval,
         degraded=degraded,
+        level2_assessments=level2_assessments,
     )
 
 
@@ -1742,6 +1859,8 @@ def render_session_report(
 ) -> str:
     provider_status = provider_status or {}
     reference = provider_status.get("reference_levels") or {}
+    level2 = provider_status.get("level2") or {}
+    late_schedule = provider_status.get("late_schedule") or {}
     lines = [
         "# 分钟级盘中模拟监控",
         "",
@@ -1765,8 +1884,60 @@ def render_session_report(
         "- 实时价格：腾讯批量基础行情；提供方时间戳缺失或超过 90 秒时不触发交易类提醒。",
         "- 成交量：仅在基础行情字段可用时记录。",
         "- 分时 K 线：本监控尚未采集，不会声称已分析。",
-        "- Level-2 盘口：当前免费源不可得，标记为 unavailable，绝不推测或编造。",
+        (
+            "- Level-2 盘口："
+            + (
+                f"已对 {level2.get('usable_symbols', 0)}/"
+                f"{level2.get('total_symbols', len(symbols))} 个标的通过授权、"
+                "新鲜度和深度完整性校验。"
+                if level2.get("usable_symbols")
+                else "当前状态 unavailable：没有通过授权、新鲜度和完整性校验的可靠数据；"
+                "本监控仅继续使用新鲜基础行情和已落盘的参考位/候选计划，并降低"
+                "候选信号置信度。技术、公告、基本面或资金证据只有在上游明确提供"
+                "来源与时间戳时才可使用，本轮不会声称已自行采集。"
+            )
+        ),
+        "- 数据等级护栏：L1 永远不会标记或展示为 Level-2。",
     ]
+    level2_statuses = level2.get("statuses") or {}
+    if isinstance(level2_statuses, Mapping) and level2_statuses:
+        lines.append(
+            "- Level-2 状态计数："
+            + "；".join(
+                f"{status}={count}"
+                for status, count in sorted(level2_statuses.items())
+            )
+        )
+    assessments = level2.get("assessments") or {}
+    reason_counts: Dict[str, int] = {}
+    if isinstance(assessments, Mapping):
+        for assessment in assessments.values():
+            if not isinstance(assessment, Mapping):
+                continue
+            for reason in assessment.get("reason_codes") or []:
+                text = str(reason or "").strip()
+                if text:
+                    reason_counts[text] = reason_counts.get(text, 0) + 1
+    if reason_counts:
+        lines.append(
+            "- Level-2 降级原因："
+            + "；".join(
+                f"{reason}={count}" for reason, count in sorted(reason_counts.items())
+            )
+        )
+    if late_schedule:
+        lines.extend(
+            [
+                "",
+                "## 调度时效",
+                "",
+                "- 本轮未抓取盘中行情：GitHub 定时任务到达时，目标交易时段已经结束。",
+                f"- 实际到达：{late_schedule.get('observed_at') or '-'}",
+                f"- 目标结束：{late_schedule.get('intended_end_at') or '-'}",
+                f"- 超时秒数：{float(late_schedule.get('delay_seconds') or 0):.0f}",
+                "- 处理：保留既有状态，不补造历史盘中数据，也不发送买卖信号。",
+            ]
+        )
     if last_cycle is not None:
         lines.extend(
             [
@@ -1780,6 +1951,11 @@ def render_session_report(
                 ),
                 f"- 下一轮间隔：{last_cycle.next_interval_seconds:.0f} 秒",
                 f"- 数据源降级：{'是' if last_cycle.degraded else '否'}",
+                (
+                    f"- Level-2 有效覆盖："
+                    f"{sum(1 for item in last_cycle.level2_assessments if item.status == LEVEL2_AVAILABLE)}"
+                    f"/{len(last_cycle.level2_assessments)}"
+                ),
             ]
         )
     return "\n".join(lines).rstrip() + "\n"
@@ -1799,6 +1975,7 @@ def run_session(
     report_path: Path,
     candidate_plans_path: Optional[Path] = None,
     fetcher: Any = None,
+    level2_adapter: Optional[Level2DataAdapter] = None,
     phase_resolver: Callable[[str, datetime], str] = default_phase_resolver,
     clock: Callable[[], datetime] = lambda: datetime.now(SHANGHAI_TZ),
     sleeper: Callable[[float], None] = time.sleep,
@@ -1817,6 +1994,7 @@ def run_session(
     cooldown_seconds: float = DEFAULT_COOLDOWN_SECONDS,
     deterioration_pct: float = DEFAULT_DETERIORATION_PCT,
     max_cycles: int = 0,
+    late_start_policy: str = "error",
 ) -> SessionResult:
     configured_symbols = normalize_stock_list(stocks)
     if not configured_symbols:
@@ -1830,11 +2008,120 @@ def run_session(
         raise SessionError("最低行情覆盖率必须在 0 到 1 之间")
     if low_coverage_limit < 1:
         raise SessionError("连续低覆盖轮数必须至少为 1")
+    if late_start_policy not in {"error", "skip"}:
+        raise SessionError("late_start_policy 必须是 error 或 skip")
 
     started = clock().astimezone(SHANGHAI_TZ)
     if end_at <= started:
-        raise SessionError(
-            f"监控时段已过期：当前 {_iso(started)}，结束时间 {_iso(end_at)}"
+        if late_start_policy == "error":
+            raise SessionError(
+                f"监控时段已过期：当前 {_iso(started)}，结束时间 {_iso(end_at)}"
+            )
+        state = load_state_v2(state_path, now=started)
+        provider = state.setdefault("provider", {})
+        delay_seconds = max(0.0, (started - end_at).total_seconds())
+        provider["session_status"] = "late_schedule_skipped"
+        provider["late_schedule"] = {
+            "session": (
+                "morning"
+                if end_at.timetz().replace(tzinfo=None) <= datetime_time(12, 2)
+                else "afternoon"
+            ),
+            "observed_at": _iso(started),
+            "intended_end_at": _iso(end_at),
+            "delay_seconds": delay_seconds,
+            "policy": "skip_without_backfill",
+        }
+        notified = 0
+        created = 0
+        session_name = str(provider["late_schedule"]["session"])
+        notification_key = f"{started.date().isoformat()}:{session_name}"
+        notification_states = provider.get("late_schedule_notifications")
+        if not isinstance(notification_states, MutableMapping):
+            notification_states = {}
+            provider["late_schedule_notifications"] = notification_states
+        notification_state = notification_states.get(notification_key)
+        pending_ids = {
+            str(event.get("event_id") or "")
+            for event in state.get("outbox", [])
+            if event.get("condition") == "schedule_late"
+            and event.get("schedule_key") == notification_key
+        }
+        should_queue = not isinstance(notification_state, MutableMapping) or (
+            notification_state.get("status") != "sent"
+            and str(notification_state.get("event_id") or "") not in pending_ids
+        )
+        if should_queue:
+            event = _queue_event(
+                state,
+                now=started,
+                symbol="SYSTEM",
+                name=f"{session_name} 盘中监控",
+                condition="schedule_late",
+                transition="missed",
+                severity="warning",
+                price=None,
+                change_pct=None,
+                reference_price=None,
+                message=(
+                    f"GitHub 定时任务在目标结束时间 {_iso(end_at)} 之后"
+                    f" {delay_seconds / 60:.0f} 分钟才到达；本轮已安全跳过，"
+                    "没有补造盘中数据，也没有产生买卖信号。"
+                ),
+            )
+            event["schedule_key"] = notification_key
+            notification_state = {
+                "status": "pending",
+                "event_id": event["event_id"],
+                "queued_at": _iso(started),
+            }
+            notification_states[notification_key] = notification_state
+            created = 1
+            for stale_key in sorted(notification_states)[:-20]:
+                notification_states.pop(stale_key, None)
+        event_id = str(notification_state.get("event_id") or "")
+        notified = flush_outbox(
+            state,
+            now=started,
+            sender=notification_sender,
+            event_predicate=lambda event: (
+                event.get("condition") == "schedule_late"
+                and event.get("schedule_key") == notification_key
+            ),
+        )
+        event_pending = any(
+            str(event.get("event_id") or "") == event_id
+            for event in state.get("outbox", [])
+        )
+        if event_id and not event_pending:
+            notification_state["status"] = "sent"
+            notification_state["notified_at"] = _iso(started)
+        state["updated_at"] = _iso(started)
+        save_state_v2(state_path, state)
+        _write_report(
+            report_path,
+            render_session_report(
+                now=started,
+                symbols=configured_symbols,
+                last_cycle=None,
+                cycles=0,
+                events_created=created,
+                events_notified=notified,
+                pending_events=len(state.get("outbox", [])),
+                provider_status=provider,
+            ),
+        )
+        return SessionResult(
+            started_at=_iso(started),
+            ended_at=_iso(started),
+            cycles=0,
+            quote_cycles=0,
+            events_created=created,
+            events_notified=notified,
+            final_pending_events=len(state.get("outbox", [])),
+            termination_reason="late_schedule_skipped",
+            state_path=state_path,
+            report_path=report_path,
         )
 
     candidate_plans = load_candidate_plans(candidate_plans_path, now=started)
@@ -1878,6 +2165,7 @@ def run_session(
         ),
     }
     provider = state.setdefault("provider", {})
+    provider.pop("late_schedule", None)
     provider["reference_levels"] = reference_summary
     provider["candidate_plan_monitoring"] = {
         "path": str(candidate_plans_path) if candidate_plans_path else "",
@@ -1919,6 +2207,7 @@ def run_session(
     quote_fetcher = fetcher or TencentBatchQuoteFetcher(
         freshness_seconds=freshness_seconds
     )
+    depth_adapter = level2_adapter or Level2DataAdapter()
     cycles = 0
     quote_cycles = 0
     created_total = 0
@@ -2003,6 +2292,7 @@ def run_session(
                 cooldown_seconds=cooldown_seconds,
                 deterioration_pct=deterioration_pct,
                 candidate_plans=candidate_plans,
+                level2_adapter=depth_adapter,
                 notification_sender=notification_sender,
             )
             quote_cycles += 1
@@ -2155,6 +2445,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=0,
         help="测试用；0 表示持续到绝对结束时间",
     )
+    parser.add_argument(
+        "--late-start-policy",
+        choices=("error", "skip"),
+        default="error",
+        help="计划任务迟到且时段已结束时：报错或保留状态后安全跳过",
+    )
     return parser
 
 
@@ -2183,17 +2479,35 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             cooldown_seconds=args.cooldown_seconds,
             deterioration_pct=args.deterioration_pct,
             max_cycles=max(0, args.max_cycles),
+            late_start_policy=args.late_start_policy,
         )
     except SessionError as exc:
         print(f"分钟级盘中监控失败: {exc}", file=sys.stderr)
         return 2
-    print(
-        "分钟级盘中监控完成: "
-        f"cycles={result.cycles} quote_cycles={result.quote_cycles} "
-        f"events_created={result.events_created} "
-        f"events_notified={result.events_notified} "
-        f"pending={result.final_pending_events} state={result.state_path}"
-    )
+    if result.termination_reason == "late_schedule_skipped":
+        message = (
+            "分钟级盘中监控未执行：计划任务到达过晚，已保留状态并安全跳过；"
+            f"pending={result.final_pending_events} state={result.state_path}"
+        )
+        print(message)
+        if os.getenv("GITHUB_ACTIONS", "").strip().lower() == "true":
+            print(f"::warning title=盘中模拟监控未执行::{message}")
+            summary_path = os.getenv("GITHUB_STEP_SUMMARY", "").strip()
+            if summary_path:
+                try:
+                    with Path(summary_path).open("a", encoding="utf-8") as handle:
+                        handle.write("## ⚠️ 盘中模拟监控未执行\n\n")
+                        handle.write(message + "\n")
+                except OSError as exc:
+                    print(f"写入 GitHub 摘要失败: {exc}", file=sys.stderr)
+    else:
+        print(
+            "分钟级盘中监控完成: "
+            f"cycles={result.cycles} quote_cycles={result.quote_cycles} "
+            f"events_created={result.events_created} "
+            f"events_notified={result.events_notified} "
+            f"pending={result.final_pending_events} state={result.state_path}"
+        )
     return 0
 
 

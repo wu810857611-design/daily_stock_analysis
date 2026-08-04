@@ -57,19 +57,24 @@ jobs:
           set -euo pipefail
           mkdir -p data/intraday reports logs
           if [ "${{ github.event_name }}" = "schedule" ]; then
+            # 保留 cron 原本代表的时段。GitHub schedule 即使排队到另一时段，
+            # 也不能把上午漏监控改写成下午已监控。
             case "${{ github.event.schedule }}" in
               "17 1 * * 1-5") SESSION="morning" ;;
               "47 4 * * 1-5") SESSION="afternoon" ;;
               *) SESSION="auto" ;;
             esac
             MAX_CYCLES="0"
+            LATE_START_POLICY="skip"
           else
             SESSION="${{ github.event.inputs.session || 'auto' }}"
             MAX_CYCLES="${{ github.event.inputs.max_cycles || '0' }}"
+            LATE_START_POLICY="error"
           fi
           echo "SESSION=$SESSION" >> "$GITHUB_ENV"
           echo "MAX_CYCLES=$MAX_CYCLES" >> "$GITHUB_ENV"
-          echo "监控时段: $SESSION；测试轮数: $MAX_CYCLES"
+          echo "LATE_START_POLICY=$LATE_START_POLICY" >> "$GITHUB_ENV"
+          echo "监控时段: $SESSION；测试轮数: $MAX_CYCLES；迟到策略: $LATE_START_POLICY"
 
       - name: 恢复最近收盘数据库
         uses: actions/cache/restore@v4
@@ -384,6 +389,7 @@ jobs:
             --cooldown-seconds "$INTRADAY_ALERT_COOLDOWN_SECONDS" \
             --deterioration-pct "$INTRADAY_DETERIORATION_PCT" \
             --max-cycles "$MAX_CYCLES" \
+            --late-start-policy "$LATE_START_POLICY" \
             "${PLAN_ARGS[@]}"
 
       - name: 打包盘中状态

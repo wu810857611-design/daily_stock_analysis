@@ -692,7 +692,11 @@ def run_monitor(
             print(f"{symbol} 实时行情获取失败: {exc}", file=sys.stderr)
             raw_quote = None
         quote = quote_snapshot(symbol, raw_quote)
-        levels = load_reference_levels(database_path, symbol)
+        levels = load_reference_levels(
+            database_path,
+            symbol,
+            now=current_time,
+        )
         if not quote.name and levels.name:
             quote = QuoteSnapshot(
                 symbol=quote.symbol,

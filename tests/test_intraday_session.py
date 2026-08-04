@@ -1,11 +1,15 @@
 import json
+import os
 import sqlite3
 import tempfile
 import unittest
 from datetime import datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
+from scripts import intraday_session as intraday_session_module
 from scripts.intraday_monitor import ReferenceLevels
 from scripts.intraday_session import (
     RealtimeQuote,
@@ -1285,6 +1289,133 @@ class SessionLoopTests(unittest.TestCase):
                 )
             self.assertFalse((root / "state.json").exists())
 
+    def test_late_scheduled_session_preserves_state_and_reports_explicit_skip(self):
+        now = datetime(2026, 7, 28, 19, 5, tzinfo=TZ)
+        notifications = []
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            state_path = root / "state.json"
+            original = load_state_v2(state_path, now=now - timedelta(days=1))
+            original["symbols"]["300408"] = {"conditions": {}}
+            save_state_v2(state_path, original)
+
+            result = run_session(
+                stocks="300408",
+                end_at=datetime(2026, 7, 28, 16, 2, tzinfo=TZ),
+                database_path=root / "missing.db",
+                state_path=state_path,
+                report_path=root / "report.md",
+                clock=lambda: now,
+                late_start_policy="skip",
+                notification_sender=lambda **payload: notifications.append(payload)
+                or True,
+            )
+            restored = load_state_v2(state_path, now=now)
+            report = (root / "report.md").read_text(encoding="utf-8")
+
+        self.assertEqual(result.termination_reason, "late_schedule_skipped")
+        self.assertEqual(result.quote_cycles, 0)
+        self.assertIn("300408", restored["symbols"])
+        self.assertEqual(
+            restored["provider"]["session_status"], "late_schedule_skipped"
+        )
+        self.assertEqual(len(notifications), 1)
+        self.assertIn("没有产生买卖信号", notifications[0]["content"])
+        self.assertIn("late_schedule_skipped", report)
+        self.assertIn("不补造历史盘中数据", report)
+
+    def test_late_schedule_alert_retries_and_dedupes_each_session_window(self):
+        morning = datetime(2026, 7, 28, 13, 5, tzinfo=TZ)
+        afternoon = datetime(2026, 7, 28, 19, 5, tzinfo=TZ)
+        attempts = []
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            state_path = root / "state.json"
+
+            first = run_session(
+                stocks="300408",
+                end_at=datetime(2026, 7, 28, 12, 2, tzinfo=TZ),
+                database_path=root / "missing.db",
+                state_path=state_path,
+                report_path=root / "morning.md",
+                clock=lambda: morning,
+                late_start_policy="skip",
+                notification_sender=lambda **payload: attempts.append(payload)
+                or False,
+            )
+            morning_state = load_state_v2(state_path, now=morning)
+            second = run_session(
+                stocks="300408",
+                end_at=datetime(2026, 7, 28, 12, 2, tzinfo=TZ),
+                database_path=root / "missing.db",
+                state_path=state_path,
+                report_path=root / "morning-repeat.md",
+                clock=lambda: morning,
+                late_start_policy="skip",
+                notification_sender=lambda **payload: attempts.append(payload)
+                or False,
+            )
+            after_repeat = load_state_v2(state_path, now=morning)
+            third = run_session(
+                stocks="300408",
+                end_at=datetime(2026, 7, 28, 16, 2, tzinfo=TZ),
+                database_path=root / "missing.db",
+                state_path=state_path,
+                report_path=root / "afternoon.md",
+                clock=lambda: afternoon,
+                late_start_policy="skip",
+                notification_sender=lambda **payload: attempts.append(payload)
+                or False,
+            )
+            final_state = load_state_v2(state_path, now=afternoon)
+
+        self.assertEqual(first.events_created, 1)
+        self.assertEqual(len(morning_state["outbox"]), 1)
+        self.assertEqual(second.events_created, 0)
+        self.assertEqual(len(after_repeat["outbox"]), 1)
+        self.assertEqual(third.events_created, 1)
+        self.assertEqual(len(final_state["outbox"]), 2)
+        self.assertEqual(
+            set(final_state["provider"]["late_schedule_notifications"]),
+            {"2026-07-28:morning", "2026-07-28:afternoon"},
+        )
+        self.assertEqual(len(attempts), 2)
+
+    def test_main_marks_late_skip_as_not_executed_in_github_summary(self):
+        result = SimpleNamespace(
+            termination_reason="late_schedule_skipped",
+            cycles=0,
+            quote_cycles=0,
+            events_created=1,
+            events_notified=0,
+            final_pending_events=1,
+            state_path=Path("data/intraday/session_state.json"),
+        )
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            summary_path = Path(temporary_directory) / "summary.md"
+            with patch.object(
+                intraday_session_module,
+                "run_session",
+                return_value=result,
+            ), patch.dict(
+                os.environ,
+                {
+                    "GITHUB_ACTIONS": "true",
+                    "GITHUB_STEP_SUMMARY": str(summary_path),
+                },
+                clear=False,
+            ), patch("builtins.print") as printer:
+                exit_code = intraday_session_module.main(
+                    ["--stocks", "300408", "--late-start-policy", "skip"]
+                )
+            summary = summary_path.read_text(encoding="utf-8")
+
+        output = "\n".join(str(call.args[0]) for call in printer.call_args_list)
+        self.assertEqual(exit_code, 0)
+        self.assertIn("监控未执行", output)
+        self.assertIn("::warning", output)
+        self.assertIn("监控未执行", summary)
+
     def test_workflow_is_independent_and_never_overwrites_with_empty_state(self):
         workflow = (
             Path(__file__).resolve().parents[1]
@@ -1307,6 +1438,10 @@ class SessionLoopTests(unittest.TestCase):
         self.assertIn("name: intraday-alert-state", workflow)
         self.assertIn("load_state_v2(", workflow)
         self.assertIn("不上传、不缓存损坏状态", workflow)
+        self.assertIn('LATE_START_POLICY="skip"', workflow)
+        self.assertIn('SESSION="morning"', workflow)
+        self.assertIn('SESSION="afternoon"', workflow)
+        self.assertIn('--late-start-policy "$LATE_START_POLICY"', workflow)
         daily_workflow = (
             Path(__file__).resolve().parents[1]
             / ".github"
