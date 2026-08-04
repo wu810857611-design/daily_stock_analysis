@@ -38,6 +38,14 @@ MARKET_SCAN_REVIEW_SYSTEM_PROMPT = """
 若输入把基本面、行业、公告、资金、政策、盘口L1或Level-2标记为 unavailable，
 必须明确数据不足，绝不补造新闻、资金流、主力意图、政策或价格。
 
+即使用户没有提供分时图、K线、盘口或成交量，也必须优先使用系统主动取得且带
+来源、授权状态和时间戳的数据，不得把“用户未上传截图”当成停止研究的理由。
+数据获取优先级为：用户已合法授权且校验通过的Level-2深度盘口；新鲜L1报价与
+逐笔/分时/成交量；OHLCV与技术指标；公司公告、财务、估值、资金、行业与政策。
+若可靠Level-2不可用，应继续用这些彼此独立的数据源交叉验证，但必须降低盘口
+相关推断的置信度，禁止用推算结果冒充Level-2。所有调仓判断以扣除手续费、税费
+和滑点后的风险调整预期收益改善为目标，而不是以交易次数多少为目标。
+
 严格区分：
 1. facts：仅复述输入中有来源和时间的数据；
 2. inferences：基于数据的可证伪推断，不得冒充事实；
@@ -48,7 +56,8 @@ MARKET_SCAN_REVIEW_SYSTEM_PROMPT = """
 “主力抢筹、洗盘、诱多”写成事实。做T必须有分时、盘口、波动、胜率及扣费后正期望，
 否则只能判 watch。模型不是fallback，意见将与另一个模型独立比对。
 
-输出严格 JSON：
+输出严格 JSON，必须为每个输入代码且仅输出一条 review；`facts`、`inferences`、
+`risks`、`invalidators` 各最多两条，`thesis` 和 `view` 各最多 120 个汉字：
 {"reviews":[{"code":"...","verdict":"pass|watch|reject","confidence":0到1,
 "hard_risk":false,"thesis":"一句话审慎观点","risks":["..."],
 "invalidators":["..."],"facts":["..."],"inferences":["..."],"view":"..."}]}。
@@ -158,11 +167,22 @@ def build_litellm_reviewer(label: str) -> Optional[Callable[[Sequence[Mapping[st
                 {"role": "user", "content": user_prompt},
             ],
             "temperature": 0.1,
-            "max_tokens": 3500,
-            "timeout": 60,
+            "timeout": 120,
+            "num_retries": 1,
             "response_format": {"type": "json_object"},
             "stream": False,
         }
+        # Both production reviewers are hybrid-thinking models.  Their
+        # reasoning tokens can consume a small output cap before the JSON
+        # answer is complete.  Structured review is a deterministic extraction
+        # task, so explicitly disable thinking.  Qwen's official JSON-mode
+        # guidance also says not to set max_tokens; DeepSeek recommends a
+        # sufficiently large cap to avoid truncating the JSON object.
+        if label == "qwen":
+            kwargs["extra_body"] = {"enable_thinking": False}
+        else:
+            kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
+            kwargs["max_tokens"] = 12_000
         if settings["api_base"]:
             kwargs["api_base"] = settings["api_base"]
         if settings["extra_headers"]:
@@ -174,12 +194,21 @@ def build_litellm_reviewer(label: str) -> Optional[Callable[[Sequence[Mapping[st
         if not choices:
             raise ValueError(f"{label} reviewer returned no choices")
         choice = choices[0]
+        finish_reason = getattr(choice, "finish_reason", None)
+        if finish_reason is None and isinstance(choice, Mapping):
+            finish_reason = choice.get("finish_reason")
+        if str(finish_reason or "").strip().lower() != "stop":
+            raise ValueError(
+                f"{label} reviewer did not finish cleanly: {finish_reason}"
+            )
         message = getattr(choice, "message", None)
         if message is None and isinstance(choice, Mapping):
             message = choice.get("message")
         content = getattr(message, "content", None)
         if content is None and isinstance(message, Mapping):
             content = message.get("content")
+        if not str(content or "").strip():
+            raise ValueError(f"{label} reviewer returned empty content")
         return _json_object_from_text(str(content or ""))
 
     return review

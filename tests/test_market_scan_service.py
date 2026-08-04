@@ -4,16 +4,24 @@
 from __future__ import annotations
 
 import json
+import sys
 from datetime import datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Dict, Mapping, Sequence
 from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
+import pytest
 import yaml
 
-from scripts.market_scan import MARKET_SCAN_REVIEW_SYSTEM_PROMPT, persist_result_and_notify
+from scripts import market_scan_reviewer_smoke
+from scripts.market_scan import (
+    MARKET_SCAN_REVIEW_SYSTEM_PROMPT,
+    build_litellm_reviewer,
+    persist_result_and_notify,
+)
 from src.services.market_scan_service import (
     MARKET_A,
     MARKET_HK,
@@ -578,3 +586,137 @@ def test_market_scan_workflow_is_independent_simulation_with_fixed_state_artifac
     assert "00-daily-analysis.yml" not in text
     assert "01-adaptive-market-monitor.yml" not in text
     assert "broker" not in text.lower()
+
+
+def test_structured_reviewers_disable_thinking_and_avoid_json_truncation(
+    monkeypatch: Any,
+) -> None:
+    calls: list[Dict[str, Any]] = []
+
+    def fake_completion(**kwargs: Any) -> Any:
+        calls.append(kwargs)
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    finish_reason="stop",
+                    message=SimpleNamespace(
+                        content=(
+                            '{"reviews":[{"code":"600001","verdict":"watch",'
+                            '"confidence":0,"hard_risk":false,"thesis":"",'
+                            '"risks":[],"invalidators":[],"facts":[],'
+                            '"inferences":[],"view":""}]}'
+                        )
+                    ),
+                )
+            ]
+        )
+
+    monkeypatch.setitem(
+        sys.modules,
+        "litellm",
+        SimpleNamespace(completion=fake_completion),
+    )
+    monkeypatch.setenv("MARKET_SCAN_QWEN_MODEL", "qwen3.6-flash")
+    monkeypatch.setenv("LLM_DASHSCOPE_API_KEY", "test-qwen-key")
+    monkeypatch.setenv(
+        "LLM_DASHSCOPE_BASE_URL",
+        "https://dashscope.example/compatible-mode/v1",
+    )
+    monkeypatch.setenv("MARKET_SCAN_DEEPSEEK_MODEL", "deepseek-v4-flash")
+    monkeypatch.setenv("LLM_DEEPSEEK_API_KEY", "test-deepseek-key")
+    monkeypatch.setenv("LLM_DEEPSEEK_BASE_URL", "https://deepseek.example")
+
+    qwen = build_litellm_reviewer("qwen")
+    deepseek = build_litellm_reviewer("deepseek")
+    assert qwen is not None
+    assert deepseek is not None
+    assert len(qwen([{"code": "600001"}])["reviews"]) == 1
+    assert len(deepseek([{"code": "600001"}])["reviews"]) == 1
+
+    qwen_kwargs, deepseek_kwargs = calls
+    assert qwen_kwargs["extra_body"] == {"enable_thinking": False}
+    assert "max_tokens" not in qwen_kwargs
+    assert deepseek_kwargs["extra_body"] == {"thinking": {"type": "disabled"}}
+    assert deepseek_kwargs["max_tokens"] == 12_000
+    assert qwen_kwargs["response_format"] == {"type": "json_object"}
+    assert deepseek_kwargs["response_format"] == {"type": "json_object"}
+    assert qwen_kwargs["num_retries"] == deepseek_kwargs["num_retries"] == 1
+
+
+@pytest.mark.parametrize(
+    ("finish_reason", "content", "message"),
+    [
+        (None, '{"reviews":[]}', "did not finish cleanly"),
+        ("length", '{"reviews":[]}', "did not finish cleanly"),
+        ("stop", "", "empty content"),
+        ("stop", "not-json", "no JSON object"),
+    ],
+)
+def test_structured_reviewer_fails_closed_on_incomplete_or_invalid_response(
+    monkeypatch: Any,
+    finish_reason: Any,
+    content: str,
+    message: str,
+) -> None:
+    def fake_completion(**_kwargs: Any) -> Any:
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    finish_reason=finish_reason,
+                    message=SimpleNamespace(content=content),
+                )
+            ]
+        )
+
+    monkeypatch.setitem(
+        sys.modules,
+        "litellm",
+        SimpleNamespace(completion=fake_completion),
+    )
+    monkeypatch.setenv("MARKET_SCAN_QWEN_MODEL", "qwen3.6-flash")
+    monkeypatch.setenv("LLM_DASHSCOPE_API_KEY", "test-qwen-key")
+    reviewer = build_litellm_reviewer("qwen")
+    assert reviewer is not None
+
+    with pytest.raises((ValueError, json.JSONDecodeError), match=message):
+        reviewer([{"code": "600001"}])
+
+
+def test_reviewer_smoke_is_isolated_from_scan_state_and_notifications(
+    monkeypatch: Any,
+) -> None:
+    def fake_builder(label: str) -> Any:
+        def review(payload: Sequence[Mapping[str, Any]]) -> Mapping[str, Any]:
+            assert payload[0]["smoke_test"] is True
+            return {
+                "reviews": [
+                    {
+                        "code": "600000",
+                        "verdict": "watch",
+                        "confidence": 0.0,
+                        "hard_risk": False,
+                        "facts": [],
+                        "inferences": [],
+                        "risks": ["验收占位样本无行情"],
+                        "invalidators": [],
+                        "thesis": f"{label} smoke",
+                        "view": "仅验证格式",
+                    }
+                ]
+            }
+
+        return review
+
+    monkeypatch.setattr(
+        market_scan_reviewer_smoke,
+        "build_litellm_reviewer",
+        fake_builder,
+    )
+    result = market_scan_reviewer_smoke.run_smoke()
+
+    assert result["success"] is True
+    assert result["fetched_market_data"] is False
+    assert result["state_mutated"] is False
+    assert result["notification_sent"] is False
+    assert result["auto_order_enabled"] is False
+    assert set(result["checks"]) == {"qwen", "deepseek"}

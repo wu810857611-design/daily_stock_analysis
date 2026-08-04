@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 > For user-friendly release highlights, see the [GitHub Releases](https://github.com/ZhuLinsen/daily_stock_analysis/releases) page.
 
 ## [Unreleased]
+- [测试] 新增手动双模型结构化输出验收工作流，仅验证通义与 DeepSeek 的真实 JSON 调用链；不抓行情、不读写模拟状态、不推送微信也不连接券商。
+- [修复] 旧版盘中监控读取止损/目标参考位时复用本轮观察时间，避免运行数日后因误用机器当前日期把本轮有效参考位错误判为过期。
+- [修复] 分钟盘中定时任务保留 cron 原定的上午/下午审计身份；到达过晚时保留有效状态、生成明确的 `late_schedule_skipped` 报告，把提醒放入可重试 outbox，并在 GitHub 摘要标记“未执行”，不再静默掩盖漏监控。
+- [修复] 全市场双模型结构化复核显式关闭混合模型思考模式，并移除通义 JSON 输出上限、提高 DeepSeek 输出预算和校验完成原因，避免候选批量复核被截断后仍被误判为可用。
+- [新功能] 分钟盘中监控新增可选的授权 Level-2 数据适配与逐标的质量门禁，校验 provider 身份、市场授权范围、授权有效期、数据等级、新鲜度及买卖盘深度完整性；任何失败均明确降级到 L1/技术/公告/基本面等合法数据并折减候选置信度，且保持模拟人工复核、不连接券商。
+- [测试] 覆盖 Level-2 未配置、未授权、越权市场、过期快照、L1 冒充、盘口不完整/交叉及 provider 异常的 fail-closed 路径，并验证降级后基础行情风险监控仍继续运行。
 - [新功能] 新增 A 股与港股通全市场分层模拟扫描、分钟级盘中基础行情监控，以及扣除手续费、税费和滑点后的自适应风险收益策略；严格拒绝过期行情和未授权 Level-2 推断，所有候选仅供人工复核且不连接券商。
 - [文档] 补充全市场模拟扫描、盘中监控、Level-2 授权边界、数据降级规则与 GitHub Actions 配置说明。
 - [修复] 将 `TencentFetcher` 的默认优先级从与 Efinance 并列的 `0` 调整为最终兜底的 `5`，避免 Efinance 短暂失败时越过其余 A 股日 K 数据源，并新增 `TENCENT_PRIORITY` 环境变量用于显式覆盖（refs #2032）。

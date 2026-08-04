@@ -98,7 +98,11 @@ class IntradayMonitorTests(unittest.TestCase):
             database_path = Path(temporary_directory) / "analysis.db"
             create_reference_database(database_path)
 
-            levels = load_reference_levels(database_path, "HK00981")
+            levels = load_reference_levels(
+                database_path,
+                "HK00981",
+                now=datetime(2026, 7, 28, 10, 30, tzinfo=SHANGHAI_TZ),
+            )
 
         self.assertEqual(levels.name, "中芯国际")
         self.assertEqual(levels.stop_loss, 50.0)
