@@ -8,9 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 > For user-friendly release highlights, see the [GitHub Releases](https://github.com/ZhuLinsen/daily_stock_analysis/releases) page.
 
 ## [Unreleased]
+- [新功能] 盘中提醒新增确定性模拟决策门：原始涨跌、止损/止盈、adaptive 与数据质量事件继续完整留账，仅在操作建议或风险/关键位发生实质变化时 Push；取消按 cooldown 机械重发，并将数据降级与恢复各收敛为一次提醒。
+- [新功能] 新增以 2026-08-07 收盘冻结的 14 只核心持仓“完全死拿 vs 策略影子账户”实验；信号只追加、成交不回填，净值扣除模拟成本与滑点，第 20 日检查后连续运行至第 60 日。真实数量、成本和绝对净值通过 GitHub secret 与 AES 加密状态保护，私密成绩单仅由 PushPlus 发送。
+- [改进] 移除分钟盘中工作流的 GitHub 原生 schedule，改由外部 cron-job.org 在北京时间 09:20/12:50 分别以 `workflow_dispatch` 触发 morning/afternoon；Run workflow 的手动入口与迟到安全保护保持可用。
 - [测试] 新增手动双模型结构化输出验收工作流，仅验证通义与 DeepSeek 的真实 JSON 调用链；不抓行情、不读写模拟状态、不推送微信也不连接券商。
 - [修复] 旧版盘中监控读取止损/目标参考位时复用本轮观察时间，避免运行数日后因误用机器当前日期把本轮有效参考位错误判为过期。
-- [修复] 分钟盘中定时任务保留 cron 原定的上午/下午审计身份；到达过晚时保留有效状态、生成明确的 `late_schedule_skipped` 报告，把提醒放入可重试 outbox，并在 GitHub 摘要标记“未执行”，不再静默掩盖漏监控。
+- [修复] 分钟盘中任务保留 dispatch 指定的上午/下午审计身份；到达过晚时保留有效状态、生成明确的 `late_schedule_skipped` 报告，把提醒放入可重试 outbox，并在 GitHub 摘要标记“未执行”，不再静默掩盖漏监控。
 - [修复] 全市场双模型结构化复核显式关闭混合模型思考模式，并移除通义 JSON 输出上限、提高 DeepSeek 输出预算和校验完成原因，避免候选批量复核被截断后仍被误判为可用。
 - [新功能] 分钟盘中监控新增可选的授权 Level-2 数据适配与逐标的质量门禁，校验 provider 身份、市场授权范围、授权有效期、数据等级、新鲜度及买卖盘深度完整性；任何失败均明确降级到 L1/技术/公告/基本面等合法数据并折减候选置信度，且保持模拟人工复核、不连接券商。
 - [测试] 覆盖 Level-2 未配置、未授权、越权市场、过期快照、L1 冒充、盘口不完整/交叉及 provider 异常的 fail-closed 路径，并验证降级后基础行情风险监控仍继续运行。

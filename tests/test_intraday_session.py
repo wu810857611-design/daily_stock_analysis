@@ -18,16 +18,23 @@ from scripts.intraday_session import (
     active_symbols_at,
     clear_removed_adaptive_plan_reviews,
     enqueue_adaptive_plan_reviews,
+    enqueue_cash_available_candidate_rechecks,
     flush_outbox,
     load_candidate_plans,
     load_reference_levels_batch,
     load_state_v2,
     parse_tencent_batch,
+    process_actionable_decisions,
     resolve_session_end,
     run_cycle,
     run_session,
     save_state_v2,
     update_condition_state,
+)
+from scripts.shadow_ab_experiment import (
+    INITIAL_INSTRUMENTS,
+    initialize_state as initialize_shadow_state,
+    record_signal as record_shadow_signal,
 )
 
 
@@ -100,6 +107,22 @@ def quote(symbol, price, change_pct, now, *, stale=False):
         stale_seconds=0,
         is_stale=stale,
         source="fake",
+    )
+
+
+def synthetic_shadow_state():
+    return initialize_shadow_state(
+        {
+            "positions": [
+                {
+                    "symbol": item["symbol"],
+                    "quantity": 100,
+                    "historical_cost": item["verified_close"],
+                }
+                for item in INITIAL_INSTRUMENTS
+            ]
+        },
+        created_at=datetime(2026, 8, 9, 10, tzinfo=TZ),
     )
 
 
@@ -310,9 +333,10 @@ class StateMachineTests(unittest.TestCase):
                 now=now,
                 sender=lambda **payload: sent.append(payload) or True,
             ),
-            2,
+            0,
         )
-        self.assertEqual(len(sent), 1)
+        self.assertEqual(len(sent), 0)
+        self.assertEqual(len(state["event_ledger"]), 2)
         self.assertEqual(state["outbox"], [])
 
         recovery_time = now + timedelta(minutes=2)
@@ -352,9 +376,7 @@ class StateMachineTests(unittest.TestCase):
         )
         self.assertEqual(created, 2)
 
-        flush_outbox(
-            state, now=repeat_time, sender=lambda **_payload: True
-        )
+        flush_outbox(state, now=repeat_time, sender=lambda **_payload: True)
         worse_time = repeat_time + timedelta(minutes=1)
         created = update_condition_state(
             state,
@@ -377,10 +399,13 @@ class StateMachineTests(unittest.TestCase):
         )
         self.assertGreaterEqual(created, 1)
         self.assertTrue(
-            any(event["transition"] == "deteriorated" for event in state["outbox"])
+            any(
+                event["transition"] == "deteriorated"
+                for event in state["event_ledger"]
+            )
         )
 
-    def test_cooldown_and_severity_upgrade_can_realert(self):
+    def test_cooldown_never_realerts_but_severity_upgrade_is_recorded(self):
         now = datetime(2026, 7, 28, 10, 0, tzinfo=TZ)
         state = {
             "schema_version": 2,
@@ -423,10 +448,15 @@ class StateMachineTests(unittest.TestCase):
             cooldown_seconds=900,
             deterioration_pct=1,
         )
-        self.assertEqual(created, 1)
-        self.assertEqual(state["outbox"][0]["transition"], "cooldown_repeat")
+        self.assertEqual(created, 0)
+        self.assertEqual(state["outbox"], [])
+        self.assertFalse(
+            any(
+                event.get("transition") == "cooldown_repeat"
+                for event in state.get("event_ledger", [])
+            )
+        )
 
-        state["outbox"] = []
         critical_time = cooldown_time + timedelta(minutes=1)
         critical_alert = evaluate_quote(
             QuoteSnapshot(
@@ -446,8 +476,289 @@ class StateMachineTests(unittest.TestCase):
             deterioration_pct=1,
         )
         self.assertEqual(created, 1)
-        self.assertEqual(state["outbox"][0]["transition"], "severity_up")
-        self.assertEqual(state["outbox"][0]["severity"], "critical")
+        self.assertEqual(state["outbox"], [])
+        self.assertEqual(state["event_ledger"][-1]["transition"], "severity_up")
+        self.assertEqual(state["event_ledger"][-1]["severity"], "critical")
+
+    def test_decision_gate_pushes_action_not_plain_move_and_dedupes(self):
+        from scripts.intraday_monitor import QuoteSnapshot, evaluate_quote
+
+        now = datetime(2026, 8, 10, 10, 0, tzinfo=TZ)
+        state = load_state_v2(Path("/path/that/does/not/exist"), now=now)
+        shadow = synthetic_shadow_state()
+        levels = {"688333": ReferenceLevels(stop_loss=110)}
+        alerts = evaluate_quote(
+            QuoteSnapshot("688333", "铂力特", 109, -1),
+            levels["688333"],
+            down_threshold_pct=3,
+            up_threshold_pct=5,
+        )
+        start = len(state["event_ledger"])
+        update_condition_state(
+            state,
+            now=now,
+            quote=quote("688333", 109, -1, now),
+            alerts=alerts,
+            levels=levels["688333"],
+            cooldown_seconds=1,
+            deterioration_pct=0.1,
+        )
+        raw = state["event_ledger"][start:]
+        self.assertEqual(
+            process_actionable_decisions(
+                state,
+                now=now,
+                raw_events=raw,
+                levels=levels,
+                shadow_state=shadow,
+                signal_recorder=record_shadow_signal,
+            ),
+            1,
+        )
+        self.assertEqual(len(state["outbox"]), 1)
+        self.assertEqual(state["outbox"][0]["payload"]["action"], "模拟减仓1/3")
+        self.assertEqual(len(shadow["signal_ledger"]), 1)
+        pushed = []
+        flush_outbox(
+            state,
+            now=now,
+            sender=lambda **payload: pushed.append(payload) or True,
+        )
+        self.assertIn("建议动作：模拟减仓1/3", pushed[0]["content"])
+
+        later = now + timedelta(minutes=20)
+        start = len(state["event_ledger"])
+        update_condition_state(
+            state,
+            now=later,
+            quote=quote("688333", 108.8, -1.1, later),
+            alerts=evaluate_quote(
+                QuoteSnapshot("688333", "铂力特", 108.8, -1.1),
+                levels["688333"],
+                down_threshold_pct=3,
+                up_threshold_pct=5,
+            ),
+            levels=levels["688333"],
+            cooldown_seconds=1,
+            deterioration_pct=0.1,
+        )
+        process_actionable_decisions(
+            state,
+            now=later,
+            raw_events=state["event_ledger"][start:],
+            levels=levels,
+            shadow_state=shadow,
+            signal_recorder=record_shadow_signal,
+        )
+        self.assertEqual(state["outbox"], [])
+
+        rise_time = later + timedelta(minutes=1)
+        start = len(state["event_ledger"])
+        rise_alerts = evaluate_quote(
+            QuoteSnapshot("300499", "高澜股份", 30, 5.2),
+            ReferenceLevels(),
+            down_threshold_pct=3,
+            up_threshold_pct=5,
+        )
+        update_condition_state(
+            state,
+            now=rise_time,
+            quote=quote("300499", 30, 5.2, rise_time),
+            alerts=rise_alerts,
+            levels=ReferenceLevels(),
+            cooldown_seconds=1,
+            deterioration_pct=0.1,
+        )
+        process_actionable_decisions(
+            state,
+            now=rise_time,
+            raw_events=state["event_ledger"][start:],
+            levels={},
+            shadow_state=shadow,
+            signal_recorder=record_shadow_signal,
+        )
+        self.assertEqual(state["outbox"], [])
+        self.assertEqual(
+            state["event_ledger"][start]["decision_result"],
+            "no_operation_price_move_only",
+        )
+
+    def test_same_cycle_keeps_only_strongest_action_per_symbol(self):
+        now = datetime(2026, 8, 10, 10, 0, tzinfo=TZ)
+        state = load_state_v2(Path("/path/that/does/not/exist"), now=now)
+        shadow = synthetic_shadow_state()
+        quote_time = (now - timedelta(seconds=5)).isoformat()
+        stop_event = {
+            "event_id": "stop-same-cycle",
+            "symbol": "688333",
+            "name": "铂力特",
+            "condition": "stop_loss",
+            "transition": "activated",
+            "severity": "high",
+            "price": 99,
+            "change_pct": -2,
+            "reference_price": 100,
+            "payload": {
+                "quote_time": quote_time,
+                "data_quality": "fresh_l1",
+            },
+        }
+        adaptive_event = {
+            "event_id": "adaptive-same-cycle",
+            "symbol": "688333",
+            "name": "铂力特",
+            "condition": "adaptive_risk_review",
+            "transition": "manual_review",
+            "severity": "high",
+            "price": 99,
+            "change_pct": -2,
+            "reference_price": 100,
+            "payload": {
+                "quote_time": quote_time,
+                "data_quality": "fresh_l1",
+                "stop_loss": 100,
+            },
+        }
+
+        self.assertEqual(
+            process_actionable_decisions(
+                state,
+                now=now,
+                raw_events=[stop_event, adaptive_event],
+                levels={"688333": ReferenceLevels(stop_loss=100)},
+                shadow_state=shadow,
+                signal_recorder=record_shadow_signal,
+            ),
+            1,
+        )
+        self.assertEqual(len(state["outbox"]), 1)
+        self.assertEqual(state["outbox"][0]["payload"]["action"], "模拟减仓1/2")
+        self.assertEqual(len(shadow["signal_ledger"]), 1)
+        self.assertEqual(
+            stop_event["decision_result"],
+            "merged_into_stronger_same_cycle_decision",
+        )
+
+    def test_observed_candidate_rechecks_when_same_currency_cash_appears(self):
+        now = datetime(2026, 8, 10, 10, 0, tzinfo=TZ)
+        state = load_state_v2(Path("/path/that/does/not/exist"), now=now)
+        shadow = synthetic_shadow_state()
+        candidate = {
+            "scope": "watchlist",
+            "symbol": "HK00700",
+            "market": "H",
+            "entry_low": 99,
+            "entry_high": 101,
+            "plan_price": 100,
+            "stop_loss": 95,
+            "target_price": 120,
+            "confidence": 0.8,
+            "data_quality": "high",
+            "expected_holding_days": 20,
+            "position_state": "flat",
+            "market_costs": {
+                "entry_fee_bps": 10,
+                "exit_fee_bps": 10,
+                "entry_slippage_bps": 5,
+                "exit_slippage_bps": 5,
+            },
+        }
+        initial_quote = quote("HK00700", 100, 0.2, now)
+        start = len(state["event_ledger"])
+        self.assertEqual(
+            enqueue_adaptive_plan_reviews(
+                state,
+                now=now,
+                quotes=[initial_quote],
+                candidates=[candidate],
+            ),
+            1,
+        )
+        self.assertEqual(
+            process_actionable_decisions(
+                state,
+                now=now,
+                raw_events=state["event_ledger"][start:],
+                levels={},
+                shadow_state=shadow,
+                signal_recorder=record_shadow_signal,
+            ),
+            1,
+        )
+        self.assertEqual(
+            state["outbox"][0]["payload"]["conclusion"],
+            "进入观察，等待资金条件",
+        )
+        self.assertEqual(shadow["signal_ledger"], [])
+
+        shadow["strategy_shadow_portfolio"]["cash_by_currency"]["HKD"] = 100000
+        later = now + timedelta(minutes=1)
+        later_quote = quote("HK00700", 100, 0.2, later)
+        start = len(state["event_ledger"])
+        self.assertEqual(
+            enqueue_cash_available_candidate_rechecks(
+                state,
+                now=later,
+                quotes=[later_quote],
+                candidates=[candidate],
+                shadow_state=shadow,
+            ),
+            1,
+        )
+        self.assertEqual(
+            process_actionable_decisions(
+                state,
+                now=later,
+                raw_events=state["event_ledger"][start:],
+                levels={},
+                shadow_state=shadow,
+                signal_recorder=record_shadow_signal,
+            ),
+            1,
+        )
+        self.assertEqual(len(state["outbox"]), 1)
+        self.assertEqual(state["outbox"][0]["payload"]["action"], "模拟买入0.5成")
+        self.assertEqual(len(shadow["signal_ledger"]), 1)
+
+    def test_legacy_raw_outbox_is_audited_but_never_pushed(self):
+        now = datetime(2026, 8, 10, 10, 0, tzinfo=TZ)
+        state = load_state_v2(Path("/path/that/does/not/exist"), now=now)
+        state["outbox"] = [
+            {
+                "event_id": "legacy-sharp-drop",
+                "created_at": now.isoformat(),
+                "symbol": "300408",
+                "name": "三环集团",
+                "condition": "sharp_drop",
+                "transition": "activated",
+                "severity": "high",
+                "price": 100,
+                "change_pct": -3.1,
+                "message": "legacy raw alert",
+                "attempts": 1,
+                "next_attempt_at": now.isoformat(),
+            }
+        ]
+        calls = []
+
+        self.assertEqual(
+            flush_outbox(
+                state,
+                now=now,
+                sender=lambda **payload: calls.append(payload) or True,
+            ),
+            0,
+        )
+        self.assertEqual(calls, [])
+        self.assertEqual(state["outbox"], [])
+        self.assertEqual(
+            state["cancelled_events"][-1]["cancel_reason"],
+            "legacy_raw_event_requires_decision_gate",
+        )
+        self.assertEqual(
+            state["event_ledger"][-1]["decision_result"],
+            "suppressed_legacy_raw_push",
+        )
 
     def test_push_failure_keeps_outbox_and_retry_succeeds_after_restart(self):
         now = datetime(2026, 7, 28, 10, 0, tzinfo=TZ)
@@ -494,7 +805,7 @@ class StateMachineTests(unittest.TestCase):
             )
             self.assertEqual(restored["outbox"], [])
 
-    def test_failed_pending_event_is_cancelled_when_fresh_quote_clears_condition(self):
+    def test_raw_condition_is_never_pushed_and_clear_is_audited(self):
         from scripts.intraday_monitor import QuoteSnapshot, evaluate_quote
 
         now = datetime(2026, 7, 28, 10, 0, tzinfo=TZ)
@@ -522,7 +833,7 @@ class StateMachineTests(unittest.TestCase):
             deterioration_pct=1,
         )
         self.assertEqual(flush_outbox(state, now=now, sender=lambda **_: False), 0)
-        self.assertEqual(len(state["outbox"]), 1)
+        self.assertEqual(state["outbox"], [])
 
         recovery = now + timedelta(seconds=31)
         update_condition_state(
@@ -545,9 +856,12 @@ class StateMachineTests(unittest.TestCase):
         )
         self.assertEqual(calls, [])
         self.assertEqual(state["outbox"], [])
-        self.assertEqual(
-            state["cancelled_events"][-1]["cancel_reason"],
-            "condition_cleared_before_delivery",
+        self.assertTrue(
+            any(
+                event.get("condition") == "stop_loss"
+                and event.get("transition") == "cleared"
+                for event in state["event_ledger"]
+            )
         )
 
     def test_adaptive_reviews_require_complete_explicit_simulation_plan(self):
@@ -583,7 +897,8 @@ class StateMachineTests(unittest.TestCase):
             ),
             1,
         )
-        self.assertIn("不是买入指令", state["outbox"][0]["message"])
+        self.assertEqual(state["outbox"], [])
+        self.assertIn("不是买入指令", state["event_ledger"][-1]["message"])
         self.assertGreater(
             state["symbols"]["300408"]["adaptive_policy"][
                 "incumbent_annualized_utility"
@@ -630,7 +945,9 @@ class StateMachineTests(unittest.TestCase):
             ),
             0,
         )
-        self.assertFalse(any("卖出" in item["message"] for item in state["outbox"]))
+        self.assertFalse(
+            any("卖出" in item["message"] for item in state["event_ledger"])
+        )
 
 
 class CycleTests(unittest.TestCase):
@@ -723,6 +1040,29 @@ class CycleTests(unittest.TestCase):
         self.assertEqual(results[2].next_interval_seconds, 120)
         self.assertEqual(len(sender_calls), 1)
 
+        recovered = {
+            "300408": quote("300408", 40, 0.1, now + timedelta(minutes=3)),
+            "HK00981": quote("HK00981", 50, 0.1, now + timedelta(minutes=3)),
+        }
+        run_cycle(
+            symbols=["300408", "HK00981"],
+            state=state,
+            levels={},
+            fetcher=FakeFetcher([recovered]),
+            now=now + timedelta(minutes=3),
+            notification_sender=lambda **payload: sender_calls.append(payload) or True,
+        )
+        run_cycle(
+            symbols=["300408", "HK00981"],
+            state=state,
+            levels={},
+            fetcher=FakeFetcher([recovered]),
+            now=now + timedelta(minutes=3),
+            notification_sender=lambda **payload: sender_calls.append(payload) or True,
+        )
+        self.assertEqual(len(sender_calls), 2)
+        self.assertIn("行情数据源已恢复", sender_calls[-1]["content"])
+
     def test_low_coverage_does_not_slow_a_fresh_near_risk_quote(self):
         now = datetime(2026, 7, 28, 10, 0, tzinfo=TZ)
         state = {
@@ -762,6 +1102,59 @@ class SessionLoopTests(unittest.TestCase):
 
         active = active_symbols_at(["300408", "HK00981"], now, resolver)
         self.assertEqual(active, ["HK00981"])
+
+    def test_session_merges_all_shadow_symbols_without_any_broker_action(self):
+        start = datetime(2026, 8, 10, 10, 0, tzinfo=TZ)
+        clock = FakeClock(start)
+
+        def batch(symbols, now):
+            return {
+                symbol: quote(symbol, 50, 0.1, now)
+                for symbol in symbols
+            }
+
+        private_payload = {
+            "positions": [
+                {
+                    "symbol": item["symbol"],
+                    "quantity": 100,
+                    "historical_cost": item["verified_close"],
+                }
+                for item in INITIAL_INSTRUMENTS
+            ]
+        }
+        fetcher = FakeFetcher([batch])
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            run_session(
+                stocks="300408",
+                end_at=start + timedelta(hours=2),
+                database_path=root / "missing.db",
+                state_path=root / "session.json",
+                report_path=root / "session.md",
+                shadow_state_path=root / "shadow.json",
+                shadow_report_path=root / "shadow.md",
+                shadow_initial_portfolio_json=json.dumps(private_payload),
+                fetcher=fetcher,
+                phase_resolver=lambda _market, _now: "intraday",
+                clock=clock.now,
+                sleeper=clock.sleep,
+                notification_sender=lambda **_: True,
+                max_cycles=1,
+            )
+            shadow = json.loads((root / "shadow.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(
+            set(fetcher.calls[0][0]),
+            {item["symbol"] for item in INITIAL_INSTRUMENTS},
+        )
+        self.assertEqual(
+            shadow["buy_and_hold_baseline"]["positions"],
+            shadow["strategy_shadow_portfolio"]["positions"],
+        )
+        self.assertIs(shadow["simulation_only"], True)
+        self.assertIs(shadow["broker_connected"], False)
+        self.assertEqual(shadow["trades"], [])
 
     def test_fake_clock_runs_to_absolute_end_without_real_sleep_or_network(self):
         start = datetime(2026, 7, 28, 15, 59, tzinfo=TZ)
@@ -1194,7 +1587,7 @@ class SessionLoopTests(unittest.TestCase):
             "candidate_plan_or_quote_invalid_before_delivery",
         )
 
-    def test_stale_quote_cancels_failed_entry_before_retry_delivery(self):
+    def test_stale_quote_clears_raw_entry_without_any_direct_push(self):
         start = datetime(2026, 7, 28, 10, 0, tzinfo=TZ)
         candidate = {
             "code": "HK00700",
@@ -1225,7 +1618,8 @@ class SessionLoopTests(unittest.TestCase):
             candidates=[candidate],
         )
         self.assertEqual(created, 1)
-        self.assertEqual(len(state["outbox"]), 1)
+        self.assertEqual(state["outbox"], [])
+        self.assertEqual(len(state["event_ledger"]), 1)
 
         stale_time = start + timedelta(minutes=1)
         enqueue_adaptive_plan_reviews(
@@ -1245,8 +1639,10 @@ class SessionLoopTests(unittest.TestCase):
         self.assertEqual(notifications, [])
         self.assertEqual(state["outbox"], [])
         self.assertEqual(
-            state["cancelled_events"][-1]["cancel_reason"],
-            "candidate_plan_or_quote_invalid_before_delivery",
+            state["symbols"]["HK00700"]["adaptive_reviews"][
+                "adaptive_entry_review"
+            ]["status"],
+            "cleared",
         )
 
     def test_all_unknown_calendar_exits_as_explicit_degradation(self):
@@ -1423,8 +1819,11 @@ class SessionLoopTests(unittest.TestCase):
             / "workflows"
             / "01-intraday-session.yml"
         ).read_text(encoding="utf-8")
-        self.assertIn("cron: '17 1 * * 1-5'", workflow)
-        self.assertIn("cron: '47 4 * * 1-5'", workflow)
+        self.assertNotIn("schedule:", workflow)
+        self.assertNotIn("cron:", workflow)
+        self.assertIn("workflow_dispatch:", workflow)
+        self.assertIn("- morning", workflow)
+        self.assertIn("- afternoon", workflow)
         self.assertIn("timeout-minutes: 210", workflow)
         self.assertIn("group: intraday-session-", workflow)
         self.assertNotIn("RANDOM", workflow)
@@ -1439,9 +1838,10 @@ class SessionLoopTests(unittest.TestCase):
         self.assertIn("load_state_v2(", workflow)
         self.assertIn("不上传、不缓存损坏状态", workflow)
         self.assertIn('LATE_START_POLICY="skip"', workflow)
-        self.assertIn('SESSION="morning"', workflow)
-        self.assertIn('SESSION="afternoon"', workflow)
+        self.assertIn('SESSION="${{ github.event.inputs.session', workflow)
         self.assertIn('--late-start-policy "$LATE_START_POLICY"', workflow)
+        self.assertIn('--shadow-state "$SHADOW_STATE_PLAIN"', workflow)
+        self.assertIn("SHADOW_AB_INITIAL_PORTFOLIO_JSON", workflow)
         daily_workflow = (
             Path(__file__).resolve().parents[1]
             / ".github"
