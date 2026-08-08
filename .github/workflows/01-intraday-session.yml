@@ -255,15 +255,43 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           STATE_BRANCH: ${{ github.ref_name }}
+          SHADOW_AB_STATE_KEY: ${{ secrets.SHADOW_AB_STATE_KEY }}
         run: |
           set -euo pipefail
-          if [ -f data/intraday/session_state.json ] && [ -f data/intraday/shadow_ab_state.json.enc ]; then
+          validate_shadow_state() {
+            local check_file
+            check_file="$(mktemp "$RUNNER_TEMP/shadow-ab-restore.XXXXXX")"
+            if [ -n "${SHADOW_AB_STATE_KEY:-}" ] && \
+              openssl enc -d -aes-256-cbc -pbkdf2 \
+                -pass env:SHADOW_AB_STATE_KEY \
+                -in data/intraday/shadow_ab_state.json.enc \
+                -out "$check_file" && \
+              SHADOW_CHECK="$check_file" python3 - <<'PY'
+          import os
+          from pathlib import Path
+
+          from scripts.shadow_ab_experiment import load_state
+
+          load_state(Path(os.environ["SHADOW_CHECK"]))
+          PY
+            then
+              rm -f "$check_file"
+              return 0
+            fi
+            rm -f "$check_file"
+            return 1
+          }
+
+          if [ -f data/intraday/session_state.json ] && \
+            [ -f data/intraday/shadow_ab_state.json.enc ] && \
+            validate_shadow_state; then
             echo "✅ 已从 Actions cache 恢复盘中状态和加密 A/B 状态"
             exit 0
           fi
           if [ -f data/intraday/session_state.json ]; then
             echo "ℹ️ cache 只有旧盘中状态，继续查找含加密 A/B 状态的 artifact"
           fi
+          rm -f data/intraday/shadow_ab_state.json.enc
 
           TMP_DIR="$(mktemp -d)"
           gh api --method GET \
@@ -325,7 +353,15 @@ jobs:
               archive.extractall(workspace, members=members)
           PY
           test -f data/intraday/session_state.json
-          echo "✅ 已从最新固定 artifact 恢复盘中状态"
+          if [ -f data/intraday/shadow_ab_state.json.enc ]; then
+            if ! validate_shadow_state; then
+              echo "❌ 最新固定 artifact 的加密 A/B 状态无法解密或校验；拒绝重建账户"
+              exit 1
+            fi
+            echo "✅ 已从最新固定 artifact 恢复盘中状态和加密 A/B 状态"
+          else
+            echo "ℹ️ 最新固定 artifact 仅含旧盘中状态；A/B账户只允许在初始化窗口创建"
+          fi
 
       - name: 运行分钟级 A/H 盘中模拟监控
         shell: bash
@@ -457,7 +493,7 @@ jobs:
               tar -czf intraday-alert-state.tar.gz data/intraday
               echo "available=true" >> "$GITHUB_OUTPUT"
             else
-              echo "::error::盘中状态或加密 A/B 状态校验失败；不上传、不缓存不完整状态"
+              echo "::error::盘中状态或加密 A/B 状态校验失败；不上传、不缓存损坏状态或不完整状态"
               echo "available=false" >> "$GITHUB_OUTPUT"
               {
                 echo "# 盘中状态无效"

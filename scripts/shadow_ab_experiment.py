@@ -426,6 +426,13 @@ def strategy_cash(state: Mapping[str, Any], currency: str) -> float:
     )
 
 
+def strategy_nav(state: Mapping[str, Any]) -> float:
+    """Return the current mixed-unit B-account NAV used for sizing only."""
+
+    _validate_state(state)
+    return _strategy_nav(state)
+
+
 def record_signal(
     state: MutableMapping[str, Any],
     signal: Optional[Mapping[str, Any]] = None,
@@ -601,6 +608,18 @@ def execute_pending(
         signal = signals.get(signal_id)
         if signal is None:
             raise ExperimentInputError(f"pending signal is absent from ledger: {signal_id}")
+        signal_dt = _parse_datetime(signal["signal_time"], "signal.signal_time")
+        if current.date() > signal_dt.date():
+            outcomes.append(
+                _execution_result(
+                    state,
+                    signal=signal,
+                    status="execution_missed",
+                    execution_time=current,
+                    reason="no_same_day_post_signal_quote",
+                )
+            )
+            continue
         raw_quote = quotes.get(signal["symbol"])
         if raw_quote is None:
             if session_closed:
@@ -650,7 +669,6 @@ def execute_pending(
                     )
                 )
             continue
-        signal_dt = _parse_datetime(signal["signal_time"], "signal.signal_time")
         if quote_dt <= signal_dt:
             if session_closed:
                 outcomes.append(
@@ -1112,8 +1130,10 @@ def _pct(value: float) -> str:
     return f"{value * 100:+.2f}%"
 
 
-def render_scorecard(state: Mapping[str, Any]) -> str:
-    """Render the latest plain-language strategy-vs-hold scorecard."""
+def render_scorecard(
+    state: Mapping[str, Any], *, trade_date: Optional[str] = None
+) -> str:
+    """Render one plain-language strategy-vs-hold scorecard (latest by default)."""
 
     _validate_state(state)
     if not state["daily_nav"]:
@@ -1122,7 +1142,20 @@ def render_scorecard(state: Mapping[str, Any]) -> str:
             "尚无完整可靠的实验日收盘数据。\n\n"
             "> 仅供模拟和人工复核，不构成交易指令；系统不会连接券商或自动下单。\n"
         )
-    latest = state["daily_nav"][-1]
+    latest = (
+        next(
+            (
+                item
+                for item in state["daily_nav"]
+                if str(item.get("trade_date") or "") == trade_date
+            ),
+            None,
+        )
+        if trade_date is not None
+        else state["daily_nav"][-1]
+    )
+    if latest is None:
+        raise ExperimentInputError(f"scorecard trade date not found: {trade_date}")
     day_index = int(latest["day_index"])
     target = CHECKPOINT_DAYS if day_index <= CHECKPOINT_DAYS else FORMAL_EVALUATION_DAYS
     excess = float(latest["excess_nav"])
@@ -1201,6 +1234,7 @@ __all__ = [
     "render_scorecard",
     "save_state",
     "strategy_cash",
+    "strategy_nav",
     "strategy_quantity",
     "update_latest_quotes",
 ]

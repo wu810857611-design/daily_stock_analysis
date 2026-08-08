@@ -237,6 +237,38 @@ class ShadowAbExperimentTests(unittest.TestCase):
         )
         self.assertEqual(later, [])
         self.assertEqual(strategy_quantity(state, "300499"), original_quantity)
+
+    def test_pending_signal_expires_before_next_trading_day_quote(self):
+        state = initialize_state(private_portfolio())
+        signal = record_signal(
+            state,
+            {
+                "event_id": "friday-risk",
+                "symbol": "688333",
+                "signal_time": "2026-08-14T14:59:05+08:00",
+                "quote_time": "2026-08-14T14:59:00+08:00",
+                "signal_price": 100,
+                "action": "模拟减仓1/3",
+                "reason": "same-day execution required",
+            },
+        )
+        original_quantity = strategy_quantity(state, "688333")
+
+        outcomes = execute_pending(
+            state,
+            {
+                "688333": quote(
+                    "688333", 90, "2026-08-17T09:31:00+08:00"
+                )
+            },
+            now=datetime(2026, 8, 17, 9, 31, 5, tzinfo=TZ),
+        )
+
+        self.assertEqual(outcomes[0]["status"], "execution_missed")
+        self.assertEqual(outcomes[0]["reason"], "no_same_day_post_signal_quote")
+        self.assertNotIn(signal["signal_id"], state["pending_signal_ids"])
+        self.assertEqual(state["trades"], [])
+        self.assertEqual(strategy_quantity(state, "688333"), original_quantity)
         self.assertEqual(len(state["trades"]), 0)
         self.assertTrue(
             any(item["status"] == "execution_missed" for item in state["status_ledger"])

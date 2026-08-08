@@ -34,6 +34,7 @@ from scripts.intraday_session import (
 from scripts.shadow_ab_experiment import (
     INITIAL_INSTRUMENTS,
     initialize_state as initialize_shadow_state,
+    record_daily_nav as record_shadow_daily_nav,
     record_signal as record_shadow_signal,
 )
 
@@ -691,10 +692,25 @@ class StateMachineTests(unittest.TestCase):
         )
         self.assertEqual(shadow["signal_ledger"], [])
 
-        shadow["strategy_shadow_portfolio"]["cash_by_currency"]["HKD"] = 100000
+        shadow["strategy_shadow_portfolio"]["cash_by_currency"]["HKD"] = 1
         later = now + timedelta(minutes=1)
         later_quote = quote("HK00700", 100, 0.2, later)
         start = len(state["event_ledger"])
+        self.assertEqual(
+            enqueue_cash_available_candidate_rechecks(
+                state,
+                now=later,
+                quotes=[later_quote],
+                candidates=[candidate],
+                shadow_state=shadow,
+            ),
+            0,
+        )
+        self.assertEqual(len(state["event_ledger"]), start)
+
+        shadow["strategy_shadow_portfolio"]["cash_by_currency"]["HKD"] = (
+            shadow["initial_nav"] * 0.04
+        )
         self.assertEqual(
             enqueue_cash_available_candidate_rechecks(
                 state,
@@ -717,7 +733,7 @@ class StateMachineTests(unittest.TestCase):
             1,
         )
         self.assertEqual(len(state["outbox"]), 1)
-        self.assertEqual(state["outbox"][0]["payload"]["action"], "模拟买入0.5成")
+        self.assertEqual(state["outbox"][0]["payload"]["action"], "模拟买入0.25成")
         self.assertEqual(len(shadow["signal_ledger"]), 1)
 
     def test_legacy_raw_outbox_is_audited_but_never_pushed(self):
@@ -759,6 +775,40 @@ class StateMachineTests(unittest.TestCase):
             state["event_ledger"][-1]["decision_result"],
             "suppressed_legacy_raw_push",
         )
+
+    def test_shadow_scorecards_retry_oldest_pending_before_new_day(self):
+        shadow = synthetic_shadow_state()
+        for trade_date, multiplier in (("2026-08-10", 1.01), ("2026-08-11", 1.02)):
+            closes = {
+                item["symbol"]: {
+                    "price": item["verified_close"] * multiplier,
+                    "provider_timestamp": f"{trade_date}T16:00:00+08:00",
+                    "is_stale": False,
+                }
+                for item in INITIAL_INSTRUMENTS
+            }
+            self.assertTrue(record_shadow_daily_nav(shadow, trade_date, closes))
+        shadow["scorecard_notifications"] = {
+            "2026-08-10": {"status": "pending", "attempts": 1}
+        }
+        sent = []
+
+        self.assertTrue(
+            intraday_session_module._notify_shadow_scorecard(
+                shadow,
+                now=datetime(2026, 8, 11, 16, 2, tzinfo=TZ),
+                sender=lambda **payload: sent.append(payload) or True,
+            )
+        )
+        self.assertEqual(
+            [item["title"] for item in sent],
+            [
+                "策略 vs 死拿每日成绩单 - 2026-08-10",
+                "策略 vs 死拿每日成绩单 - 2026-08-11",
+            ],
+        )
+        self.assertIn("实验第 1 / 20", sent[0]["content"])
+        self.assertIn("实验第 2 / 20", sent[1]["content"])
 
     def test_push_failure_keeps_outbox_and_retry_succeeds_after_restart(self):
         now = datetime(2026, 7, 28, 10, 0, tzinfo=TZ)

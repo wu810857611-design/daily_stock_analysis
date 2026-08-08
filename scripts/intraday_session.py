@@ -67,6 +67,7 @@ from scripts.shadow_ab_experiment import (  # noqa: E402
     render_scorecard as render_shadow_scorecard,
     save_state as save_shadow_state,
     strategy_cash as shadow_strategy_cash,
+    strategy_nav as shadow_strategy_nav,
     strategy_quantity as shadow_strategy_quantity,
     update_latest_quotes as update_shadow_latest_quotes,
 )
@@ -1600,6 +1601,37 @@ def _shadow_strategy_cash(
         return 0.0
 
 
+def _affordable_candidate_action(
+    shadow_state: Optional[Mapping[str, Any]],
+    *,
+    symbol: str,
+    confidence: float,
+    market_costs: Optional[Mapping[str, Any]],
+) -> Optional[str]:
+    """Choose only a size coverable by same-currency cash after costs."""
+
+    if not shadow_state:
+        return None
+    cash = _shadow_strategy_cash(shadow_state, symbol)
+    try:
+        nav = float(shadow_strategy_nav(shadow_state))
+    except (KeyError, ShadowExperimentError, TypeError, ValueError):
+        return None
+    if cash <= 0 or not math.isfinite(nav) or nav <= 0:
+        return None
+    costs = market_costs or {}
+    fee_bps = _nonnegative_float(costs.get("entry_fee_bps")) or 0.0
+    slippage_bps = _nonnegative_float(costs.get("entry_slippage_bps")) or 0.0
+    cost_multiplier = 1.0 + (fee_bps + slippage_bps) / 10_000.0
+    choices = [("buy_0_5", 0.05), ("buy_0_25", 0.025)]
+    if confidence < 0.8:
+        choices = choices[1:]
+    for action, fraction in choices:
+        if cash + 1e-9 >= nav * fraction * cost_multiplier:
+            return action
+    return None
+
+
 def _mark_raw_decision(
     event: MutableMapping[str, Any],
     *,
@@ -1662,8 +1694,6 @@ def enqueue_cash_available_candidate_rechecks(
         decision_state = conditions.get("adaptive_entry_review") or {}
         if decision_state.get("last_action") != "observe":
             continue
-        if _shadow_strategy_cash(shadow_state, symbol) <= 0:
-            continue
         review = (
             state.get("symbols", {})
             .get(symbol, {})
@@ -1671,6 +1701,13 @@ def enqueue_cash_available_candidate_rechecks(
             .get("adaptive_entry_review", {})
         )
         source_payload = decision_state.get("source_payload") or {}
+        if _affordable_candidate_action(
+            shadow_state,
+            symbol=symbol,
+            confidence=_finite_float(source_payload.get("confidence")) or 0.0,
+            market_costs=(source_payload.get("market_costs") or {}),
+        ) is None:
+            continue
         if (
             review.get("status") != "active"
             or review.get("fingerprint") != source_payload.get("plan_fingerprint")
@@ -1847,13 +1884,19 @@ def process_actionable_decisions(
             if quantity > 0:
                 _mark_raw_decision(raw_event, result="no_operation_already_held")
                 continue
-            if _shadow_strategy_cash(shadow_state, symbol) <= 0:
+            affordable_action = _affordable_candidate_action(
+                shadow_state,
+                symbol=symbol,
+                confidence=confidence,
+                market_costs=(raw_payload.get("market_costs") or {}),
+            )
+            if affordable_action is None:
                 action = "observe"
                 conclusion = "进入观察，等待资金条件"
                 position_change = "0"
-                basis = "候选已通过扣费后的风险收益门槛并进入可靠买入区，但影子账户当前无可用现金。"
+                basis = "候选已通过扣费后的风险收益门槛并进入可靠买入区，但同币种现金不足以覆盖最小模拟仓位和成本。"
             else:
-                action = "buy_0_5" if confidence >= 0.8 else "buy_0_25"
+                action = affordable_action
                 conclusion = _TRADE_ACTION_LABELS[action]
                 position_change = "+5% NAV" if action == "buy_0_5" else "+2.5% NAV"
                 basis = "候选已进入可信计划区，并通过交易成本、数据质量和风险收益门槛。"
@@ -2655,29 +2698,38 @@ def _notify_shadow_scorecard(
     daily_nav = shadow_state.get("daily_nav") or []
     if not daily_nav:
         return False
-    trade_date = str(daily_nav[-1].get("trade_date") or "")
     notifications = shadow_state.setdefault("scorecard_notifications", {})
-    notification = notifications.setdefault(
-        trade_date, {"status": "pending", "attempts": 0}
-    )
-    if notification.get("status") == "sent":
-        return True
-    try:
-        sent = bool(
-            sender(
-                title=f"策略 vs 死拿每日成绩单 - {trade_date}",
-                content=render_shadow_scorecard(shadow_state),
+    for item in daily_nav:
+        trade_date = str(item.get("trade_date") or "")
+        notifications.setdefault(trade_date, {"status": "pending", "attempts": 0})
+
+    for item in daily_nav:
+        trade_date = str(item.get("trade_date") or "")
+        notification = notifications[trade_date]
+        if notification.get("status") == "sent":
+            continue
+        try:
+            sent = bool(
+                sender(
+                    title=f"策略 vs 死拿每日成绩单 - {trade_date}",
+                    content=render_shadow_scorecard(
+                        shadow_state, trade_date=trade_date
+                    ),
+                )
             )
-        )
-    except Exception as exc:
-        print(f"A/B 每日成绩单 PushPlus 异常，保留状态下次重试: {exc}", file=sys.stderr)
-        sent = False
-    notification["attempts"] = int(notification.get("attempts") or 0) + 1
-    notification["last_attempt_at"] = _iso(now)
-    if sent:
+        except Exception as exc:
+            print(
+                f"A/B 每日成绩单 PushPlus 异常，保留状态下次重试: {exc}",
+                file=sys.stderr,
+            )
+            sent = False
+        notification["attempts"] = int(notification.get("attempts") or 0) + 1
+        notification["last_attempt_at"] = _iso(now)
+        if not sent:
+            return False
         notification["status"] = "sent"
         notification["sent_at"] = _iso(now)
-    return sent
+    return True
 
 
 def run_session(
