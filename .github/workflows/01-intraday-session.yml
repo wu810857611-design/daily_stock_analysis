@@ -1,10 +1,6 @@
 name: 分钟级盘中模拟监控
 
 on:
-  schedule:
-    # GitHub cron 使用 UTC；刻意避开整点，降低排队延迟概率。
-    - cron: '17 1 * * 1-5'   # 北京时间 09:17，覆盖 A/H 上午交易
-    - cron: '47 4 * * 1-5'   # 北京时间 12:47，覆盖 A/H 下午交易
   workflow_dispatch:
     inputs:
       session:
@@ -56,21 +52,11 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p data/intraday reports logs
-          if [ "${{ github.event_name }}" = "schedule" ]; then
-            # 保留 cron 原本代表的时段。GitHub schedule 即使排队到另一时段，
-            # 也不能把上午漏监控改写成下午已监控。
-            case "${{ github.event.schedule }}" in
-              "17 1 * * 1-5") SESSION="morning" ;;
-              "47 4 * * 1-5") SESSION="afternoon" ;;
-              *) SESSION="auto" ;;
-            esac
-            MAX_CYCLES="0"
-            LATE_START_POLICY="skip"
-          else
-            SESSION="${{ github.event.inputs.session || 'auto' }}"
-            MAX_CYCLES="${{ github.event.inputs.max_cycles || '0' }}"
-            LATE_START_POLICY="error"
-          fi
+          SESSION="${{ github.event.inputs.session || 'auto' }}"
+          MAX_CYCLES="${{ github.event.inputs.max_cycles || '0' }}"
+          # 外部 cron-job.org 使用 workflow_dispatch；如果排队到目标时段之后，
+          # 必须安全跳过且不得补造盘中信号。手动运行同样遵守这一边界。
+          LATE_START_POLICY="skip"
           echo "SESSION=$SESSION" >> "$GITHUB_ENV"
           echo "MAX_CYCLES=$MAX_CYCLES" >> "$GITHUB_ENV"
           echo "LATE_START_POLICY=$LATE_START_POLICY" >> "$GITHUB_ENV"
@@ -269,12 +255,43 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           STATE_BRANCH: ${{ github.ref_name }}
+          SHADOW_AB_STATE_KEY: ${{ secrets.SHADOW_AB_STATE_KEY }}
         run: |
           set -euo pipefail
-          if [ -f data/intraday/session_state.json ]; then
-            echo "✅ 已从 Actions cache 恢复盘中状态"
+          validate_shadow_state() {
+            local check_file
+            check_file="$(mktemp "$RUNNER_TEMP/shadow-ab-restore.XXXXXX")"
+            if [ -n "${SHADOW_AB_STATE_KEY:-}" ] && \
+              openssl enc -d -aes-256-cbc -pbkdf2 \
+                -pass env:SHADOW_AB_STATE_KEY \
+                -in data/intraday/shadow_ab_state.json.enc \
+                -out "$check_file" && \
+              SHADOW_CHECK="$check_file" python3 - <<'PY'
+          import os
+          from pathlib import Path
+
+          from scripts.shadow_ab_experiment import load_state
+
+          load_state(Path(os.environ["SHADOW_CHECK"]))
+          PY
+            then
+              rm -f "$check_file"
+              return 0
+            fi
+            rm -f "$check_file"
+            return 1
+          }
+
+          if [ -f data/intraday/session_state.json ] && \
+            [ -f data/intraday/shadow_ab_state.json.enc ] && \
+            validate_shadow_state; then
+            echo "✅ 已从 Actions cache 恢复盘中状态和加密 A/B 状态"
             exit 0
           fi
+          if [ -f data/intraday/session_state.json ]; then
+            echo "ℹ️ cache 只有旧盘中状态，继续查找含加密 A/B 状态的 artifact"
+          fi
+          rm -f data/intraday/shadow_ab_state.json.enc
 
           TMP_DIR="$(mktemp -d)"
           gh api --method GET \
@@ -336,7 +353,15 @@ jobs:
               archive.extractall(workspace, members=members)
           PY
           test -f data/intraday/session_state.json
-          echo "✅ 已从最新固定 artifact 恢复盘中状态"
+          if [ -f data/intraday/shadow_ab_state.json.enc ]; then
+            if ! validate_shadow_state; then
+              echo "❌ 最新固定 artifact 的加密 A/B 状态无法解密或校验；拒绝重建账户"
+              exit 1
+            fi
+            echo "✅ 已从最新固定 artifact 恢复盘中状态和加密 A/B 状态"
+          else
+            echo "ℹ️ 最新固定 artifact 仅含旧盘中状态；A/B账户只允许在初始化窗口创建"
+          fi
 
       - name: 运行分钟级 A/H 盘中模拟监控
         shell: bash
@@ -356,6 +381,9 @@ jobs:
           INTRADAY_ALERT_COOLDOWN_SECONDS: ${{ vars.INTRADAY_ALERT_COOLDOWN_SECONDS || '900' }}
           INTRADAY_DETERIORATION_PCT: ${{ vars.INTRADAY_DETERIORATION_PCT || '1.0' }}
           INTRADAY_CANDIDATE_PLANS_PATH: ${{ vars.INTRADAY_CANDIDATE_PLANS_PATH || 'data/market_scan/latest.json' }}
+          # 公开仓库不得把真实数量/成本和绝对净值写入明文 artifact。
+          SHADOW_AB_INITIAL_PORTFOLIO_JSON: ${{ secrets.SHADOW_AB_INITIAL_PORTFOLIO_JSON }}
+          SHADOW_AB_STATE_KEY: ${{ secrets.SHADOW_AB_STATE_KEY }}
         run: |
           set -euo pipefail
           STOCK_LIST="${STOCK_LIST_CONFIG:-${STOCK_LIST:-}}"
@@ -371,12 +399,48 @@ jobs:
               echo "::warning::候选计划路径不存在；本轮不生成自适应人工复核事件"
             fi
           fi
+          if [ -z "${SHADOW_AB_INITIAL_PORTFOLIO_JSON:-}" ] || [ -z "${SHADOW_AB_STATE_KEY:-}" ]; then
+            echo "❌ 缺少 SHADOW_AB_INITIAL_PORTFOLIO_JSON 或 SHADOW_AB_STATE_KEY；拒绝以明文/空组合启动 A/B 实验"
+            exit 1
+          fi
+          SHADOW_STATE_PLAIN="$RUNNER_TEMP/shadow_ab_state.json"
+          SHADOW_REPORT_PLAIN="$RUNNER_TEMP/shadow_ab_scorecard.md"
+          SHADOW_STATE_ENCRYPTED="data/intraday/shadow_ab_state.json.enc"
+          SHADOW_REPORT_ENCRYPTED="data/intraday/shadow_ab_scorecard.md.enc"
+          if [ -f "$SHADOW_STATE_ENCRYPTED" ]; then
+            openssl enc -d -aes-256-cbc -pbkdf2 \
+              -pass env:SHADOW_AB_STATE_KEY \
+              -in "$SHADOW_STATE_ENCRYPTED" \
+              -out "$SHADOW_STATE_PLAIN"
+          fi
+          persist_private_shadow_state() {
+            status=$?
+            if [ -f "$SHADOW_STATE_PLAIN" ]; then
+              openssl enc -aes-256-cbc -pbkdf2 -salt \
+                -pass env:SHADOW_AB_STATE_KEY \
+                -in "$SHADOW_STATE_PLAIN" \
+                -out "$SHADOW_STATE_ENCRYPTED.tmp"
+              mv "$SHADOW_STATE_ENCRYPTED.tmp" "$SHADOW_STATE_ENCRYPTED"
+            fi
+            if [ -f "$SHADOW_REPORT_PLAIN" ]; then
+              openssl enc -aes-256-cbc -pbkdf2 -salt \
+                -pass env:SHADOW_AB_STATE_KEY \
+                -in "$SHADOW_REPORT_PLAIN" \
+                -out "$SHADOW_REPORT_ENCRYPTED.tmp"
+              mv "$SHADOW_REPORT_ENCRYPTED.tmp" "$SHADOW_REPORT_ENCRYPTED"
+            fi
+            rm -f "$SHADOW_STATE_PLAIN" "$SHADOW_REPORT_PLAIN"
+            return "$status"
+          }
+          trap persist_private_shadow_state EXIT
           python3 scripts/intraday_session.py \
             --stocks "$STOCK_LIST" \
             --session "$SESSION" \
             --db data/stock_analysis.db \
             --state data/intraday/session_state.json \
             --report reports/intraday_session.md \
+            --shadow-state "$SHADOW_STATE_PLAIN" \
+            --shadow-report "$SHADOW_REPORT_PLAIN" \
             --normal-interval "$INTRADAY_NORMAL_INTERVAL_SECONDS" \
             --fast-interval "$INTRADAY_FAST_INTERVAL_SECONDS" \
             --degraded-interval "$INTRADAY_DEGRADED_INTERVAL_SECONDS" \
@@ -396,40 +460,55 @@ jobs:
         if: always()
         id: package_state
         shell: bash
+        env:
+          SHADOW_AB_STATE_KEY: ${{ secrets.SHADOW_AB_STATE_KEY }}
         run: |
           set -euo pipefail
           mkdir -p reports
-          if [ -f data/intraday/session_state.json ]; then
-            if python3 - <<'PY'
+          SHADOW_CHECK="$(mktemp "$RUNNER_TEMP/shadow-ab-validate.XXXXXX")"
+          if [ -f data/intraday/session_state.json ] && [ -f data/intraday/shadow_ab_state.json.enc ]; then
+            VALID_STATE=1
+            openssl enc -d -aes-256-cbc -pbkdf2 \
+              -pass env:SHADOW_AB_STATE_KEY \
+              -in data/intraday/shadow_ab_state.json.enc \
+              -out "$SHADOW_CHECK" || VALID_STATE=0
+            if [ "$VALID_STATE" = "1" ]; then
+              SHADOW_CHECK="$SHADOW_CHECK" python3 - <<'PY' || VALID_STATE=0
           from datetime import datetime
+          import os
           from pathlib import Path
           from zoneinfo import ZoneInfo
 
           from scripts.intraday_session import load_state_v2
+          from scripts.shadow_ab_experiment import load_state as load_shadow_state
 
           load_state_v2(
               Path("data/intraday/session_state.json"),
               now=datetime.now(ZoneInfo("Asia/Shanghai")),
           )
+          load_shadow_state(Path(os.environ["SHADOW_CHECK"]))
           PY
-            then
+            fi
+            if [ "$VALID_STATE" = "1" ]; then
               tar -czf intraday-alert-state.tar.gz data/intraday
               echo "available=true" >> "$GITHUB_OUTPUT"
             else
-              echo "::error::盘中状态校验失败；不上传、不缓存损坏状态"
+              echo "::error::盘中状态或加密 A/B 状态校验失败；不上传、不缓存损坏状态或不完整状态"
               echo "available=false" >> "$GITHUB_OUTPUT"
               {
                 echo "# 盘中状态无效"
                 echo
-                echo "恢复或运行后的状态未通过 schema 校验；本轮不会覆盖最近有效备份。"
+                echo "恢复或运行后的盘中/A/B状态未通过完整性校验；本轮不会覆盖最近有效备份。"
               } > reports/intraday_state_missing.md
             fi
+            rm -f "$SHADOW_CHECK"
           else
+            rm -f "$SHADOW_CHECK"
             echo "available=false" >> "$GITHUB_OUTPUT"
             {
               echo "# 盘中状态未生成"
               echo
-              echo "前置恢复或监控初始化失败；未创建空状态，也未覆盖历史有效备份。"
+              echo "盘中状态或加密 A/B 状态缺失；未创建空状态，也未覆盖历史有效备份。"
             } > reports/intraday_state_missing.md
           fi
 
