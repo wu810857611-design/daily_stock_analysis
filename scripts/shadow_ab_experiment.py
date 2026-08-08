@@ -7,9 +7,9 @@ and reliable daily closing quotes.  The immutable ledgers then compare a fixed
 buy-and-hold account with a strategy account that follows every recorded
 simulation signal.
 
-Values are reported using the experiment's explicit 1:1 mixed-local-currency
-assumption.  CNY and HKD components are always retained separately so the
-combined number cannot be mistaken for converted RMB.
+Formal values are reported in CNY using the experiment's immutable baseline
+HKD/CNY conversion.  Original CNY and HKD components remain available for
+audit, while the strategy account uses one CNY purchasing-power balance.
 """
 
 from __future__ import annotations
@@ -27,11 +27,12 @@ from zoneinfo import ZoneInfo
 
 
 SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 BASELINE_DATE = "2026-08-07"
 CHECKPOINT_DAYS = 20
 FORMAL_EVALUATION_DAYS = 60
-INITIALIZATION_DEADLINE = date(2026, 8, 10)
+HKD_CNY_BASELINE_FX = 0.8865
+VALUATION_MODE = "fixed_baseline_fx_to_cny"
 
 # Public market metadata only.  Actual quantities and historical costs must be
 # supplied privately at runtime and must not be committed to a public repo.
@@ -151,6 +152,26 @@ def _canonical_symbol(value: Any) -> str:
     return symbol
 
 
+def _currency_fx(currency: Any) -> float:
+    normalized = str(currency or "").upper()
+    if normalized == "CNY":
+        return 1.0
+    if normalized == "HKD":
+        return HKD_CNY_BASELINE_FX
+    raise ExperimentInputError(f"unsupported experiment currency: {normalized}")
+
+
+def _amount_cny(amount: Any, currency: Any, field: str = "amount") -> float:
+    return _finite(amount, field) * _currency_fx(currency)
+
+
+def _nav_cny(by_currency: Mapping[str, Any]) -> float:
+    return sum(
+        _amount_cny(amount, currency, f"nav_by_currency.{currency}")
+        for currency, amount in by_currency.items()
+    )
+
+
 def _portfolio_payload(value: Union[Mapping[str, Any], str, Path]) -> Mapping[str, Any]:
     if isinstance(value, Mapping):
         return value
@@ -226,7 +247,8 @@ def initialize_state(
         by_currency[position["currency"]] += (
             position["quantity"] * position["experiment_basis_price"]
         )
-    initial_nav = sum(by_currency.values())
+    initial_nav_mixed = sum(by_currency.values())
+    initial_nav = _nav_cny(by_currency)
     costs = _normalise_costs(default_costs or DEFAULT_COSTS)
     now = created_at or datetime.now(SHANGHAI_TZ)
     state = {
@@ -239,17 +261,28 @@ def initialize_state(
         "broker_connected": False,
         "created_at": _iso(now),
         "valuation_assumption": {
-            "mode": "mixed_local_currency_1_to_1",
-            "description": "CNY and HKD components retained separately; combined NAV uses the user-specified 1:1 experiment unit and is not RMB.",
+            "mode": VALUATION_MODE,
+            "baseline_date": BASELINE_DATE,
+            "hkd_cny": HKD_CNY_BASELINE_FX,
+            "locked": True,
+            "description": "Formal NAV uses the immutable 2026-08-07 HKD/CNY baseline FX; local-currency components are retained for audit.",
         },
         "config": {
             "checkpoint_days": CHECKPOINT_DAYS,
             "formal_evaluation_days": FORMAL_EVALUATION_DAYS,
             "default_costs": costs,
+            "purchasing_power_assumption": "simulation assumption: unified CNY purchasing power with fixed baseline FX",
+            "share_unit_assumptions": {
+                "a_share_buy_lot": 100,
+                "a_share_sell_tail_allowed": True,
+                "hk_board_lot": "not_modeled",
+            },
         },
         "initial_positions": supplied,
         "initial_nav": initial_nav,
+        "initial_nav_cny": initial_nav,
         "initial_nav_by_currency": by_currency,
+        "initial_nav_mixed_local_currency_1_to_1": initial_nav_mixed,
         "buy_and_hold_baseline": {
             "positions": copy.deepcopy(supplied),
             "cash_by_currency": {"CNY": 0.0, "HKD": 0.0},
@@ -257,6 +290,7 @@ def initialize_state(
         "strategy_shadow_portfolio": {
             "positions": copy.deepcopy(supplied),
             "cash_by_currency": {"CNY": 0.0, "HKD": 0.0},
+            "cash_cny": 0.0,
             "last_prices": {
                 symbol: float(position["experiment_basis_price"])
                 for symbol, position in supplied.items()
@@ -283,6 +317,180 @@ def initialize_state(
     return state
 
 
+def _migrate_trade_to_cny(trade: MutableMapping[str, Any]) -> None:
+    """Add formal CNY audit fields without changing an immutable trade fact."""
+
+    currency = str(trade.get("currency") or "").upper()
+    fx = _currency_fx(currency)
+    trade.setdefault("fx_to_cny", fx)
+    for local_field, cny_field in (
+        ("gross_amount", "gross_amount_cny"),
+        ("transaction_cost", "transaction_cost_cny"),
+        ("slippage", "slippage_cny"),
+        ("market_move_from_signal", "market_move_from_signal_cny"),
+    ):
+        if local_field in trade:
+            trade.setdefault(cny_field, float(trade[local_field]) * fx)
+
+
+def _migrate_daily_nav_to_cny(
+    state: MutableMapping[str, Any], record: MutableMapping[str, Any]
+) -> None:
+    """Correct derived v1 score fields while preserving their mixed-unit audit."""
+
+    baseline_parts = record.get("buy_and_hold_nav_by_currency") or {}
+    strategy_parts = record.get("strategy_nav_by_currency") or {}
+    record.setdefault(
+        "buy_and_hold_nav_mixed_local_currency_1_to_1",
+        float(record.get("buy_and_hold_nav", sum(baseline_parts.values()))),
+    )
+    record.setdefault(
+        "strategy_nav_mixed_local_currency_1_to_1",
+        float(record.get("strategy_nav", sum(strategy_parts.values()))),
+    )
+    baseline_nav = _nav_cny(baseline_parts)
+    strategy_nav_value = _nav_cny(strategy_parts)
+    initial_nav = float(state["initial_nav"])
+    record["buy_and_hold_nav"] = baseline_nav
+    record["buy_and_hold_nav_cny"] = baseline_nav
+    record["buy_and_hold_return"] = baseline_nav / initial_nav - 1.0
+    record["strategy_nav"] = strategy_nav_value
+    record["strategy_nav_cny"] = strategy_nav_value
+    record["strategy_return"] = strategy_nav_value / initial_nav - 1.0
+    record["excess_nav"] = strategy_nav_value - baseline_nav
+    record["excess_nav_cny"] = strategy_nav_value - baseline_nav
+    record["excess_return_points"] = (strategy_nav_value - baseline_nav) / initial_nav
+    strategy_cash_parts = record.get("strategy_cash_by_currency") or {}
+    cash_cny = _nav_cny(strategy_cash_parts)
+    record["strategy_cash"] = cash_cny
+    record["strategy_cash_cny"] = cash_cny
+    record["strategy_cash_ratio"] = (
+        cash_cny / strategy_nav_value if strategy_nav_value > 0 else 0.0
+    )
+    for item in record.get("operation_attribution") or []:
+        if not isinstance(item, MutableMapping):
+            continue
+        item.setdefault("estimated_gain_local", float(item.get("estimated_gain", 0.0)))
+        currency = "HKD" if str(item.get("symbol") or "").startswith("HK") else "CNY"
+        item["estimated_gain"] = _amount_cny(
+            item["estimated_gain_local"], currency, "operation_attribution.estimated_gain"
+        )
+        item["estimated_gain_cny"] = item["estimated_gain"]
+    candidate = sum(
+        float(item.get("estimated_gain_cny", 0.0))
+        for item in record.get("operation_attribution") or []
+        if item.get("contribution_type") == "new_candidate_selection"
+    )
+    record.setdefault(
+        "new_candidate_selection_mixed_local_currency_1_to_1",
+        float(record.get("new_candidate_selection", 0.0)),
+    )
+    record.setdefault(
+        "existing_position_management_mixed_local_currency_1_to_1",
+        float(record.get("existing_position_management", 0.0)),
+    )
+    record["new_candidate_selection"] = candidate
+    record["existing_position_management"] = record["excess_nav"] - candidate
+    eligible_trades = [
+        item
+        for item in state.get("trades", [])
+        if str(item.get("execution_time") or "")[:10] <= str(record.get("trade_date") or "")
+    ]
+    transaction_cost = sum(float(item.get("transaction_cost_cny", 0.0)) for item in eligible_trades)
+    slippage = sum(float(item.get("slippage_cny", 0.0)) for item in eligible_trades)
+    record["transaction_cost"] = transaction_cost
+    record["slippage"] = slippage
+    record["total_cost_and_slippage"] = transaction_cost + slippage
+    record["valuation_mode"] = VALUATION_MODE
+    record["hkd_cny_baseline_fx"] = HKD_CNY_BASELINE_FX
+
+
+def _migrate_v1_to_v2(state: MutableMapping[str, Any]) -> MutableMapping[str, Any]:
+    """Migrate the already-encrypted PR #4 state without rebuilding the account."""
+
+    if state.get("schema_version") != 1:
+        return state
+    if state.get("baseline_date") != BASELINE_DATE:
+        raise ExperimentInputError("cannot migrate an unexpected shadow A/B baseline")
+    legacy_valuation = state.get("valuation_assumption")
+    if isinstance(legacy_valuation, Mapping) and legacy_valuation.get("locked") is True:
+        legacy_fx = legacy_valuation.get("hkd_cny")
+        if legacy_fx is not None and float(legacy_fx) != HKD_CNY_BASELINE_FX:
+            raise ExperimentInputError("locked baseline FX conflicts with 0.8865")
+    by_currency = state.get("initial_nav_by_currency")
+    if not isinstance(by_currency, Mapping):
+        raise ExperimentInputError("legacy state has no auditable initial currency split")
+    legacy_initial_nav = float(state.get("initial_nav", sum(by_currency.values())))
+    initial_nav = _nav_cny(by_currency)
+    state["initial_nav_mixed_local_currency_1_to_1"] = legacy_initial_nav
+    state["initial_nav"] = initial_nav
+    state["initial_nav_cny"] = initial_nav
+    state["valuation_assumption"] = {
+        "mode": VALUATION_MODE,
+        "baseline_date": BASELINE_DATE,
+        "hkd_cny": HKD_CNY_BASELINE_FX,
+        "locked": True,
+        "description": "Formal NAV uses the immutable 2026-08-07 HKD/CNY baseline FX; local-currency components are retained for audit.",
+    }
+    config = state.setdefault("config", {})
+    config["purchasing_power_assumption"] = (
+        "simulation assumption: unified CNY purchasing power with fixed baseline FX"
+    )
+    config["share_unit_assumptions"] = {
+        "a_share_buy_lot": 100,
+        "a_share_sell_tail_allowed": True,
+        "hk_board_lot": "not_modeled",
+    }
+    strategy = state.get("strategy_shadow_portfolio")
+    if not isinstance(strategy, MutableMapping):
+        raise ExperimentInputError("legacy state has no strategy account")
+    legacy_cash = strategy.get("cash_by_currency") or {}
+    if not isinstance(legacy_cash, Mapping):
+        raise ExperimentInputError("legacy strategy cash split is invalid")
+    unified_cash = _nav_cny(legacy_cash)
+    strategy["legacy_cash_by_currency_at_fx_migration"] = copy.deepcopy(legacy_cash)
+    strategy["cash_cny"] = unified_cash
+    strategy["cash_by_currency"] = {"CNY": unified_cash, "HKD": 0.0}
+    for trade in state.get("trades", []):
+        if isinstance(trade, MutableMapping):
+            _migrate_trade_to_cny(trade)
+    state["schema_version"] = SCHEMA_VERSION
+    for record in state.get("daily_nav", []):
+        if isinstance(record, MutableMapping):
+            _migrate_daily_nav_to_cny(state, record)
+    metrics = state.setdefault("metrics", {})
+    baseline_peak = initial_nav
+    strategy_peak = initial_nav
+    baseline_max_drawdown = 0.0
+    strategy_max_drawdown = 0.0
+    for record in state.get("daily_nav", []):
+        baseline_nav = float(record["buy_and_hold_nav"])
+        strategy_nav_value = float(record["strategy_nav"])
+        baseline_peak = max(baseline_peak, baseline_nav)
+        strategy_peak = max(strategy_peak, strategy_nav_value)
+        baseline_drawdown = max(0.0, 1.0 - baseline_nav / baseline_peak)
+        strategy_drawdown = max(0.0, 1.0 - strategy_nav_value / strategy_peak)
+        baseline_max_drawdown = max(baseline_max_drawdown, baseline_drawdown)
+        strategy_max_drawdown = max(strategy_max_drawdown, strategy_drawdown)
+        record["buy_and_hold_drawdown"] = baseline_drawdown
+        record["strategy_drawdown"] = strategy_drawdown
+        record["buy_and_hold_max_drawdown"] = baseline_max_drawdown
+        record["strategy_max_drawdown"] = strategy_max_drawdown
+    metrics["buy_and_hold_peak"] = baseline_peak
+    metrics["strategy_peak"] = strategy_peak
+    metrics["buy_and_hold_max_drawdown"] = baseline_max_drawdown
+    metrics["strategy_max_drawdown"] = strategy_max_drawdown
+    state["migration_audit"] = {
+        "from_schema_version": 1,
+        "to_schema_version": SCHEMA_VERSION,
+        "preserved_baseline_date": BASELINE_DATE,
+        "preserved_ledgers": True,
+        "formal_valuation_mode": VALUATION_MODE,
+        "hkd_cny_baseline_fx": HKD_CNY_BASELINE_FX,
+    }
+    return state
+
+
 def _validate_state(state: Mapping[str, Any]) -> None:
     if state.get("schema_version") != SCHEMA_VERSION:
         raise ExperimentInputError("unsupported shadow A/B state schema")
@@ -295,6 +503,15 @@ def _validate_state(state: Mapping[str, Any]) -> None:
         raise ExperimentInputError("shadow A/B state violated simulation-only safety flags")
     if state.get("baseline_date") != BASELINE_DATE:
         raise ExperimentInputError("unexpected shadow A/B baseline date")
+    valuation = state.get("valuation_assumption")
+    if (
+        not isinstance(valuation, Mapping)
+        or valuation.get("mode") != VALUATION_MODE
+        or valuation.get("baseline_date") != BASELINE_DATE
+        or valuation.get("locked") is not True
+        or float(valuation.get("hkd_cny", 0.0)) != HKD_CNY_BASELINE_FX
+    ):
+        raise ExperimentInputError("shadow A/B fixed baseline FX is missing or altered")
     expected = set(initial_symbols())
     positions = state.get("initial_positions")
     if not isinstance(positions, Mapping) or set(positions) != expected:
@@ -317,6 +534,33 @@ def _validate_state(state: Mapping[str, Any]) -> None:
         raise ExperimentInputError("buy-and-hold account cannot change its initial universe")
     if baseline.get("positions") != positions:
         raise ExperimentInputError("buy-and-hold positions must remain equal to the initial snapshot")
+    by_currency = state.get("initial_nav_by_currency")
+    if not isinstance(by_currency, Mapping):
+        raise ExperimentInputError("initial NAV currency split is required")
+    expected_initial_nav = _nav_cny(by_currency)
+    if not math.isclose(float(state.get("initial_nav", -1.0)), expected_initial_nav, rel_tol=0.0, abs_tol=1e-6):
+        raise ExperimentInputError("formal initial NAV must use the locked baseline FX")
+    cash_cny = _finite(strategy.get("cash_cny"), "strategy.cash_cny")
+    if cash_cny < -1e-8:
+        raise ExperimentInputError("unified CNY purchasing power cannot be negative")
+    cash_audit = strategy.get("cash_by_currency")
+    if not isinstance(cash_audit, Mapping):
+        raise ExperimentInputError("strategy cash audit split is required")
+    if (
+        not math.isclose(
+            _finite(cash_audit.get("CNY", 0.0), "strategy.cash_by_currency.CNY"),
+            cash_cny,
+            rel_tol=0.0,
+            abs_tol=1e-6,
+        )
+        or abs(
+            _finite(cash_audit.get("HKD", 0.0), "strategy.cash_by_currency.HKD")
+        )
+        > 1e-8
+    ):
+        raise ExperimentInputError(
+            "strategy cash audit must mirror unified CNY purchasing power"
+        )
 
 
 def load_state(path: Union[str, Path]) -> Optional[Dict[str, Any]]:
@@ -329,6 +573,7 @@ def load_state(path: Union[str, Path]) -> Optional[Dict[str, Any]]:
         raise ExperimentInputError(f"cannot load shadow A/B state: {exc}") from exc
     if not isinstance(state, dict):
         raise ExperimentInputError("shadow A/B state must be an object")
+    _migrate_v1_to_v2(state)
     _validate_state(state)
     return state
 
@@ -338,23 +583,15 @@ def load_or_initialize(
     initial_portfolio_json: Optional[Union[Mapping[str, Any], str, Path]],
     now: datetime,
 ) -> Dict[str, Any]:
-    """Load persisted state, or initialize only during the first live window.
-
-    Refusing a later implicit rebuild prevents a cache/artifact miss from
-    silently resetting an experiment that should already have history.
-    """
+    """Load PRIMARY state; the completed experiment can never be reborn."""
 
     existing = load_state(path)
     if existing is not None:
         return existing
-    current = now if now.tzinfo is not None else now.replace(tzinfo=SHANGHAI_TZ)
-    if current.astimezone(SHANGHAI_TZ).date() > INITIALIZATION_DEADLINE:
-        raise ExperimentInputError(
-            "shadow A/B state is missing after the initialization deadline; refusing reset"
-        )
-    if initial_portfolio_json is None:
-        raise ExperimentInputError("initial portfolio JSON is required for first initialization")
-    return initialize_state(initial_portfolio_json, created_at=current)
+    del initial_portfolio_json, now
+    raise ExperimentInputError(
+        "PRIMARY shadow A/B state is missing; refusing reset or reinitialization"
+    )
 
 
 def save_state(path: Union[str, Path], state: Mapping[str, Any]) -> None:
@@ -400,10 +637,14 @@ def _normalise_costs(raw: Mapping[str, Any]) -> Dict[str, Any]:
 def _strategy_nav(state: Mapping[str, Any]) -> float:
     strategy = state["strategy_shadow_portfolio"]
     prices = strategy.get("last_prices") or {}
-    value = sum(float(amount) for amount in strategy["cash_by_currency"].values())
+    value = _finite(strategy.get("cash_cny"), "strategy.cash_cny")
     for symbol, position in strategy["positions"].items():
         price = _finite(prices.get(symbol), f"last_prices.{symbol}", positive=True)
-        value += float(position["quantity"]) * price
+        value += _amount_cny(
+            float(position["quantity"]) * price,
+            position["currency"],
+            f"positions.{symbol}.market_value",
+        )
     return value
 
 
@@ -416,18 +657,26 @@ def strategy_quantity(state: Mapping[str, Any], symbol: str) -> float:
     return 0.0 if position is None else float(position["quantity"])
 
 
-def strategy_cash(state: Mapping[str, Any], currency: str) -> float:
-    """Return B-account cash in one local currency."""
+def strategy_cash_cny(state: Mapping[str, Any]) -> float:
+    """Return authoritative unified CNY purchasing power."""
 
-    return float(
-        state["strategy_shadow_portfolio"]["cash_by_currency"].get(
-            str(currency or "").upper(), 0.0
-        )
-    )
+    _validate_state(state)
+    return float(state["strategy_shadow_portfolio"]["cash_cny"])
+
+
+def strategy_cash(state: Mapping[str, Any], currency: str = "CNY") -> float:
+    """Backward-compatible wrapper for unified CNY purchasing power.
+
+    ``currency`` remains accepted for caller compatibility; A- and H-share
+    decisions draw from the same CNY balance under the fixed-FX assumption.
+    """
+
+    del currency
+    return strategy_cash_cny(state)
 
 
 def strategy_nav(state: Mapping[str, Any]) -> float:
-    """Return the current mixed-unit B-account NAV used for sizing only."""
+    """Return the current fixed-FX CNY B-account NAV used for sizing."""
 
     _validate_state(state)
     return _strategy_nav(state)
@@ -524,6 +773,7 @@ def record_signal(
         "action": normalised_action,
         "position_delta": position_delta,
         "requested_notional": requested_notional,
+        "requested_notional_currency": "CNY" if requested_notional is not None else None,
         "reason": reason,
         "current_key_level": copy.deepcopy(
             raw.get("current_key_level", raw.get("key_level"))
@@ -684,9 +934,9 @@ def execute_pending(
 
         strategy = state["strategy_shadow_portfolio"]
         positions = strategy["positions"]
-        cash = strategy["cash_by_currency"]
         symbol = signal["symbol"]
         currency = signal["currency"]
+        fx_to_cny = _currency_fx(currency)
         action = signal["action"]
         costs = signal["market_costs"]
         is_buy = action in _BUY_NAV_FRACTIONS
@@ -710,8 +960,13 @@ def execute_pending(
                     )
                 )
                 continue
-            notional = float(signal["requested_notional"])
-            quantity = float(math.floor(notional / execution_price))
+            notional_cny = float(signal["requested_notional"])
+            raw_quantity = math.floor(notional_cny / (execution_price * fx_to_cny))
+            quantity = (
+                float((raw_quantity // 100) * 100)
+                if currency == "CNY"
+                else float(raw_quantity)
+            )
             if quantity < 1:
                 outcomes.append(
                     _execution_result(
@@ -719,21 +974,25 @@ def execute_pending(
                         signal=signal,
                         status="execution_missed",
                         execution_time=current,
-                        reason="notional_below_one_share",
+                        reason=(
+                            "notional_below_a_share_buy_lot"
+                            if currency == "CNY"
+                            else "notional_below_one_share"
+                        ),
                     )
                 )
                 continue
             gross = quantity * execution_price
             fee = gross * fee_bps / 10_000.0
-            required_cash = gross + fee
-            if float(cash.get(currency, 0.0)) + 1e-9 < required_cash:
+            required_cash_cny = (gross + fee) * fx_to_cny
+            if float(strategy["cash_cny"]) + 1e-9 < required_cash_cny:
                 outcomes.append(
                     _execution_result(
                         state,
                         signal=signal,
                         status="execution_missed",
                         execution_time=current,
-                        reason="insufficient_same_currency_cash",
+                        reason="insufficient_unified_cny_cash",
                     )
                 )
                 continue
@@ -748,7 +1007,7 @@ def execute_pending(
                     "experiment_basis_price", execution_price
                 ),
             }
-            cash[currency] = float(cash.get(currency, 0.0)) - required_cash
+            strategy["cash_cny"] = float(strategy["cash_cny"]) - required_cash_cny
             side = "paper_buy"
         else:
             if position is None or float(position.get("quantity", 0.0)) <= 0:
@@ -787,8 +1046,20 @@ def execute_pending(
                 positions.pop(symbol, None)
             else:
                 position["quantity"] = remaining
-            cash[currency] = float(cash.get(currency, 0.0)) + gross - fee
+            cash_change_cny = (gross - fee) * fx_to_cny
+            strategy["cash_cny"] = float(strategy["cash_cny"]) + cash_change_cny
             side = "paper_sell"
+
+        if float(strategy["cash_cny"]) < -1e-8:
+            raise ExperimentInputError("simulation attempted to create negative CNY cash")
+        if abs(float(strategy["cash_cny"])) <= 1e-8:
+            strategy["cash_cny"] = 0.0
+        # Kept only as a backward-compatible audit view.  CNY purchasing power
+        # is authoritative, and HKD cash is never a separate spending silo.
+        strategy["cash_by_currency"] = {
+            "CNY": float(strategy["cash_cny"]),
+            "HKD": 0.0,
+        }
 
         strategy["last_prices"][symbol] = observed_price
         slippage = abs(execution_price - observed_price) * quantity
@@ -808,9 +1079,19 @@ def execute_pending(
             "execution_price": execution_price,
             "quantity": quantity,
             "gross_amount": gross,
+            "gross_amount_cny": gross * fx_to_cny,
             "transaction_cost": fee,
+            "transaction_cost_cny": fee * fx_to_cny,
             "slippage": slippage,
+            "slippage_cny": slippage * fx_to_cny,
             "market_move_from_signal": market_move,
+            "market_move_from_signal_cny": market_move * fx_to_cny,
+            "fx_to_cny": fx_to_cny,
+            "cash_change_cny": (
+                -(gross + fee) * fx_to_cny
+                if side == "paper_buy"
+                else (gross - fee) * fx_to_cny
+            ),
             "contribution_type": signal["contribution_type"],
             "simulation_only": True,
         }
@@ -898,14 +1179,22 @@ def _candidate_contribution(state: Mapping[str, Any], prices: Mapping[str, float
     strategy_positions = state["strategy_shadow_portfolio"]["positions"]
     for symbol, position in strategy_positions.items():
         if symbol not in initial:
-            contribution += float(position["quantity"]) * prices[symbol]
+            contribution += _amount_cny(
+                float(position["quantity"]) * prices[symbol],
+                position["currency"],
+                f"candidate.{symbol}.market_value",
+            )
     for trade in state["trades"]:
         if trade["symbol"] in initial:
             continue
         if trade["side"] == "paper_buy":
-            contribution -= float(trade["gross_amount"]) + float(trade["transaction_cost"])
+            contribution -= float(trade["gross_amount_cny"]) + float(
+                trade["transaction_cost_cny"]
+            )
         else:
-            contribution += float(trade["gross_amount"]) - float(trade["transaction_cost"])
+            contribution += float(trade["gross_amount_cny"]) - float(
+                trade["transaction_cost_cny"]
+            )
     return contribution
 
 
@@ -922,12 +1211,13 @@ def _operation_attribution(
             continue
         quantity = float(trade["quantity"])
         execution_price = float(trade["execution_price"])
-        fee = float(trade["transaction_cost"])
+        fx_to_cny = float(trade.get("fx_to_cny", _currency_fx(trade["currency"])))
+        fee = float(trade["transaction_cost_cny"])
         if trade["side"] == "paper_sell":
-            estimated_gain = (execution_price - close_price) * quantity - fee
+            estimated_gain = (execution_price - close_price) * quantity * fx_to_cny - fee
             interpretation = "减仓后避免损失" if estimated_gain >= 0 else "减仓后卖飞"
         else:
-            estimated_gain = (close_price - execution_price) * quantity - fee
+            estimated_gain = (close_price - execution_price) * quantity * fx_to_cny - fee
             interpretation = "买入后贡献" if estimated_gain >= 0 else "买入后拖累"
         result.append(
             {
@@ -936,6 +1226,7 @@ def _operation_attribution(
                 "action": trade["action"],
                 "contribution_type": trade["contribution_type"],
                 "estimated_gain": estimated_gain,
+                "estimated_gain_cny": estimated_gain,
                 "interpretation": interpretation,
                 "as_of_close": close_price,
                 "simulation_only": True,
@@ -1060,8 +1351,10 @@ def record_daily_nav(
     strategy_by_currency = _nav_by_currency(
         strategy_positions, strategy["cash_by_currency"], prices
     )
-    baseline_nav = sum(baseline_by_currency.values())
-    strategy_nav = sum(strategy_by_currency.values())
+    baseline_nav_mixed = sum(baseline_by_currency.values())
+    strategy_nav_mixed = sum(strategy_by_currency.values())
+    baseline_nav = _nav_cny(baseline_by_currency)
+    strategy_nav = _nav_cny(strategy_by_currency)
     initial_nav = float(state["initial_nav"])
     metrics = state["metrics"]
     baseline_peak = max(float(metrics["buy_and_hold_peak"]), baseline_nav)
@@ -1080,27 +1373,36 @@ def record_daily_nav(
     candidate_contribution = _candidate_contribution(state, prices)
     operation_attribution = _operation_attribution(state, prices)
     excess = strategy_nav - baseline_nav
-    transaction_cost = sum(float(item["transaction_cost"]) for item in state["trades"])
-    slippage = sum(float(item["slippage"]) for item in state["trades"])
+    transaction_cost = sum(
+        float(item["transaction_cost_cny"]) for item in state["trades"]
+    )
+    slippage = sum(float(item["slippage_cny"]) for item in state["trades"])
+    strategy_cash_cny_value = float(strategy["cash_cny"])
     record = {
         "trade_date": trade_date,
         "day_index": day_index,
         "buy_and_hold_nav": baseline_nav,
+        "buy_and_hold_nav_cny": baseline_nav,
         "buy_and_hold_nav_by_currency": baseline_by_currency,
+        "buy_and_hold_nav_mixed_local_currency_1_to_1": baseline_nav_mixed,
         "buy_and_hold_return": baseline_nav / initial_nav - 1.0,
         "strategy_nav": strategy_nav,
+        "strategy_nav_cny": strategy_nav,
         "strategy_nav_by_currency": strategy_by_currency,
+        "strategy_nav_mixed_local_currency_1_to_1": strategy_nav_mixed,
         "strategy_return": strategy_nav / initial_nav - 1.0,
         "excess_nav": excess,
+        "excess_nav_cny": excess,
         "excess_return_points": (strategy_nav - baseline_nav) / initial_nav,
         "buy_and_hold_drawdown": baseline_drawdown,
         "strategy_drawdown": strategy_drawdown,
         "buy_and_hold_max_drawdown": metrics["buy_and_hold_max_drawdown"],
         "strategy_max_drawdown": metrics["strategy_max_drawdown"],
-        "strategy_cash": sum(float(v) for v in strategy["cash_by_currency"].values()),
+        "strategy_cash": strategy_cash_cny_value,
+        "strategy_cash_cny": strategy_cash_cny_value,
         "strategy_cash_by_currency": copy.deepcopy(strategy["cash_by_currency"]),
         "strategy_cash_ratio": (
-            sum(float(v) for v in strategy["cash_by_currency"].values()) / strategy_nav
+            strategy_cash_cny_value / strategy_nav
             if strategy_nav > 0
             else 0.0
         ),
@@ -1111,7 +1413,8 @@ def record_daily_nav(
         "existing_position_management": excess - candidate_contribution,
         "new_candidate_selection": candidate_contribution,
         "operation_attribution": operation_attribution,
-        "valuation_mode": "mixed_local_currency_1_to_1",
+        "valuation_mode": VALUATION_MODE,
+        "hkd_cny_baseline_fx": HKD_CNY_BASELINE_FX,
         "simulation_only": True,
     }
     state["daily_nav"].append(record)
@@ -1172,14 +1475,14 @@ def render_scorecard(
         "",
         f"实验第 {day_index} / {target} 个交易日",
         "",
-        f"- 完全死拿账户：{latest['buy_and_hold_nav'] / 10_000:,.2f} 万实验净值单位",
+        f"- 完全死拿账户：{latest['buy_and_hold_nav'] / 10_000:,.2f} 万元人民币",
         f"- 死拿累计收益率：{_pct(float(latest['buy_and_hold_return']))}",
-        f"- 完全按策略账户：{latest['strategy_nav'] / 10_000:,.2f} 万实验净值单位",
+        f"- 完全按策略账户：{latest['strategy_nav'] / 10_000:,.2f} 万元人民币",
         f"- 策略累计收益率：{_pct(float(latest['strategy_return']))}",
         f"- 听策略相比死拿：{comparison} {abs(excess) / 10_000:,.2f} 万，{_pct(float(latest['excess_return_points']))}",
         f"- 死拿最大回撤：{_pct(-float(latest['buy_and_hold_max_drawdown']))}",
         f"- 策略最大回撤：{_pct(-float(latest['strategy_max_drawdown']))}",
-        f"- 策略当前现金：{latest['strategy_cash'] / 10_000:,.2f} 万实验净值单位",
+        f"- 策略当前现金：{latest['strategy_cash'] / 10_000:,.2f} 万元人民币",
         f"- 策略当前现金比例：{_pct(float(latest['strategy_cash_ratio']))}",
         f"- 累计模拟交易次数：{latest['trade_count']}",
         f"- 累计手续费及模拟滑点：{latest['total_cost_and_slippage'] / 10_000:,.2f} 万",
@@ -1207,7 +1510,8 @@ def render_scorecard(
             "",
             f"当前阶段结论：策略目前相比死拿{comparison}{abs(excess) / 10_000:,.2f} 万；{sample}",
             "",
-            "> CNY与HKD分项保留，合计按用户指定的1:1实验单位展示，不代表人民币。",
+            f"> 正式净值统一使用人民币；HKD按2026-08-07锁定汇率1 HKD = {HKD_CNY_BASELINE_FX:.4f} CNY换算。",
+            "> simulation assumption: unified CNY purchasing power with fixed baseline FX; HK board lot not modeled.",
             "> 仅供模拟和人工复核，不构成交易指令；系统不会连接券商或自动下单。",
             "",
         ]
@@ -1221,7 +1525,7 @@ __all__ = [
     "DEFAULT_COSTS",
     "ExperimentInputError",
     "FORMAL_EVALUATION_DAYS",
-    "INITIALIZATION_DEADLINE",
+    "HKD_CNY_BASELINE_FX",
     "INITIAL_INSTRUMENTS",
     "execute_pending",
     "initial_symbols",
@@ -1234,6 +1538,7 @@ __all__ = [
     "render_scorecard",
     "save_state",
     "strategy_cash",
+    "strategy_cash_cny",
     "strategy_nav",
     "strategy_quantity",
     "update_latest_quotes",

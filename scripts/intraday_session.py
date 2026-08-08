@@ -48,6 +48,12 @@ from scripts.adaptive_signal_policy import (  # noqa: E402
     evaluate_adaptive_signal,
     input_from_mapping as adaptive_input_from_mapping,
 )
+from scripts.account_watchlists import (  # noqa: E402
+    PRIMARY_SYMBOLS,
+    all_quote_symbols as account_quote_symbols,
+    load_private_watch_config,
+    watch_contexts_by_symbol,
+)
 from scripts.level2_adapter import (  # noqa: E402
     LEVEL2_AVAILABLE,
     LEVEL2_PROVIDER_ERROR,
@@ -2037,6 +2043,234 @@ def process_actionable_decisions(
     return created
 
 
+def process_watch_account_decisions(
+    state: MutableMapping[str, Any],
+    *,
+    now: datetime,
+    raw_events: Sequence[MutableMapping[str, Any]],
+    levels: Mapping[str, ReferenceLevels],
+    contexts_by_symbol: Optional[
+        Mapping[str, Sequence[Mapping[str, str]]]
+    ] = None,
+) -> int:
+    """Create account-labelled human-review alerts without touching PRIMARY A/B.
+
+    Watch layers reuse the already-fetched quote and reference level.  This
+    function has no shadow-state or signal-recorder argument by design, so a
+    FAMILY/SECONDARY/SISTER decision cannot enter PRIMARY NAV or execution.
+    """
+
+    contexts = contexts_by_symbol or watch_contexts_by_symbol()
+    actionable = {
+        "stop_loss",
+        "target_reached",
+        "adaptive_entry_review",
+        "adaptive_risk_review",
+    }
+    candidates: Dict[tuple[str, str], List[MutableMapping[str, Any]]] = {}
+    for event in raw_events:
+        symbol = str(event.get("symbol") or "")
+        condition = str(event.get("condition") or "")
+        transition = str(event.get("transition") or "")
+        if condition in {"sharp_rise", "sharp_drop"}:
+            continue
+        if condition not in actionable and transition != "cleared":
+            continue
+        for context in contexts.get(symbol, ()):
+            key = (str(context.get("layer") or ""), symbol)
+            candidates.setdefault(key, []).append(event)
+
+    created = 0
+    watch_state = state.setdefault("watch_decision_notifications", {})
+    for (layer, symbol), events in candidates.items():
+        context = next(
+            (
+                item
+                for item in contexts.get(symbol, ())
+                if str(item.get("layer") or "") == layer
+            ),
+            None,
+        )
+        if context is None:
+            continue
+        event = max(
+            events,
+            key=lambda item: (
+                1 if str(item.get("transition") or "") == "cleared" else 2,
+                _raw_decision_priority(item, levels),
+                str(item.get("event_id") or ""),
+            ),
+        )
+        condition = str(event.get("condition") or "")
+        transition = str(event.get("transition") or "")
+        status = str(context.get("status") or "")
+        raw_payload = event.get("payload") or {}
+        price = _positive_float(event.get("price"))
+        data_quality = str(raw_payload.get("data_quality") or "unknown")
+        if price is None or data_quality not in {"fresh_l1", "high", "medium"}:
+            continue
+
+        condition_state = (
+            watch_state.setdefault(layer, {})
+            .setdefault(symbol, {})
+            .setdefault(condition, {})
+        )
+        reference = levels.get(symbol, ReferenceLevels())
+        key_level: Optional[float] = None
+        action = "不操作"
+        position_change = "0"
+        conclusion = "继续持有"
+        basis = "没有新的可靠条件改变当前人工复核结论。"
+        next_trigger = "等待新的可靠关键位或研究计划。"
+
+        if transition == "cleared":
+            if condition_state.get("status") != "active":
+                continue
+            conclusion = "风险解除，继续持有" if status != "candidate" else "风险解除，继续观察"
+            basis = "此前已提醒的风险条件已由新鲜行情确认解除。"
+            action = "不操作"
+        elif condition == "adaptive_entry_review":
+            if status != "candidate":
+                continue
+            low = _positive_float(raw_payload.get("entry_low"))
+            high = _positive_float(raw_payload.get("entry_high"))
+            stop = _positive_float(raw_payload.get("stop_loss"))
+            target = _positive_float(raw_payload.get("target_price"))
+            if not all((low, high, stop, target)):
+                continue
+            key_level = low
+            conclusion = "候选观察，进入计划买入区"
+            action = "继续观察"
+            basis = "候选首次进入已有可信计划的可操作观察区；尚未确认实际买入。"
+            next_trigger = (
+                f"仅在 {low:.3f}–{high:.3f} 内保持候选；"
+                f"跌破 {stop:.3f} 或超过 {target:.3f} 时取消候选预案。"
+            )
+        elif status == "candidate":
+            # A not-yet-held candidate can never receive a reduce/clear alert.
+            continue
+        elif condition in {"stop_loss", "adaptive_risk_review"}:
+            key_level = _positive_float(reference.stop_loss) or _positive_float(
+                raw_payload.get("stop_loss")
+            ) or _positive_float(event.get("reference_price"))
+            if key_level is None:
+                continue
+            if price <= key_level * 0.98 or event.get("severity") == "critical":
+                conclusion = "人工复核清仓"
+                action = "人工复核清仓"
+                position_change = "人工复核 -100%"
+            elif condition == "adaptive_risk_review":
+                conclusion = "人工复核减仓1/2"
+                action = "人工复核减仓1/2"
+                position_change = "人工复核 -1/2"
+            else:
+                conclusion = "人工复核减仓1/3"
+                action = "人工复核减仓1/3"
+                position_change = "人工复核 -1/3"
+            basis = "价格有效跌破已有可靠风险参考位，需要人工复核持仓风险。"
+            next_trigger = (
+                f"若继续跌至 {key_level * 0.98:.3f} 则风险升级；"
+                f"重新站回 {key_level * 1.005:.3f} 则撤销本预案。"
+            )
+        elif condition == "target_reached":
+            key_level = _positive_float(reference.target_price) or _positive_float(
+                event.get("reference_price")
+            )
+            if key_level is None:
+                continue
+            if price >= key_level * 1.05:
+                conclusion = "人工复核减仓1/2"
+                action = "人工复核减仓1/2"
+                position_change = "人工复核 -1/2"
+            else:
+                conclusion = "人工复核减仓1/4"
+                action = "人工复核减仓1/4"
+                position_change = "人工复核 -1/4"
+            basis = "价格到达已有可靠目标参考位，需要人工复核是否锁定部分收益。"
+            next_trigger = (
+                f"继续有效突破 {key_level * 1.05:.3f} 则风险收益结论升级；"
+                f"回落至 {key_level * 0.995:.3f} 下方则撤销本预案。"
+            )
+        else:
+            continue
+
+        fingerprint = hashlib.sha256(
+            json.dumps(
+                {
+                    "condition": condition,
+                    "transition": transition,
+                    "conclusion": conclusion,
+                    "severity": str(event.get("severity") or "info"),
+                    "key_level": key_level,
+                    "plan_fingerprint": raw_payload.get("plan_fingerprint"),
+                },
+                sort_keys=True,
+            ).encode("utf-8")
+        ).hexdigest()[:20]
+        if (
+            condition_state.get("status") == "active"
+            and condition_state.get("fingerprint") == fingerprint
+        ):
+            continue
+
+        unique_condition = f"watch:{layer}:{condition}"
+        _cancel_outbox_events(
+            state,
+            now=now,
+            predicate=lambda queued, current_symbol=symbol, current=unique_condition: (
+                queued.get("symbol") == current_symbol
+                and queued.get("condition") == current
+            ),
+            reason="watch_decision_replaced_before_delivery",
+        )
+        decision_event = _queue_event(
+            state,
+            now=now,
+            symbol=symbol,
+            name=str(context.get("name") or event.get("name") or ""),
+            condition=unique_condition,
+            transition="watch_human_review",
+            severity=str(event.get("severity") or "warning"),
+            price=price,
+            change_pct=_finite_float(event.get("change_pct")),
+            reference_price=key_level,
+            volume=_nonnegative_float(event.get("volume")),
+            message=basis,
+            decision_result="push_watch_account_decision",
+            payload={
+                "kind": "trade_decision",
+                "account_layer": layer,
+                "account_prefix": str(context.get("push_prefix") or ""),
+                "holding_status": status,
+                "conclusion": conclusion,
+                "action": action,
+                "position_change": position_change,
+                "basis": basis,
+                "key_level": key_level,
+                "next_trigger": next_trigger,
+                "data_quality": data_quality,
+                "quote_time": raw_payload.get("quote_time"),
+                "source_event_id": event.get("event_id"),
+                "simulation_only": True,
+                "human_review_required": True,
+                "primary_shadow_eligible": False,
+            },
+        )
+        condition_state.update(
+            {
+                "status": "cleared" if transition == "cleared" else "active",
+                "fingerprint": fingerprint,
+                "decision_event_id": decision_event["event_id"],
+                "updated_at": _iso(now),
+            }
+        )
+        event.setdefault("watch_decision_results", {})[layer] = (
+            f"decision:{conclusion}"
+        )
+        created += 1
+    return created
+
+
 def render_outbox(events: Sequence[Mapping[str, Any]], now: datetime) -> str:
     labels = {
         "sharp_drop": "日内跌幅风险",
@@ -2067,6 +2301,9 @@ def render_outbox(events: Sequence[Mapping[str, Any]], now: datetime) -> str:
         display = f"{name} ({symbol})" if name else symbol
         payload = event.get("payload") or {}
         if payload.get("kind") == "trade_decision":
+            account_prefix = str(payload.get("account_prefix") or "")
+            if account_prefix:
+                display = f"{account_prefix}{display}"
             key_level = _positive_float(payload.get("key_level"))
             lines.extend(
                 [
@@ -2155,10 +2392,28 @@ def flush_outbox(
         return 0
 
     content = render_outbox(due, now)
+    account_prefixes = {
+        str((event.get("payload") or {}).get("account_prefix") or "")
+        for event in due
+        if str((event.get("payload") or {}).get("account_prefix") or "")
+    }
+    has_unlabelled = any(
+        not str((event.get("payload") or {}).get("account_prefix") or "")
+        for event in due
+    )
+    if len(account_prefixes) == 1 and not has_unlabelled:
+        title_prefix = next(iter(account_prefixes))
+    elif account_prefixes:
+        title_prefix = "【多账户】"
+    else:
+        title_prefix = ""
     try:
         sent = bool(
             sender(
-                title=f"盘中模拟决策提醒 - {now.strftime('%m-%d %H:%M')}",
+                title=(
+                    f"{title_prefix}盘中模拟决策提醒 - "
+                    f"{now.strftime('%m-%d %H:%M')}"
+                ),
                 content=content,
             )
         )
@@ -2276,6 +2531,7 @@ def _queue_reference_health_event(
 def run_cycle(
     *,
     symbols: Sequence[str],
+    primary_symbols: Optional[Sequence[str]] = None,
     state: MutableMapping[str, Any],
     levels: Mapping[str, ReferenceLevels],
     fetcher: Any,
@@ -2308,6 +2564,14 @@ def run_cycle(
         candidates=candidate_plans,
     )
     canonical = list(dict.fromkeys(canonical_symbol(symbol) for symbol in symbols))
+    primary_set = (
+        {canonical_symbol(symbol) for symbol in primary_symbols}
+        if primary_symbols is not None
+        else set(canonical)
+    )
+    primary_canonical = [symbol for symbol in canonical if symbol in primary_set]
+    context_index = watch_contexts_by_symbol()
+    watch_only_symbols = set(context_index) - primary_set
     try:
         fetched = fetcher.fetch(canonical, now=now)
     except Exception as exc:
@@ -2323,25 +2587,80 @@ def run_cycle(
         )
         for symbol in canonical
     ]
-    valid = [quote for quote in quotes if quote.price is not None and not quote.is_stale]
+    primary_valid = [
+        quote
+        for quote in quotes
+        if quote.symbol in primary_set
+        and quote.price is not None
+        and not quote.is_stale
+    ]
     quote_map = {quote.symbol: quote for quote in quotes}
     if shadow_state is not None:
+        shadow_quote_map = {
+            symbol: quote
+            for symbol, quote in quote_map.items()
+            if symbol not in watch_only_symbols
+        }
         # Pending signals are evaluated before this cycle creates any new
         # signal, guaranteeing that a signal cannot fill on its own quote.
         execute_shadow_pending(
             shadow_state,
-            quote_map,
+            shadow_quote_map,
             now=now,
             freshness_seconds=shadow_freshness_seconds,
         )
         update_shadow_latest_quotes(
             shadow_state,
-            quote_map,
+            shadow_quote_map,
             now,
             freshness_seconds=shadow_freshness_seconds,
         )
-    coverage = len(valid) / len(canonical) if canonical else 0.0
+    coverage = (
+        len(primary_valid) / len(primary_canonical) if primary_canonical else 0.0
+    )
     provider = state.setdefault("provider", {})
+    layer_symbols: Dict[str, set[str]] = {}
+    for symbol, contexts in context_index.items():
+        if symbol not in canonical:
+            continue
+        for context in contexts:
+            layer_symbols.setdefault(str(context.get("layer") or ""), set()).add(
+                symbol
+            )
+    provider["coverage_by_account_layer"] = {
+        "PRIMARY_PORTFOLIO": {
+            "valid": len(primary_valid),
+            "total": len(primary_canonical),
+            "coverage": coverage,
+            "drives_primary_degradation": True,
+        },
+        **{
+            layer: {
+                "valid": sum(
+                    1
+                    for quote in quotes
+                    if quote.symbol in members
+                    and quote.price is not None
+                    and not quote.is_stale
+                ),
+                "total": len(members),
+                "coverage": (
+                    sum(
+                        1
+                        for quote in quotes
+                        if quote.symbol in members
+                        and quote.price is not None
+                        and not quote.is_stale
+                    )
+                    / len(members)
+                    if members
+                    else 0.0
+                ),
+                "drives_primary_degradation": False,
+            }
+            for layer, members in layer_symbols.items()
+        },
+    }
     recovery_events = 0
     depth_adapter = level2_adapter or Level2DataAdapter()
     try:
@@ -2413,7 +2732,7 @@ def run_cycle(
         if level2_available
         else "unavailable_using_declared_fallback"
     )
-    if not valid or coverage < min_quote_coverage:
+    if not primary_valid or coverage < min_quote_coverage:
         provider["consecutive_low_coverage"] = (
             int(provider.get("consecutive_low_coverage") or 0) + 1
         )
@@ -2447,8 +2766,8 @@ def run_cycle(
                         "signal_time": _iso(now),
                         "quote_time": None,
                         "data_quality": "recovered",
-                        "valid_count": len(valid),
-                        "total_count": len(canonical),
+                        "valid_count": len(primary_valid),
+                        "total_count": len(primary_canonical),
                     },
                     decision_result="push_data_recovery_once",
                 )
@@ -2460,7 +2779,10 @@ def run_cycle(
     created = recovery_events
     if degraded:
         created += _queue_data_health_event(
-            state, now=now, valid_count=len(valid), total_count=len(canonical)
+            state,
+            now=now,
+            valid_count=len(primary_valid),
+            total_count=len(primary_canonical),
         )
 
     fast_until = _parse_iso(provider.get("fast_until"))
@@ -2532,10 +2854,21 @@ def run_cycle(
     created += process_actionable_decisions(
         state,
         now=now,
-        raw_events=raw_events,
+        raw_events=[
+            event
+            for event in raw_events
+            if str(event.get("symbol") or "") not in watch_only_symbols
+        ],
         levels=levels,
         shadow_state=shadow_state,
         signal_recorder=shadow_signal_recorder,
+    )
+    created += process_watch_account_decisions(
+        state,
+        now=now,
+        raw_events=raw_events,
+        levels=levels,
+        contexts_by_symbol=context_index,
     )
     provider["last_coverage"] = coverage
     provider["last_checked_at"] = _iso(now)
@@ -2558,7 +2891,7 @@ def run_cycle(
         checked_at=_iso(now),
         active_symbols=canonical,
         quotes=quotes,
-        valid_quote_count=len(valid),
+        valid_quote_count=len(primary_valid),
         coverage=coverage,
         new_event_count=created,
         pending_event_count=len(state.get("outbox", [])),
@@ -2662,6 +2995,14 @@ def render_session_report(
             ]
         )
     if last_cycle is not None:
+        primary_coverage = (
+            provider_status.get("coverage_by_account_layer", {}).get(
+                "PRIMARY_PORTFOLIO", {}
+            )
+        )
+        primary_total = int(
+            primary_coverage.get("total", last_cycle.valid_quote_count)
+        )
         lines.extend(
             [
                 "",
@@ -2669,8 +3010,8 @@ def render_session_report(
                 "",
                 f"- 开市标的：{len(last_cycle.active_symbols)}",
                 (
-                    f"- 有效行情：{last_cycle.valid_quote_count}/"
-                    f"{len(last_cycle.active_symbols)}（{last_cycle.coverage:.2%}）"
+                    f"- PRIMARY有效行情：{last_cycle.valid_quote_count}/"
+                    f"{primary_total}（{last_cycle.coverage:.2%}）"
                 ),
                 f"- 下一轮间隔：{last_cycle.next_interval_seconds:.0f} 秒",
                 f"- 数据源降级：{'是' if last_cycle.degraded else '否'}",
@@ -2781,14 +3122,25 @@ def run_session(
         raise SessionError("late_start_policy 必须是 error 或 skip")
 
     started = clock().astimezone(SHANGHAI_TZ)
+    try:
+        # Validate the optional Secret without logging or persisting its
+        # contents. Intraday decisions use only public held/candidate roles.
+        load_private_watch_config()
+    except ValueError:
+        # A malformed optional side-account payload must never block PRIMARY.
+        # Ignore its private fields without echoing any payload value.
+        print(
+            "::warning::旁路观察账户私密配置无效；本轮忽略私密字段，PRIMARY继续",
+            file=sys.stderr,
+        )
     shadow_state: Optional[MutableMapping[str, Any]] = None
     if shadow_state_path is not None:
         try:
+            # Legacy argument retained for API compatibility only. PRIMARY is
+            # restore-only and must never consume an initialization payload.
             shadow_state = load_or_initialize_shadow(
                 shadow_state_path,
-                shadow_initial_portfolio_json
-                if shadow_initial_portfolio_json is not None
-                else os.getenv("SHADOW_AB_INITIAL_PORTFOLIO_JSON"),
+                None,
                 started,
             )
         except ShadowExperimentError as exc:
@@ -2943,8 +3295,18 @@ def run_session(
             shadow_state.get("strategy_shadow_portfolio", {}).get("positions", {})
         )
         shadow_symbols.extend(str(symbol) for symbol in shadow_positions)
+    # PRIMARY is always first.  Side accounts share one deduplicated quote
+    # request but never become PRIMARY A/B positions or coverage denominators.
     symbols = list(
-        dict.fromkeys([*configured_symbols, *extra_candidates, *shadow_symbols])
+        dict.fromkeys(
+            [
+                *PRIMARY_SYMBOLS,
+                *configured_symbols,
+                *account_quote_symbols(),
+                *extra_candidates,
+                *shadow_symbols,
+            ]
+        )
     )
 
     state = load_state_v2(state_path, now=started)
@@ -2954,19 +3316,26 @@ def run_session(
         candidates=candidate_plans,
     )
     levels = load_reference_levels_batch(database_path, symbols, now=started)
+    primary_reference_symbols = list(PRIMARY_SYMBOLS)
     covered_references = sum(
         1
-        for reference in levels.values()
+        for symbol in primary_reference_symbols
+        for reference in (levels.get(symbol, ReferenceLevels()),)
         if reference.stop_loss is not None or reference.target_price is not None
     )
     reference_summary = {
         "database_available": database_path.exists(),
         "covered_symbols": covered_references,
-        "total_symbols": len(symbols),
-        "coverage": covered_references / len(symbols),
+        "total_symbols": len(primary_reference_symbols),
+        "coverage": (
+            covered_references / len(primary_reference_symbols)
+            if primary_reference_symbols
+            else 0.0
+        ),
+        "scope": "PRIMARY_PORTFOLIO_only",
         "status": (
             "available"
-            if covered_references == len(symbols)
+            if covered_references == len(primary_reference_symbols)
             else "partial"
             if covered_references
             else "unavailable"
@@ -2996,7 +3365,7 @@ def run_session(
             state,
             now=started,
             covered_count=0,
-            total_count=len(symbols),
+            total_count=len(primary_reference_symbols),
             database_available=database_path.exists(),
         )
     else:
@@ -3097,6 +3466,9 @@ def run_session(
         if active:
             last_cycle = run_cycle(
                 symbols=active,
+                primary_symbols=[
+                    symbol for symbol in active if symbol in set(PRIMARY_SYMBOLS)
+                ],
                 state=state,
                 levels=levels,
                 fetcher=quote_fetcher,
@@ -3194,7 +3566,12 @@ def run_session(
                 )
             execute_shadow_pending(
                 shadow_state,
-                closing_quotes,
+                {
+                    symbol: quote
+                    for symbol, quote in closing_quotes.items()
+                    if symbol
+                    not in (set(watch_contexts_by_symbol()) - set(PRIMARY_SYMBOLS))
+                },
                 now=ended,
                 freshness_seconds=freshness_seconds,
                 session_closed=True,

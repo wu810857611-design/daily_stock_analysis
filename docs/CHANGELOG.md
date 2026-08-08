@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 > For user-friendly release highlights, see the [GitHub Releases](https://github.com/ZhuLinsen/daily_stock_analysis/releases) page.
 
 ## [Unreleased]
+- [修复] PRIMARY 真实持仓 A/B 实验锁定 2026-08-07 基准汇率 `1 HKD = 0.8865 CNY`，正式 NAV、收益、回撤、现金及仓位统一使用人民币；A/H 共用人民币模拟购买力，A 股买入按 100 股整数手，既有加密状态只迁移不重建。
+- [新功能] 新增父亲、本人第二账户与妹妹账户的隔离观察层；相同 symbol 复用一次行情与收盘研究，PRIMARY 覆盖率、信号、成交和绩效保持独立，私密数量与成本仅接受 `WATCH_ACCOUNTS_PRIVATE_JSON` Secret 注入。
+- [改进] PRIMARY 14 只成为每日收盘 P0 股票池，其他账户按 P1-P3 有限降级执行；旧 100 万元 paper tracker 退出正常 full 推送，仅保留手动“旧版标准化20日模拟实验（非真实持仓A/B）”入口及历史状态。
 - [新功能] 盘中提醒新增确定性模拟决策门：原始涨跌、止损/止盈、adaptive 与数据质量事件继续完整留账，仅在操作建议或风险/关键位发生实质变化时 Push；取消按 cooldown 机械重发，并将数据降级与恢复各收敛为一次提醒。
 - [新功能] 新增以 2026-08-07 收盘冻结的 14 只核心持仓“完全死拿 vs 策略影子账户”实验；信号只追加、成交不回填，净值扣除模拟成本与滑点，第 20 日检查后连续运行至第 60 日。真实数量、成本和绝对净值通过 GitHub secret 与 AES 加密状态保护，私密成绩单仅由 PushPlus 发送。
 - [改进] 移除分钟盘中工作流的 GitHub 原生 schedule，改由外部 cron-job.org 在北京时间 09:20/12:50 分别以 `workflow_dispatch` 触发 morning/afternoon；Run workflow 的手动入口与迟到安全保护保持可用。
