@@ -61,8 +61,14 @@
 卖出现金留在账户内，后续只有新有效买入/加仓信号才可使用。
 
 历史成本仅用于展示用户历史浮盈亏，不作为实验收益起点。两账户以冻结日可靠收盘
-市值建立相同初始净值，并在比较中扣除显式标记为 simulation assumption 的手续费、
-税费和滑点。信号账本只追加不回改；模拟成交使用信号以后第一笔满足新鲜度要求的
+市值建立相同初始净值；正式 NAV 统一折算为人民币，其中港股在整个 20→60 日实验
+永久使用 2026-08-07 基准汇率 `1 HKD = 0.8865 CNY`，不混入后续汇率波动。原始
+CNY/HKD 分项和旧 1:1 口径只保留审计。策略账户采用统一人民币模拟购买力，A 股与
+港股通卖出所得可跨市场再配置，不模拟真实港股通清算时差，也不允许现金为负。
+比较中扣除显式标记为 simulation assumption 的手续费、税费和滑点。A 股新买入与
+加仓按 100 股整数手；卖出和清仓可处理已有尾数。没有可靠港股每手 metadata 时不
+猜测，并明确标记 `HK board lot not modeled`。信号账本只追加不回改；模拟成交使用
+信号以后第一笔满足新鲜度要求的
 可验证行情。`scheduler_missed`、`data_unavailable`、`stale_quote` 或
 `execution_missed` 均不补单，也不记为策略主动不操作，避免前视偏差。
 
@@ -73,9 +79,28 @@
 账户、不生成委托，也不使用真实资金。
 
 由于仓库公开，14 只持仓的真实数量、历史成本和绝对净值不会写入源码、公开报告或
-明文 artifact。初始化快照由 GitHub secret 注入，持久化状态使用 AES 加密；私密
-每日成绩单只通过 PushPlus 发送。公开 artifact 仅允许保存不含绝对资产信息的运行
-诊断，cache miss 不得据此重建或猜测账户。
+明文 artifact。初始化完成后 PRIMARY 只允许从 AES 加密状态恢复；cache 与 artifact
+都无法恢复时直接失败，初始持仓 Secret 也不得用来重建。私密每日成绩单只通过
+PushPlus 发送。公开 artifact 仅允许保存不含绝对资产信息的运行诊断。
+
+## 分层账户观察与每日优先级
+
+正式 A/B 只包含 `PRIMARY_PORTFOLIO` 的 14 只核心持仓。父亲账户、本人第二账户和
+妹妹账户分别作为 `FAMILY_WATCHLIST`、`SECONDARY_ACCOUNT_WATCH` 与
+`SISTER_MANAGED_WATCH` 旁路观察层：它们可复用同一 symbol 的行情、收盘研究和参考
+价位，但不会写入 PRIMARY 信号、成交、现金、NAV、回撤、覆盖率或实验天数。
+收盘分析按 P0 PRIMARY、P1 父亲、P2 其他已持有账户、P3 候选顺序执行；可选层失败
+不会拖累 PRIMARY，重复 symbol 不重复分析。`002759` 在明确成交前始终只是 candidate。
+
+公开代码只保存 symbol、账户层和 held/candidate 状态。第二账户及妹妹账户的真实
+数量与成本如需用于人工风险复核，只能放入 GitHub Repository Secret
+`WATCH_ACCOUNTS_PRIVATE_JSON`；运行时只校验使用，不输出日志、不落明文 artifact。
+普通涨跌、cooldown 到期和结论未变化继续不 Push；旁路提醒只有在关键位、风险等级
+或人工复核动作发生实质变化时才发送，并带清晰账户前缀。
+
+旧 `paper_trade_tracker.py` 的 100 万元标准化实验及历史状态继续保留，但正常每日
+full 运行不再推进或 Push。只有手动选择 `simulation-summary` 才会查看
+“旧版标准化20日模拟实验（非真实持仓A/B）”。
 
 ## Level-2 和数据降级
 

@@ -25,17 +25,26 @@ from scripts.intraday_session import (
     load_state_v2,
     parse_tencent_batch,
     process_actionable_decisions,
+    process_watch_account_decisions,
     resolve_session_end,
     run_cycle,
     run_session,
     save_state_v2,
     update_condition_state,
 )
+from scripts.account_watchlists import (
+    PRIMARY_SYMBOLS,
+    all_quote_symbols,
+    load_private_watch_config,
+    priority_analysis_pools,
+    watch_contexts_by_symbol,
+)
 from scripts.shadow_ab_experiment import (
     INITIAL_INSTRUMENTS,
     initialize_state as initialize_shadow_state,
     record_daily_nav as record_shadow_daily_nav,
     record_signal as record_shadow_signal,
+    save_state as save_shadow_state,
 )
 
 
@@ -125,6 +134,351 @@ def synthetic_shadow_state():
         },
         created_at=datetime(2026, 8, 9, 10, tzinfo=TZ),
     )
+
+
+class AccountWatchLayerTests(unittest.TestCase):
+    def test_priority_pools_are_canonical_and_cross_tier_deduplicated(self):
+        pools = priority_analysis_pools()
+        self.assertEqual(pools["P0_PRIMARY"], PRIMARY_SYMBOLS)
+        flattened = [symbol for values in pools.values() for symbol in values]
+        self.assertEqual(len(flattened), len(set(flattened)))
+        self.assertEqual(all_quote_symbols(), tuple(flattened))
+        self.assertIn("563230", pools["P2_ACCOUNT_HOLDINGS"])
+        self.assertEqual(pools["P3_CANDIDATES"], ("002759",))
+        self.assertNotIn("HK01347", pools["P2_ACCOUNT_HOLDINGS"])
+
+    def test_private_watch_config_accepts_only_runtime_held_positions(self):
+        parsed = load_private_watch_config(
+            json.dumps(
+                {
+                    "secondary_account": {
+                        "positions": [
+                            {
+                                "symbol": "563230",
+                                "quantity": 1000,
+                                "historical_cost": 1.23,
+                            }
+                        ],
+                        "informational_snapshot": {
+                            "captured_at": "2026-01-01T00:00:00+08:00",
+                            "cash": 12345,
+                        },
+                    },
+                    "sister_managed": {
+                        "positions": [
+                            {
+                                "symbol": "002594",
+                                "quantity": 100,
+                                "historical_cost": 50,
+                            }
+                        ]
+                    },
+                }
+            )
+        )
+        self.assertEqual(parsed["secondary_account"]["positions"][0]["symbol"], "563230")
+        self.assertEqual(parsed["sister_managed"]["positions"][0]["symbol"], "002594")
+        with self.assertRaises(ValueError):
+            load_private_watch_config(
+                json.dumps(
+                    {
+                        "secondary_account": {
+                            "positions": [
+                                {
+                                    "symbol": "002759",
+                                    "quantity": 100,
+                                    "historical_cost": 10,
+                                }
+                            ]
+                        }
+                    }
+                )
+            )
+
+    def test_side_quote_failures_do_not_change_primary_coverage_or_degrade(self):
+        now = datetime(2026, 8, 10, 10, 0, tzinfo=TZ)
+        state = intraday_session_module._empty_state(now)
+        result = run_cycle(
+            symbols=["300408", "000100", "HK09988"],
+            primary_symbols=["300408"],
+            state=state,
+            levels={},
+            fetcher=FakeFetcher(
+                [
+                    {
+                        "300408": quote("300408", 40, 0.1, now),
+                        "000100": RealtimeQuote(symbol="000100", is_stale=True),
+                        "HK09988": RealtimeQuote(symbol="HK09988", is_stale=True),
+                    }
+                ]
+            ),
+            now=now,
+            min_quote_coverage=1.0,
+            low_coverage_limit=1,
+            notification_sender=lambda **_: True,
+        )
+        self.assertEqual(result.coverage, 1.0)
+        self.assertFalse(result.degraded)
+        coverage = state["provider"]["coverage_by_account_layer"]
+        self.assertEqual(coverage["PRIMARY_PORTFOLIO"]["coverage"], 1.0)
+        self.assertFalse(
+            coverage["FAMILY_WATCHLIST"]["drives_primary_degradation"]
+        )
+        self.assertFalse(
+            coverage["SISTER_MANAGED_WATCH"]["drives_primary_degradation"]
+        )
+
+    def test_side_layer_never_calls_primary_signal_recorder(self):
+        now = datetime(2026, 8, 10, 10, 0, tzinfo=TZ)
+        state = intraday_session_module._empty_state(now)
+        called = []
+
+        def forbidden_recorder(*_args, **_kwargs):
+            called.append(True)
+            raise AssertionError("watch layer must not record a PRIMARY signal")
+
+        result = run_cycle(
+            symbols=["300408", "000100"],
+            primary_symbols=["300408"],
+            state=state,
+            levels={"000100": ReferenceLevels(stop_loss=9.9)},
+            fetcher=FakeFetcher(
+                [
+                    {
+                        "300408": quote("300408", 40, 0.1, now),
+                        "000100": quote("000100", 9.8, -2.0, now),
+                    }
+                ]
+            ),
+            now=now,
+            shadow_state=synthetic_shadow_state(),
+            shadow_signal_recorder=forbidden_recorder,
+            notification_sender=lambda **_: False,
+        )
+        self.assertFalse(called)
+        self.assertEqual(result.coverage, 1.0)
+        self.assertEqual(len(state["outbox"]), 1)
+        payload = state["outbox"][0]["payload"]
+        self.assertEqual(payload["account_layer"], "FAMILY_WATCHLIST")
+        self.assertIs(payload["primary_shadow_eligible"], False)
+        self.assertEqual(
+            state["outbox"][0]["condition"],
+            "watch:FAMILY_WATCHLIST:stop_loss",
+        )
+
+    def test_preexisting_watch_only_pending_signal_cannot_execute_on_side_quote(self):
+        now = datetime(2026, 8, 10, 10, 0, tzinfo=TZ)
+        shadow = synthetic_shadow_state()
+        shadow["strategy_shadow_portfolio"]["positions"]["000100"] = {
+            "symbol": "000100",
+            "name": "synthetic side position",
+            "currency": "CNY",
+            "quantity": 100,
+            "historical_cost": 10,
+            "experiment_basis_price": 10,
+        }
+        shadow["strategy_shadow_portfolio"]["last_prices"]["000100"] = 10
+        signal = record_shadow_signal(
+            shadow,
+            event_id="legacy-side-pending",
+            symbol="000100",
+            signal_time=(now - timedelta(seconds=5)).isoformat(),
+            quote_time=(now - timedelta(seconds=10)).isoformat(),
+            signal_price=10,
+            action="模拟清仓",
+            reason="synthetic pending signal must remain isolated",
+        )
+        state = intraday_session_module._empty_state(now)
+
+        run_cycle(
+            symbols=["300408", "000100"],
+            primary_symbols=["300408"],
+            state=state,
+            levels={},
+            fetcher=FakeFetcher(
+                [
+                    {
+                        "300408": quote("300408", 40, 0.1, now),
+                        "000100": quote("000100", 11, 1.0, now),
+                    }
+                ]
+            ),
+            now=now,
+            shadow_state=shadow,
+            notification_sender=lambda **_: False,
+        )
+
+        self.assertIn(signal["signal_id"], shadow["pending_signal_ids"])
+        self.assertEqual(shadow["execution_ledger"], [])
+        self.assertEqual(shadow["trades"], [])
+        self.assertEqual(
+            shadow["strategy_shadow_portfolio"]["positions"]["000100"][
+                "quantity"
+            ],
+            100,
+        )
+
+    def test_secondary_and_sister_alerts_never_enter_primary_execution(self):
+        now = datetime(2026, 8, 10, 10, 0, tzinfo=TZ)
+        shadow = synthetic_shadow_state()
+        state = intraday_session_module._empty_state(now)
+
+        def forbidden_recorder(*_args, **_kwargs):
+            raise AssertionError("side-account alert reached PRIMARY recorder")
+
+        run_cycle(
+            symbols=["300408", "563230", "HK09988"],
+            primary_symbols=["300408"],
+            state=state,
+            levels={
+                "563230": ReferenceLevels(target_price=1.1),
+                "HK09988": ReferenceLevels(target_price=100),
+            },
+            fetcher=FakeFetcher(
+                [
+                    {
+                        "300408": quote("300408", 40, 0.1, now),
+                        "563230": quote("563230", 1.2, 1.0, now),
+                        "HK09988": quote("HK09988", 105, 1.0, now),
+                    }
+                ]
+            ),
+            now=now,
+            shadow_state=shadow,
+            shadow_signal_recorder=forbidden_recorder,
+            notification_sender=lambda **_: False,
+        )
+        self.assertEqual(shadow["signal_ledger"], [])
+        self.assertEqual(shadow["execution_ledger"], [])
+        self.assertEqual(shadow["trades"], [])
+        self.assertEqual(
+            {
+                event["payload"]["account_layer"]
+                for event in state["outbox"]
+            },
+            {"SECONDARY_ACCOUNT_WATCH", "SISTER_MANAGED_WATCH"},
+        )
+
+    def test_same_account_symbol_cycle_emits_only_strongest_watch_decision(self):
+        now = datetime(2026, 8, 10, 10, 0, tzinfo=TZ)
+        state = intraday_session_module._empty_state(now)
+        raw_events = [
+            {
+                "event_id": "target",
+                "symbol": "000100",
+                "name": "TCL科技",
+                "condition": "target_reached",
+                "transition": "activated",
+                "severity": "warning",
+                "price": 10.5,
+                "reference_price": 10.0,
+                "payload": {
+                    "data_quality": "fresh_l1",
+                    "quote_time": now.isoformat(),
+                },
+            },
+            {
+                "event_id": "stop",
+                "symbol": "000100",
+                "name": "TCL科技",
+                "condition": "stop_loss",
+                "transition": "activated",
+                "severity": "critical",
+                "price": 9.0,
+                "reference_price": 9.5,
+                "payload": {
+                    "data_quality": "fresh_l1",
+                    "quote_time": now.isoformat(),
+                },
+            },
+        ]
+        created = process_watch_account_decisions(
+            state,
+            now=now,
+            raw_events=raw_events,
+            levels={
+                "000100": ReferenceLevels(stop_loss=9.5, target_price=10.0)
+            },
+        )
+        self.assertEqual(created, 1)
+        self.assertEqual(len(state["outbox"]), 1)
+        self.assertEqual(state["outbox"][0]["payload"]["action"], "人工复核清仓")
+        sent = []
+        self.assertEqual(
+            flush_outbox(
+                state,
+                now=now,
+                sender=lambda **payload: sent.append(payload) or True,
+            ),
+            1,
+        )
+        self.assertTrue(sent[0]["title"].startswith("【父亲账户观察】"))
+        self.assertIn("【父亲账户观察】TCL科技", sent[0]["content"])
+
+    def test_secondary_candidate_can_observe_but_never_receive_sell_action(self):
+        now = datetime(2026, 8, 10, 10, 0, tzinfo=TZ)
+        state = intraday_session_module._empty_state(now)
+        stop_event = {
+            "event_id": "candidate-stop",
+            "symbol": "002759",
+            "name": "ST天际",
+            "condition": "stop_loss",
+            "transition": "activated",
+            "severity": "critical",
+            "price": 8.0,
+            "reference_price": 8.5,
+            "payload": {
+                "data_quality": "fresh_l1",
+                "quote_time": now.isoformat(),
+            },
+        }
+        self.assertEqual(
+            process_watch_account_decisions(
+                state,
+                now=now,
+                raw_events=[stop_event],
+                levels={"002759": ReferenceLevels(stop_loss=8.5)},
+            ),
+            0,
+        )
+        entry_event = {
+            **stop_event,
+            "event_id": "candidate-entry",
+            "condition": "adaptive_entry_review",
+            "severity": "warning",
+            "price": 9.0,
+            "payload": {
+                "data_quality": "fresh_l1",
+                "quote_time": now.isoformat(),
+                "entry_low": 8.8,
+                "entry_high": 9.2,
+                "stop_loss": 8.5,
+                "target_price": 10.5,
+                "plan_fingerprint": "plan-1",
+            },
+        }
+        self.assertEqual(
+            process_watch_account_decisions(
+                state,
+                now=now,
+                raw_events=[entry_event],
+                levels={},
+            ),
+            1,
+        )
+        payload = state["outbox"][0]["payload"]
+        self.assertEqual(payload["account_layer"], "SECONDARY_ACCOUNT_WATCH")
+        self.assertEqual(payload["action"], "继续观察")
+        self.assertIn("候选观察", payload["conclusion"])
+
+    def test_shared_symbol_has_one_quote_but_separate_account_contexts(self):
+        symbols = all_quote_symbols()
+        self.assertEqual(symbols.count("563230"), 1)
+        contexts = watch_contexts_by_symbol()["563230"]
+        self.assertEqual(
+            {context["layer"] for context in contexts},
+            {"SECONDARY_ACCOUNT_WATCH", "SISTER_MANAGED_WATCH"},
+        )
 
 
 class TencentBatchTests(unittest.TestCase):
@@ -692,7 +1046,11 @@ class StateMachineTests(unittest.TestCase):
         )
         self.assertEqual(shadow["signal_ledger"], [])
 
-        shadow["strategy_shadow_portfolio"]["cash_by_currency"]["HKD"] = 1
+        shadow["strategy_shadow_portfolio"]["cash_cny"] = 1
+        shadow["strategy_shadow_portfolio"]["cash_by_currency"] = {
+            "CNY": 1,
+            "HKD": 0,
+        }
         later = now + timedelta(minutes=1)
         later_quote = quote("HK00700", 100, 0.2, later)
         start = len(state["event_ledger"])
@@ -708,9 +1066,13 @@ class StateMachineTests(unittest.TestCase):
         )
         self.assertEqual(len(state["event_ledger"]), start)
 
-        shadow["strategy_shadow_portfolio"]["cash_by_currency"]["HKD"] = (
+        shadow["strategy_shadow_portfolio"]["cash_cny"] = (
             shadow["initial_nav"] * 0.04
         )
+        shadow["strategy_shadow_portfolio"]["cash_by_currency"] = {
+            "CNY": shadow["strategy_shadow_portfolio"]["cash_cny"],
+            "HKD": 0,
+        }
         self.assertEqual(
             enqueue_cash_available_candidate_rechecks(
                 state,
@@ -1163,19 +1525,10 @@ class SessionLoopTests(unittest.TestCase):
                 for symbol in symbols
             }
 
-        private_payload = {
-            "positions": [
-                {
-                    "symbol": item["symbol"],
-                    "quantity": 100,
-                    "historical_cost": item["verified_close"],
-                }
-                for item in INITIAL_INSTRUMENTS
-            ]
-        }
         fetcher = FakeFetcher([batch])
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
+            save_shadow_state(root / "shadow.json", synthetic_shadow_state())
             run_session(
                 stocks="300408",
                 end_at=start + timedelta(hours=2),
@@ -1184,7 +1537,6 @@ class SessionLoopTests(unittest.TestCase):
                 report_path=root / "session.md",
                 shadow_state_path=root / "shadow.json",
                 shadow_report_path=root / "shadow.md",
-                shadow_initial_portfolio_json=json.dumps(private_payload),
                 fetcher=fetcher,
                 phase_resolver=lambda _market, _now: "intraday",
                 clock=clock.now,
@@ -1196,8 +1548,9 @@ class SessionLoopTests(unittest.TestCase):
 
         self.assertEqual(
             set(fetcher.calls[0][0]),
-            {item["symbol"] for item in INITIAL_INSTRUMENTS},
+            set(all_quote_symbols()),
         )
+        self.assertEqual(tuple(fetcher.calls[0][0][:14]), PRIMARY_SYMBOLS)
         self.assertEqual(
             shadow["buy_and_hold_baseline"]["positions"],
             shadow["strategy_shadow_portfolio"]["positions"],
@@ -1294,7 +1647,10 @@ class SessionLoopTests(unittest.TestCase):
                 max_cycles=1,
             )
         self.assertEqual(result.quote_cycles, 1)
-        self.assertEqual(fetcher.calls[0][0], ["HK00981"])
+        self.assertEqual(
+            fetcher.calls[0][0],
+            [symbol for symbol in all_quote_symbols() if symbol.startswith("HK")],
+        )
 
     def test_missing_reference_database_is_visible_and_notified_once(self):
         start = datetime(2026, 7, 28, 10, 0, tzinfo=TZ)
@@ -1394,7 +1750,9 @@ class SessionLoopTests(unittest.TestCase):
                 max_cycles=1,
             )
             saved = json.loads((root / "state.json").read_text(encoding="utf-8"))
-        self.assertEqual(fetcher.calls[0][0], ["300408", "HK00700"])
+        self.assertEqual(
+            fetcher.calls[0][0], [*all_quote_symbols(), "HK00700"]
+        )
         self.assertEqual(
             saved["provider"]["candidate_plan_monitoring"]["extra_symbols"],
             ["HK00700"],
@@ -1891,7 +2249,9 @@ class SessionLoopTests(unittest.TestCase):
         self.assertIn('SESSION="${{ github.event.inputs.session', workflow)
         self.assertIn('--late-start-policy "$LATE_START_POLICY"', workflow)
         self.assertIn('--shadow-state "$SHADOW_STATE_PLAIN"', workflow)
-        self.assertIn("SHADOW_AB_INITIAL_PORTFOLIO_JSON", workflow)
+        self.assertNotIn("SHADOW_AB_INITIAL_PORTFOLIO_JSON", workflow)
+        self.assertIn("WATCH_ACCOUNTS_PRIVATE_JSON", workflow)
+        self.assertIn("拒绝重新初始化", workflow)
         daily_workflow = (
             Path(__file__).resolve().parents[1]
             / ".github"

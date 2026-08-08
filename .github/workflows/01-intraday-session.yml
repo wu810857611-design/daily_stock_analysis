@@ -317,8 +317,8 @@ jobs:
           PY
           )"
           if [ -z "$ARTIFACT_ID" ]; then
-            echo "ℹ️ 没有可恢复的同分支盘中状态，本轮创建 v2 状态"
-            exit 0
+            echo "❌ cache 与 artifact 均无可恢复的加密 PRIMARY A/B 状态；实验已锁定，拒绝重新初始化"
+            exit 1
           fi
 
           mkdir -p "$TMP_DIR/unpacked"
@@ -360,7 +360,8 @@ jobs:
             fi
             echo "✅ 已从最新固定 artifact 恢复盘中状态和加密 A/B 状态"
           else
-            echo "ℹ️ 最新固定 artifact 仅含旧盘中状态；A/B账户只允许在初始化窗口创建"
+            echo "❌ 最新固定 artifact 缺少加密 PRIMARY A/B 状态；实验已锁定，拒绝重新初始化"
+            exit 1
           fi
 
       - name: 运行分钟级 A/H 盘中模拟监控
@@ -382,8 +383,9 @@ jobs:
           INTRADAY_DETERIORATION_PCT: ${{ vars.INTRADAY_DETERIORATION_PCT || '1.0' }}
           INTRADAY_CANDIDATE_PLANS_PATH: ${{ vars.INTRADAY_CANDIDATE_PLANS_PATH || 'data/market_scan/latest.json' }}
           # 公开仓库不得把真实数量/成本和绝对净值写入明文 artifact。
-          SHADOW_AB_INITIAL_PORTFOLIO_JSON: ${{ secrets.SHADOW_AB_INITIAL_PORTFOLIO_JSON }}
+          # PRIMARY 账户已经初始化完成；运行时只允许恢复现有加密状态。
           SHADOW_AB_STATE_KEY: ${{ secrets.SHADOW_AB_STATE_KEY }}
+          WATCH_ACCOUNTS_PRIVATE_JSON: ${{ secrets.WATCH_ACCOUNTS_PRIVATE_JSON }}
         run: |
           set -euo pipefail
           STOCK_LIST="${STOCK_LIST_CONFIG:-${STOCK_LIST:-}}"
@@ -399,20 +401,22 @@ jobs:
               echo "::warning::候选计划路径不存在；本轮不生成自适应人工复核事件"
             fi
           fi
-          if [ -z "${SHADOW_AB_INITIAL_PORTFOLIO_JSON:-}" ] || [ -z "${SHADOW_AB_STATE_KEY:-}" ]; then
-            echo "❌ 缺少 SHADOW_AB_INITIAL_PORTFOLIO_JSON 或 SHADOW_AB_STATE_KEY；拒绝以明文/空组合启动 A/B 实验"
+          if [ -z "${SHADOW_AB_STATE_KEY:-}" ]; then
+            echo "❌ 缺少 SHADOW_AB_STATE_KEY；无法恢复加密 PRIMARY A/B 状态"
+            exit 1
+          fi
+          if [ ! -f data/intraday/shadow_ab_state.json.enc ]; then
+            echo "❌ 加密 PRIMARY A/B 状态缺失；实验已锁定，拒绝重新初始化"
             exit 1
           fi
           SHADOW_STATE_PLAIN="$RUNNER_TEMP/shadow_ab_state.json"
           SHADOW_REPORT_PLAIN="$RUNNER_TEMP/shadow_ab_scorecard.md"
           SHADOW_STATE_ENCRYPTED="data/intraday/shadow_ab_state.json.enc"
           SHADOW_REPORT_ENCRYPTED="data/intraday/shadow_ab_scorecard.md.enc"
-          if [ -f "$SHADOW_STATE_ENCRYPTED" ]; then
-            openssl enc -d -aes-256-cbc -pbkdf2 \
-              -pass env:SHADOW_AB_STATE_KEY \
-              -in "$SHADOW_STATE_ENCRYPTED" \
-              -out "$SHADOW_STATE_PLAIN"
-          fi
+          openssl enc -d -aes-256-cbc -pbkdf2 \
+            -pass env:SHADOW_AB_STATE_KEY \
+            -in "$SHADOW_STATE_ENCRYPTED" \
+            -out "$SHADOW_STATE_PLAIN"
           persist_private_shadow_state() {
             status=$?
             if [ -f "$SHADOW_STATE_PLAIN" ]; then

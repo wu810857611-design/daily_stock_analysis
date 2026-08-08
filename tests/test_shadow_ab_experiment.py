@@ -1,4 +1,5 @@
 import copy
+import json
 import math
 import tempfile
 import unittest
@@ -7,6 +8,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from scripts.shadow_ab_experiment import (
+    HKD_CNY_BASELINE_FX,
     INITIAL_INSTRUMENTS,
     ExperimentInputError,
     execute_pending,
@@ -19,6 +21,7 @@ from scripts.shadow_ab_experiment import (
     render_scorecard,
     save_state,
     strategy_cash,
+    strategy_cash_cny,
     strategy_quantity,
     update_latest_quotes,
 )
@@ -82,20 +85,38 @@ class ShadowAbExperimentTests(unittest.TestCase):
         )
 
         expected_symbols = tuple(item["symbol"] for item in INITIAL_INSTRUMENTS)
-        expected_nav = sum(
-            record["quantity"] * item["verified_close"]
-            for record, item in zip(portfolio["positions"], INITIAL_INSTRUMENTS)
+        expected_by_currency = {
+            "CNY": sum(
+                record["quantity"] * item["verified_close"]
+                for record, item in zip(portfolio["positions"], INITIAL_INSTRUMENTS)
+                if item["currency"] == "CNY"
+            ),
+            "HKD": sum(
+                record["quantity"] * item["verified_close"]
+                for record, item in zip(portfolio["positions"], INITIAL_INSTRUMENTS)
+                if item["currency"] == "HKD"
+            ),
+        }
+        expected_nav = (
+            expected_by_currency["CNY"]
+            + expected_by_currency["HKD"] * HKD_CNY_BASELINE_FX
         )
         self.assertEqual(initial_symbols(), expected_symbols)
         self.assertEqual(initial_symbols(state), expected_symbols)
         self.assertEqual(len(state["initial_positions"]), 14)
         self.assertAlmostEqual(state["initial_nav"], expected_nav)
+        self.assertEqual(state["initial_nav_by_currency"], expected_by_currency)
+        self.assertEqual(
+            state["valuation_assumption"]["hkd_cny"], HKD_CNY_BASELINE_FX
+        )
+        self.assertIs(state["valuation_assumption"]["locked"], True)
         self.assertEqual(
             state["buy_and_hold_baseline"]["positions"],
             state["strategy_shadow_portfolio"]["positions"],
         )
         self.assertEqual(strategy_cash(state, "CNY"), 0)
         self.assertEqual(strategy_cash(state, "HKD"), 0)
+        self.assertEqual(strategy_cash_cny(state), 0)
         self.assertIs(state["simulation_only"], True)
         self.assertIs(state["places_real_orders"], False)
         self.assertIs(state["broker_connected"], False)
@@ -113,6 +134,12 @@ class ShadowAbExperimentTests(unittest.TestCase):
                     Path(directory) / "missing.json",
                     portfolio,
                     datetime(2026, 9, 1, tzinfo=TZ),
+                )
+            with self.assertRaisesRegex(ExperimentInputError, "refusing reset"):
+                load_or_initialize(
+                    Path(directory) / "also-missing.json",
+                    portfolio,
+                    datetime(2026, 8, 9, tzinfo=TZ),
                 )
 
     def test_rejects_old_signal_then_executes_only_next_fresh_quote(self):
@@ -196,6 +223,198 @@ class ShadowAbExperimentTests(unittest.TestCase):
         attribution = state["daily_nav"][-1]["operation_attribution"][0]
         self.assertEqual(attribution["symbol"], "688333")
         self.assertEqual(attribution["interpretation"], "减仓后卖飞")
+
+    def test_v1_state_migrates_in_place_without_resetting_ledgers(self):
+        state = initialize_state(private_portfolio())
+        self.assertTrue(
+            record_daily_nav(state, "2026-08-10", close_quotes("2026-08-10"))
+        )
+        state["signal_ledger"] = [{"signal_id": "preserved-signal"}]
+        state["execution_ledger"] = [{"execution_id": "preserved-execution"}]
+        state["schema_version"] = 1
+        state["valuation_assumption"] = {
+            "mode": "mixed_local_currency_1_to_1"
+        }
+        state["initial_nav"] = sum(state["initial_nav_by_currency"].values())
+        state.pop("initial_nav_cny", None)
+        state.pop("initial_nav_mixed_local_currency_1_to_1", None)
+        state["config"].pop("purchasing_power_assumption", None)
+        state["config"].pop("share_unit_assumptions", None)
+        state["strategy_shadow_portfolio"].pop("cash_cny", None)
+        for item in state["daily_nav"]:
+            item["buy_and_hold_nav"] = sum(
+                item["buy_and_hold_nav_by_currency"].values()
+            )
+            item["strategy_nav"] = sum(item["strategy_nav_by_currency"].values())
+            item["valuation_mode"] = "mixed_local_currency_1_to_1"
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "legacy-state.json"
+            path.write_text(json.dumps(state), encoding="utf-8")
+            migrated = load_state(path)
+
+        self.assertEqual(migrated["schema_version"], 2)
+        self.assertEqual(migrated["signal_ledger"], [{"signal_id": "preserved-signal"}])
+        self.assertEqual(
+            migrated["execution_ledger"], [{"execution_id": "preserved-execution"}]
+        )
+        self.assertEqual(len(migrated["daily_nav"]), 1)
+        self.assertEqual(migrated["daily_nav"][0]["valuation_mode"], "fixed_baseline_fx_to_cny")
+        expected = (
+            migrated["initial_nav_by_currency"]["CNY"]
+            + migrated["initial_nav_by_currency"]["HKD"] * HKD_CNY_BASELINE_FX
+        )
+        self.assertAlmostEqual(migrated["initial_nav"], expected)
+        self.assertEqual(migrated["metrics"]["completed_trading_days"], 1)
+
+    def test_v1_migration_rejects_conflicting_locked_fx(self):
+        state = initialize_state(private_portfolio())
+        state["schema_version"] = 1
+        state["valuation_assumption"] = {
+            "mode": "fixed_baseline_fx_to_cny",
+            "baseline_date": "2026-08-07",
+            "hkd_cny": 0.9,
+            "locked": True,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "conflicting-state.json"
+            path.write_text(json.dumps(state), encoding="utf-8")
+            with self.assertRaisesRegex(ExperimentInputError, "conflicts"):
+                load_state(path)
+
+    def test_a_share_sale_can_fund_h_share_buy_with_unified_cny_cash(self):
+        state = initialize_state(private_portfolio())
+        record_signal(
+            state,
+            event_id="sell-a",
+            symbol="302132",
+            signal_time="2026-08-10T10:00:05+08:00",
+            quote_time="2026-08-10T10:00:00+08:00",
+            signal_price=50,
+            action="模拟清仓",
+            reason="test cross-market funding",
+        )
+        execute_pending(
+            state,
+            {"302132": quote("302132", 50, "2026-08-10T10:01:00+08:00")},
+            now=datetime(2026, 8, 10, 10, 1, 5, tzinfo=TZ),
+        )
+        cash_after_sale = strategy_cash_cny(state)
+        self.assertGreater(cash_after_sale, 0)
+
+        record_signal(
+            state,
+            event_id="buy-h",
+            symbol="HK00700",
+            signal_time="2026-08-10T10:02:05+08:00",
+            quote_time="2026-08-10T10:02:00+08:00",
+            signal_price=100,
+            action="模拟买入0.25成",
+            reason="test use A-sale CNY for H-share",
+        )
+        outcomes = execute_pending(
+            state,
+            {"HK00700": quote("HK00700", 100, "2026-08-10T10:03:00+08:00")},
+            now=datetime(2026, 8, 10, 10, 3, 5, tzinfo=TZ),
+        )
+        self.assertEqual(outcomes[0]["status"], "executed")
+        trade = state["trades"][-1]
+        self.assertEqual(trade["fx_to_cny"], HKD_CNY_BASELINE_FX)
+        self.assertAlmostEqual(
+            strategy_cash_cny(state),
+            cash_after_sale
+            - trade["gross_amount_cny"]
+            - trade["transaction_cost_cny"],
+        )
+        self.assertGreaterEqual(strategy_cash_cny(state), 0)
+
+    def test_h_share_sale_can_fund_a_share_buy_in_100_share_lots(self):
+        state = initialize_state(private_portfolio())
+        record_signal(
+            state,
+            event_id="sell-h",
+            symbol="HK06181",
+            signal_time="2026-08-10T10:00:05+08:00",
+            quote_time="2026-08-10T10:00:00+08:00",
+            signal_price=300,
+            action="模拟清仓",
+            reason="test cross-market funding",
+        )
+        execute_pending(
+            state,
+            {"HK06181": quote("HK06181", 300, "2026-08-10T10:01:00+08:00")},
+            now=datetime(2026, 8, 10, 10, 1, 5, tzinfo=TZ),
+        )
+        cash_after_sale = strategy_cash_cny(state)
+        expected_hkd_net = (
+            state["trades"][0]["gross_amount"]
+            - state["trades"][0]["transaction_cost"]
+        )
+        self.assertAlmostEqual(cash_after_sale, expected_hkd_net * HKD_CNY_BASELINE_FX)
+
+        record_signal(
+            state,
+            event_id="buy-a",
+            symbol="600000",
+            signal_time="2026-08-10T10:02:05+08:00",
+            quote_time="2026-08-10T10:02:00+08:00",
+            signal_price=10,
+            action="模拟买入0.25成",
+            reason="test use H-sale CNY for A-share",
+        )
+        outcomes = execute_pending(
+            state,
+            {"600000": quote("600000", 10, "2026-08-10T10:03:00+08:00")},
+            now=datetime(2026, 8, 10, 10, 3, 5, tzinfo=TZ),
+        )
+        self.assertEqual(outcomes[0]["status"], "executed")
+        self.assertEqual(int(state["trades"][-1]["quantity"]) % 100, 0)
+        self.assertGreaterEqual(strategy_cash_cny(state), 0)
+
+    def test_a_share_buy_below_100_shares_is_missed_and_clear_sells_tail(self):
+        state = initialize_state(private_portfolio())
+        strategy = state["strategy_shadow_portfolio"]
+        strategy["cash_cny"] = 100_000
+        strategy["cash_by_currency"] = {"CNY": 100_000, "HKD": 0.0}
+        record_signal(
+            state,
+            event_id="too-small-a-buy",
+            symbol="600001",
+            signal_time="2026-08-10T10:00:05+08:00",
+            quote_time="2026-08-10T10:00:00+08:00",
+            signal_price=1000,
+            action="模拟买入0.25成",
+            reason="below one A-share lot",
+        )
+        missed = execute_pending(
+            state,
+            {"600001": quote("600001", 1000, "2026-08-10T10:01:00+08:00")},
+            now=datetime(2026, 8, 10, 10, 1, 5, tzinfo=TZ),
+        )
+        self.assertEqual(missed[0]["status"], "execution_missed")
+        self.assertEqual(missed[0]["reason"], "notional_below_a_share_buy_lot")
+        self.assertEqual(strategy_cash_cny(state), 100_000)
+
+        strategy["positions"]["688333"]["quantity"] = 155
+        record_signal(
+            state,
+            event_id="clear-tail",
+            symbol="688333",
+            signal_time="2026-08-10T10:02:05+08:00",
+            quote_time="2026-08-10T10:02:00+08:00",
+            signal_price=100,
+            action="模拟清仓",
+            reason="sell the entire odd-lot tail",
+        )
+        cleared = execute_pending(
+            state,
+            {"688333": quote("688333", 100, "2026-08-10T10:03:00+08:00")},
+            now=datetime(2026, 8, 10, 10, 3, 5, tzinfo=TZ),
+        )
+        self.assertEqual(cleared[0]["status"], "executed")
+        self.assertEqual(cleared[0]["quantity"], 155)
+        self.assertEqual(strategy_quantity(state, "688333"), 0)
+        self.assertGreaterEqual(strategy_cash_cny(state), 0)
 
     def test_stale_quote_becomes_execution_missed_and_is_never_backfilled(self):
         state = initialize_state(private_portfolio())
@@ -307,12 +526,21 @@ class ShadowAbExperimentTests(unittest.TestCase):
         )
         latest = state["daily_nav"][-1]
         self.assertAlmostEqual(latest["buy_and_hold_nav"], latest["strategy_nav"])
+        self.assertAlmostEqual(
+            latest["buy_and_hold_nav"],
+            latest["buy_and_hold_nav_by_currency"]["CNY"]
+            + latest["buy_and_hold_nav_by_currency"]["HKD"]
+            * HKD_CNY_BASELINE_FX,
+        )
+        self.assertEqual(latest["valuation_mode"], "fixed_baseline_fx_to_cny")
         self.assertEqual(latest["existing_position_management"], 0)
         self.assertEqual(latest["new_candidate_selection"], 0)
         scorecard = render_scorecard(state)
         self.assertIn("实验第 60 / 60 个交易日", scorecard)
         self.assertIn("仅供模拟和人工复核", scorecard)
         self.assertIn("不会连接券商或自动下单", scorecard)
+        self.assertIn("万元人民币", scorecard)
+        self.assertIn("HK board lot not modeled", scorecard)
 
     def test_incomplete_close_does_not_count_as_hold_or_experiment_day(self):
         state = initialize_state(private_portfolio())

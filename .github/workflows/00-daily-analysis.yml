@@ -3,7 +3,7 @@ name: 每日股票分析
 on:
   # 定时触发（GitHub cron 使用 UTC）
   schedule:
-    - cron: '0 10 * * 1-5'     # 北京时间 18:00：收盘分析与模拟记账
+    - cron: '0 10 * * 1-5'     # 北京时间 18:00：分层收盘分析（暂保留 GitHub schedule）
   
   # 手动触发
   workflow_dispatch:
@@ -40,12 +40,14 @@ jobs:
     # 兼容误将 STOCK_LIST 配到同名 Environment variables 的场景；
     # 推荐位置仍是 Settings -> Secrets and variables -> Actions -> Repository variables。
     environment: STOCK_LIST
-    # 12 只股票分 A/H 两批执行，给免费行情源和模型调用留出余量。
+    # P0 PRIMARY 14只先按A/H批次完成；旁路观察层共享受限时间预算。
     timeout-minutes: ${{ fromJSON(vars.ANALYSIS_TIMEOUT_MINUTES || '90') }}
     
     steps:
       - name: 随机延迟（避免固定时间访问）
-        run: sleep $((RANDOM % 60))  # 随机延迟0-60秒启动
+        run: |
+          echo "JOB_BUDGET_STARTED_EPOCH=$(date +%s)" >> "$GITHUB_ENV"
+          sleep $((RANDOM % 60))  # 随机延迟0-60秒启动
       
       - name: 检出代码
         uses: actions/checkout@v5
@@ -64,7 +66,7 @@ jobs:
       
       - name: 创建必要目录
         run: |
-          mkdir -p data/paper_trade data/intraday logs reports
+          mkdir -p data/paper_trade data/daily_analysis data/intraday logs reports
 
       - name: 确定运行阶段
         shell: bash
@@ -84,7 +86,7 @@ jobs:
           echo "RUN_PHASE=$RUN_PHASE" >> "$GITHUB_ENV"
           echo "本轮阶段: $RUN_PHASE"
 
-      - name: 恢复收盘分析与模拟状态
+      - name: 恢复收盘数据库与旧模拟历史
         uses: actions/cache/restore@v4
         with:
           path: |
@@ -102,8 +104,8 @@ jobs:
           STATE_BRANCH: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          if [ -f data/stock_analysis.db ] && [ -f data/paper_trade/state.json ]; then
-            echo "✅ 已从 GitHub Actions 缓存恢复完整状态"
+          if [ -f data/stock_analysis.db ] && { [ "${RUN_PHASE:-full}" != "simulation-summary" ] || [ -f data/paper_trade/state.json ]; }; then
+            echo "✅ 已从 GitHub Actions 缓存恢复所需收盘状态"
             exit 0
           fi
 
@@ -174,8 +176,10 @@ jobs:
           PY
 
           test -f data/stock_analysis.db
-          test -f data/paper_trade/state.json
-          echo "✅ 已从最新未过期 artifact 恢复收盘数据库与20日模拟状态"
+          if [ "${RUN_PHASE:-full}" = "simulation-summary" ]; then
+            test -f data/paper_trade/state.json
+          fi
+          echo "✅ 已从最新未过期 artifact 恢复收盘数据库与旧模拟历史（如存在）"
 
       - name: 恢复盘中提醒去重状态
         if: env.RUN_PHASE == 'intraday-check'
@@ -524,6 +528,7 @@ jobs:
           SINGLE_STOCK_NOTIFY: ${{ vars.SINGLE_STOCK_NOTIFY || secrets.SINGLE_STOCK_NOTIFY || 'false' }}
           MARKET_REVIEW_ENABLED: ${{ vars.MARKET_REVIEW_ENABLED || secrets.MARKET_REVIEW_ENABLED || 'true' }}
           ANALYSIS_DELAY: ${{ vars.ANALYSIS_DELAY || secrets.ANALYSIS_DELAY || '0' }}
+          ANALYSIS_TIMEOUT_MINUTES: ${{ vars.ANALYSIS_TIMEOUT_MINUTES || '90' }}
           TRADING_DAY_CHECK_ENABLED: ${{ vars.TRADING_DAY_CHECK_ENABLED || secrets.TRADING_DAY_CHECK_ENABLED || 'true' }}
           DATABASE_PATH: ./data/stock_analysis.db
           SQLITE_WAL_ENABLED: 'false'
@@ -548,25 +553,31 @@ jobs:
           REALTIME_SOURCE_PRIORITY: ${{ vars.REALTIME_SOURCE_PRIORITY || 'tencent,akshare_sina,efinance,akshare_em' }}
           
         run: |
-          # 解析自选股配置：
-          # 1. Repository/Environment secrets 或 Repository variables（STOCK_LIST_CONFIG）
-          # 2. 同名 Environment variables 注入的 runner 环境变量（STOCK_LIST）
-          # 3. 最小默认值
-          if [ -n "${STOCK_LIST_CONFIG:-}" ]; then
-            export STOCK_LIST="$STOCK_LIST_CONFIG"
-          elif [ -z "${STOCK_LIST:-}" ]; then
-            export STOCK_LIST="600519"
-          fi
+          # 正式收盘分析使用公开、分层且跨层去重的股票池；旧 STOCK_LIST 仅保留
+          # 配置兼容性，不再自动决定用户端主报告，也不会抢占 PRIMARY 资源。
+          mapfile -t DAILY_ANALYSIS_POOLS < <(
+            python3 - <<'PY'
+          from scripts.account_watchlists import priority_analysis_pools
 
-          # 把误填的 HK.00981 / 00981.HK 等形式统一成数据层支持的 HK00981。
-          NORMALIZED_STOCK_LIST="$(python3 scripts/normalize_stock_list.py "$STOCK_LIST")"
-          if [ -z "$NORMALIZED_STOCK_LIST" ]; then
-            echo "❌ 自选股列表规范化后为空"
+          pools = priority_analysis_pools()
+          for priority in (
+              "P0_PRIMARY",
+              "P1_FAMILY",
+              "P2_ACCOUNT_HOLDINGS",
+              "P3_CANDIDATES",
+          ):
+              print(",".join(pools[priority]))
+          PY
+          )
+          if [ "${#DAILY_ANALYSIS_POOLS[@]}" -ne 4 ] || [ -z "${DAILY_ANALYSIS_POOLS[0]}" ]; then
+            echo "❌ 分层收盘股票池生成失败"
             exit 1
           fi
-          export STOCK_LIST="$NORMALIZED_STOCK_LIST"
-          CN_STOCKS="$(python3 scripts/normalize_stock_list.py "$STOCK_LIST" --market cn)"
-          HK_STOCKS="$(python3 scripts/normalize_stock_list.py "$STOCK_LIST" --market hk)"
+          PRIMARY_STOCKS="${DAILY_ANALYSIS_POOLS[0]}"
+          FAMILY_STOCKS="${DAILY_ANALYSIS_POOLS[1]}"
+          ACCOUNT_HOLDING_STOCKS="${DAILY_ANALYSIS_POOLS[2]}"
+          CANDIDATE_STOCKS="${DAILY_ANALYSIS_POOLS[3]}"
+          export STOCK_LIST="$PRIMARY_STOCKS"
 
           # 处理 LITELLM YAML 配置文件
           if [ -n "$LITELLM_CONFIG_YAML" ] && [ -n "$LITELLM_CONFIG" ]; then
@@ -586,7 +597,10 @@ jobs:
           echo "=========================================="
           echo "⏰ 时间: $(TZ='Asia/Shanghai' date '+%Y-%m-%d %H:%M:%S')"
           echo "🎯 运行模式: $MODE"
-          echo "📊 自选股: $STOCK_LIST"
+          echo "📊 P0 PRIMARY: $PRIMARY_STOCKS"
+          echo "👨 P1 父亲账户观察: $FAMILY_STOCKS"
+          echo "👥 P2 其他已持有账户: $ACCOUNT_HOLDING_STOCKS"
+          echo "🔎 P3 候选观察: $CANDIDATE_STOCKS"
           echo "📝 报告类型: $REPORT_TYPE"
           echo ""
           echo "=========================================="
@@ -683,7 +697,7 @@ jobs:
               --summary reports/paper_trade_20d.md
             python3 scripts/pushplus_notify.py \
               --file reports/paper_trade_20d.md \
-              --title "20个交易日模拟跟踪进度" \
+              --title "旧版标准化20日模拟实验（非真实持仓A/B）" \
               || echo "::warning::PushPlus 推送失败；模拟状态和报告仍会保留"
             exit 0
           fi
@@ -693,33 +707,10 @@ jobs:
             exit 0
           fi
 
-          # 收盘个股分析分成 A 股、港股两批。某一批失败时仍继续另一批，
-          # 最终由覆盖率校验决定本交易日是否能写入模拟台账。
+          # 收盘分析先完成 P0 PRIMARY，再处理其他旁路观察层。跨层 symbol 已在
+          # account_watchlists 中去重，因此同一股票每轮只调用一次分析链路。
           ANALYSIS_SINCE_UTC="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
           echo "🕐 本轮个股分析起点（UTC）: $ANALYSIS_SINCE_UTC"
-          ANALYSIS_STATUS=0
-          if [ -n "$CN_STOCKS" ]; then
-            echo "🇨🇳 A股批次: $CN_STOCKS"
-            python main.py --stocks "$CN_STOCKS" --no-market-review --no-notify $FORCE_RUN_ARG \
-              || ANALYSIS_STATUS=1
-            mkdir -p reports/cn
-            cp reports/*.md reports/cn/ 2>/dev/null || true
-          fi
-
-          if [ -n "$HK_STOCKS" ]; then
-            echo "🇭🇰 港股批次: $HK_STOCKS"
-            python main.py --stocks "$HK_STOCKS" --no-market-review --no-notify $FORCE_RUN_ARG \
-              || ANALYSIS_STATUS=1
-            mkdir -p reports/hk
-            cp reports/*.md reports/hk/ 2>/dev/null || true
-          fi
-
-          if [ "$MODE" = "full" ]; then
-            python main.py --market-review --no-notify $FORCE_RUN_ARG \
-              || echo "::warning::大盘复盘失败；不影响已完成的个股分析与模拟记账"
-            mkdir -p reports/market
-            cp reports/*.md reports/market/ 2>/dev/null || true
-          fi
 
           # 北京时间 18:00 后使用当天；18:00 前使用最近一个已经结束的工作日。
           # 节假日不在这里猜测，由下面的严格覆盖率检查自然拒绝无有效分析的日期。
@@ -737,44 +728,136 @@ jobs:
           print(trade_date.isoformat())
           PY
           )"
-          echo "📅 模拟记账交易日: $TRADE_DATE"
-          python3 scripts/export_paper_signals.py \
-            --db "$DATABASE_PATH" \
-            --stocks "$STOCK_LIST" \
-            --trade-date "$TRADE_DATE" \
-            --analysis-since "$ANALYSIS_SINCE_UTC" \
-            --min-coverage 1.0 \
-            --output data/paper_trade/daily_signals.json \
-            || ANALYSIS_STATUS=1
+          echo "📅 收盘分析交易日: $TRADE_DATE"
 
-          if [ "$ANALYSIS_STATUS" -eq 0 ]; then
-            python3 scripts/paper_trade_tracker.py \
-              --signals data/paper_trade/daily_signals.json \
-              --state data/paper_trade/state.json \
-              --summary reports/paper_trade_20d.md \
-              --target-days 20
-            python3 scripts/pushplus_notify.py \
-              --file reports/paper_trade_20d.md \
-              --title "收盘分析与20日模拟跟踪" \
-              || echo "::warning::PushPlus 推送失败；本交易日仍计入模拟，报告可从 artifact 下载"
-          else
-            echo "❌ 本轮未覆盖全部股票，不计入20个交易日模拟"
+          # 定时任务若延迟到次日凌晨，拒绝把前一交易日分析记到错误日期。
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            LOCAL_HOUR="$(TZ='Asia/Shanghai' date '+%H')"
+            if [ "$LOCAL_HOUR" -lt 18 ]; then
+              echo "❌ 定时收盘任务已跨越自然日，无法可靠确定 trade_date；本轮 fail closed"
+              exit 1
+            fi
+          fi
+
+          # 旁路观察层共享一个有限时间预算。预算耗尽时跳过低优先级层，不影响
+          # 已完成的 PRIMARY 分析、覆盖率和数据库。
+          OPTIONAL_ANALYSIS_DEADLINE=0
+          run_analysis_layer() {
+            local priority="$1"
+            local label="$2"
+            local stocks="$3"
+            local required="$4"
+            local market
+            local market_label
+            local batch
+            local remaining
+            local layer_status=0
+
+            if [ -z "$stocks" ]; then
+              echo "ℹ️ $priority $label 无待分析标的"
+              return 0
+            fi
+
+            for market in cn hk; do
+              batch="$(python3 scripts/normalize_stock_list.py "$stocks" --market "$market")"
+              [ -n "$batch" ] || continue
+              if [ "$market" = "cn" ]; then
+                market_label="A股"
+              else
+                market_label="港股"
+              fi
+              echo "📌 $priority $label / $market_label: $batch"
+
+              if [ "$required" = "true" ]; then
+                python main.py --stocks "$batch" --no-market-review --no-notify $FORCE_RUN_ARG \
+                  || layer_status=1
+              else
+                remaining=$((OPTIONAL_ANALYSIS_DEADLINE - $(date +%s)))
+                if [ "$remaining" -le 0 ]; then
+                  echo "::warning::$priority $label 因旁路分析时间预算耗尽而跳过；PRIMARY 不受影响"
+                  return 0
+                fi
+                timeout --signal=TERM "${remaining}s" \
+                  python main.py --stocks "$batch" --no-market-review --no-notify $FORCE_RUN_ARG \
+                  || layer_status=1
+              fi
+
+              mkdir -p "reports/${priority,,}/$market"
+              cp reports/*.md "reports/${priority,,}/$market/" 2>/dev/null || true
+            done
+
+            if [ "$layer_status" -ne 0 ]; then
+              if [ "$required" = "true" ]; then
+                echo "❌ $priority $label 分析未完整完成"
+                return 1
+              fi
+              echo "::warning::$priority $label 本轮未完整完成；不影响 PRIMARY"
+            fi
+            return 0
+          }
+
+          # P0 必须先完整分析，并用现有只读导出器做14只严格覆盖校验；
+          # 该文件仅用于覆盖审计，不会传给旧 paper_trade_tracker。
+          if ! run_analysis_layer "P0_PRIMARY" "本人主账户" "$PRIMARY_STOCKS" true; then
             exit 1
           fi
+          if ! python3 scripts/export_paper_signals.py \
+              --db "$DATABASE_PATH" \
+              --stocks "$PRIMARY_STOCKS" \
+              --trade-date "$TRADE_DATE" \
+              --analysis-since "$ANALYSIS_SINCE_UTC" \
+              --min-coverage 1.0 \
+              --output data/daily_analysis/primary_coverage.json; then
+            echo "❌ PRIMARY 14只未达到100%收盘覆盖率；停止旁路分析"
+            exit 1
+          fi
+
+          if [ "$MODE" = "full" ]; then
+            python main.py --market-review --no-notify $FORCE_RUN_ARG \
+              || echo "::warning::大盘复盘失败；不影响已完成的 PRIMARY 分析"
+            mkdir -p reports/market
+            cp reports/*.md reports/market/ 2>/dev/null || true
+          fi
+
+          # P1-P3 只复用分析数据库和公开 symbol；不进入 PRIMARY A/B 记账。
+          # 总预算24分钟，低优先级失败或超时只降级，不污染 PRIMARY coverage。
+          # 除24分钟旁路上限外，再按整个job的timeout预留至少8分钟用于
+          # PRIMARY数据库/旧历史打包与上传，避免可选分析拖垮已完成的P0。
+          OPTIONAL_SAFETY_MARGIN_SECONDS=$((8 * 60))
+          if ! [[ "$ANALYSIS_TIMEOUT_MINUTES" =~ ^[0-9]+$ ]]; then
+            ANALYSIS_TIMEOUT_MINUTES=90
+          fi
+          JOB_PERSIST_DEADLINE=$((
+            JOB_BUDGET_STARTED_EPOCH
+            + ANALYSIS_TIMEOUT_MINUTES * 60
+            - OPTIONAL_SAFETY_MARGIN_SECONDS
+          ))
+          OPTIONAL_ANALYSIS_DEADLINE=$(( $(date +%s) + 24 * 60 ))
+          if [ "$OPTIONAL_ANALYSIS_DEADLINE" -gt "$JOB_PERSIST_DEADLINE" ]; then
+            OPTIONAL_ANALYSIS_DEADLINE="$JOB_PERSIST_DEADLINE"
+          fi
+          run_analysis_layer "P1_FAMILY" "父亲账户观察" "$FAMILY_STOCKS" false
+          run_analysis_layer "P2_ACCOUNT_HOLDINGS" "第二/妹妹账户持仓观察" "$ACCOUNT_HOLDING_STOCKS" false
+          run_analysis_layer "P3_CANDIDATES" "候选观察" "$CANDIDATE_STOCKS" false
       
-      - name: 打包收盘分析与模拟状态
+      - name: 打包收盘分析与旧模拟历史
+        id: package_close_state
         if: success() && (env.RUN_PHASE == 'full' || env.RUN_PHASE == 'stocks-only')
         shell: bash
         run: |
           set -euo pipefail
           test -f data/stock_analysis.db
-          test -f data/paper_trade/state.json
-          tar -czf paper-close-state.tar.gz \
-            data/stock_analysis.db \
-            data/paper_trade
+          # 不用缺少旧 state 的新 artifact 覆盖仍可恢复的历史备份。
+          if [ ! -f data/paper_trade/state.json ]; then
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::本轮未恢复旧 paper state；跳过固定名历史备份，日常分析仍成功"
+            exit 0
+          fi
+          tar -czf paper-close-state.tar.gz data/stock_analysis.db data/paper_trade
+          echo "available=true" >> "$GITHUB_OUTPUT"
 
       - name: 上传固定名收盘状态备份
-        if: success() && (env.RUN_PHASE == 'full' || env.RUN_PHASE == 'stocks-only')
+        if: success() && steps.package_close_state.outputs.available == 'true'
         uses: actions/upload-artifact@v6
         with:
           name: paper-close-state
@@ -783,7 +866,7 @@ jobs:
           retention-days: 90
           compression-level: 0
 
-      - name: 保存收盘分析与模拟状态
+      - name: 保存收盘数据库与旧模拟历史
         if: success() && env.RUN_PHASE != 'intraday-check'
         uses: actions/cache/save@v4
         with:
@@ -807,7 +890,7 @@ jobs:
           path: |
             reports/
             logs/
-            data/paper_trade/daily_signals.json
+            data/daily_analysis/primary_coverage.json
             data/stock_analysis.db
           if-no-files-found: warn
           retention-days: 90
@@ -827,7 +910,7 @@ jobs:
           fi
           if [ -f "reports/paper_trade_20d.md" ]; then
             echo ""
-            echo "📈 20日模拟进度:"
+            echo "📈 旧版标准化20日模拟实验（非真实持仓A/B）:"
             sed -n '1,24p' reports/paper_trade_20d.md
           fi
           echo ""
