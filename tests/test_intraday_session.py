@@ -3,7 +3,7 @@ import os
 import sqlite3
 import tempfile
 import unittest
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -21,6 +21,7 @@ from scripts.intraday_session import (
     enqueue_cash_available_candidate_rechecks,
     flush_outbox,
     load_candidate_plans,
+    load_fixed_watch_candidate_plans,
     load_reference_levels_batch,
     load_state_v2,
     parse_tencent_batch,
@@ -136,6 +137,63 @@ def synthetic_shadow_state():
     )
 
 
+def write_fixed_candidate_signal(path, now, **overrides):
+    values = {
+        "id": 1,
+        "stock_code": "002759",
+        "stock_name": "ST天际",
+        "source_type": "analysis",
+        "source_report_id": 42,
+        "action": "buy",
+        "confidence": 1.0,
+        "entry_low": 9.8,
+        "entry_high": 10.2,
+        "stop_loss": 9.0,
+        "target_price": 12.0,
+        "data_quality_summary_json": json.dumps({"level": "high"}),
+        "plan_quality": "complete",
+        "status": "active",
+        "created_at": (now - timedelta(hours=12))
+        .astimezone(timezone.utc)
+        .strftime("%Y-%m-%d %H:%M:%S"),
+        "expires_at": (now + timedelta(days=1))
+        .astimezone(timezone.utc)
+        .strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    values.update(overrides)
+    connection = sqlite3.connect(path)
+    connection.execute(
+        """
+        CREATE TABLE decision_signals (
+            id INTEGER PRIMARY KEY,
+            stock_code TEXT,
+            stock_name TEXT,
+            source_type TEXT,
+            source_report_id INTEGER,
+            action TEXT,
+            confidence REAL,
+            entry_low REAL,
+            entry_high REAL,
+            stop_loss REAL,
+            target_price REAL,
+            data_quality_summary_json TEXT,
+            plan_quality TEXT,
+            status TEXT,
+            expires_at TEXT,
+            created_at TEXT
+        )
+        """
+    )
+    columns = tuple(values)
+    connection.execute(
+        f"INSERT INTO decision_signals ({','.join(columns)}) "
+        f"VALUES ({','.join('?' for _ in columns)})",
+        tuple(values[column] for column in columns),
+    )
+    connection.commit()
+    connection.close()
+
+
 class AccountWatchLayerTests(unittest.TestCase):
     def test_priority_pools_are_canonical_and_cross_tier_deduplicated(self):
         pools = priority_analysis_pools()
@@ -146,6 +204,218 @@ class AccountWatchLayerTests(unittest.TestCase):
         self.assertIn("563230", pools["P2_ACCOUNT_HOLDINGS"])
         self.assertEqual(pools["P3_CANDIDATES"], ("002759",))
         self.assertNotIn("HK01347", pools["P2_ACCOUNT_HOLDINGS"])
+
+    def test_fixed_secondary_candidate_reuses_fresh_p3_plan_without_primary_signal(self):
+        now = datetime(2026, 8, 10, 10, 0, tzinfo=TZ)
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            database_path = Path(temporary_directory) / "analysis.db"
+            write_fixed_candidate_signal(database_path, now, stock_code="SZ002759")
+            plans = load_fixed_watch_candidate_plans(database_path, now=now)
+
+        self.assertEqual(len(plans), 1)
+        self.assertEqual(plans[0]["symbol"], "002759")
+        self.assertEqual(plans[0]["position_state"], "flat")
+        state = intraday_session_module._empty_state(now)
+        shadow = synthetic_shadow_state()
+
+        def forbidden_recorder(*_args, **_kwargs):
+            raise AssertionError("fixed watch candidate reached PRIMARY recorder")
+
+        result = run_cycle(
+            symbols=["300408", "002759"],
+            primary_symbols=["300408"],
+            state=state,
+            levels={},
+            fetcher=FakeFetcher(
+                [
+                    {
+                        "300408": quote("300408", 40, 0.1, now),
+                        "002759": quote("002759", 10, 0.2, now),
+                    }
+                ]
+            ),
+            now=now,
+            candidate_plans=plans,
+            shadow_state=shadow,
+            shadow_signal_recorder=forbidden_recorder,
+            notification_sender=lambda **_: False,
+        )
+
+        self.assertEqual(result.coverage, 1.0)
+        self.assertEqual(shadow["signal_ledger"], [])
+        self.assertEqual(shadow["execution_ledger"], [])
+        self.assertEqual(len(state["outbox"]), 1)
+        payload = state["outbox"][0]["payload"]
+        self.assertEqual(payload["account_layer"], "SECONDARY_ACCOUNT_WATCH")
+        self.assertEqual(payload["action"], "继续观察")
+        self.assertEqual(payload["conclusion"], "候选观察，进入计划买入区")
+
+    def test_fixed_candidate_plan_loader_fails_closed_without_entry_zone(self):
+        now = datetime(2026, 8, 10, 10, 0, tzinfo=TZ)
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            database_path = Path(temporary_directory) / "analysis.db"
+            write_fixed_candidate_signal(database_path, now, entry_high=None)
+            plans = load_fixed_watch_candidate_plans(database_path, now=now)
+        self.assertEqual(plans, [])
+
+    def test_fixed_candidate_plan_loader_rejects_expired_or_old_plan(self):
+        now = datetime(2026, 8, 10, 10, 0, tzinfo=TZ)
+        cases = {
+            "expired": {
+                "expires_at": (now - timedelta(minutes=1))
+                .astimezone(timezone.utc)
+                .strftime("%Y-%m-%d %H:%M:%S")
+            },
+            "old": {
+                "created_at": (now - timedelta(days=8))
+                .astimezone(timezone.utc)
+                .strftime("%Y-%m-%d %H:%M:%S")
+            },
+        }
+        for label, overrides in cases.items():
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as temporary_directory:
+                database_path = Path(temporary_directory) / "analysis.db"
+                write_fixed_candidate_signal(database_path, now, **overrides)
+                self.assertEqual(
+                    load_fixed_watch_candidate_plans(database_path, now=now),
+                    [],
+                )
+
+    def test_fixed_candidate_requires_good_data_and_fresh_quote(self):
+        now = datetime(2026, 8, 10, 10, 0, tzinfo=TZ)
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            database_path = Path(temporary_directory) / "analysis.db"
+            write_fixed_candidate_signal(
+                database_path,
+                now,
+                data_quality_summary_json=json.dumps({"level": "limited"}),
+            )
+            degraded_plan = load_fixed_watch_candidate_plans(database_path, now=now)
+        self.assertEqual(len(degraded_plan), 1)
+        state = intraday_session_module._empty_state(now)
+        self.assertEqual(
+            enqueue_adaptive_plan_reviews(
+                state,
+                now=now,
+                quotes=[quote("002759", 10, 0.2, now)],
+                candidates=degraded_plan,
+            ),
+            0,
+        )
+
+        fresh_plan = dict(degraded_plan[0])
+        fresh_plan["data_quality"] = "high"
+        self.assertEqual(
+            enqueue_adaptive_plan_reviews(
+                state,
+                now=now,
+                quotes=[quote("002759", 10, 0.2, now, stale=True)],
+                candidates=[fresh_plan],
+            ),
+            0,
+        )
+
+    def test_fixed_candidate_same_plan_pushes_once_until_zone_reentry(self):
+        now = datetime(2026, 8, 10, 10, 0, tzinfo=TZ)
+        plan = {
+            "scope": "watchlist",
+            "symbol": "002759",
+            "name": "ST天际",
+            "position_state": "flat",
+            "expected_holding_days": 20,
+            "confidence": 0.8,
+            "data_quality": "high",
+            "market_costs": {
+                "entry_fee_bps": 10,
+                "exit_fee_bps": 10,
+                "entry_slippage_bps": 5,
+                "exit_slippage_bps": 5,
+            },
+            "plan": {
+                "entry_low": 9.8,
+                "entry_high": 10.2,
+                "plan_price": 10,
+                "stop_loss": 9,
+                "target_price": 12,
+            },
+        }
+        state = intraday_session_module._empty_state(now)
+
+        def cycle(price, checked_at):
+            ledger_start = len(state.get("event_ledger", []))
+            raw_created = enqueue_adaptive_plan_reviews(
+                state,
+                now=checked_at,
+                quotes=[quote("002759", price, 0.2, checked_at)],
+                candidates=[plan],
+            )
+            raw_events = state.get("event_ledger", [])[ledger_start:]
+            watch_created = process_watch_account_decisions(
+                state,
+                now=checked_at,
+                raw_events=raw_events,
+                levels={},
+            )
+            return raw_created, watch_created
+
+        self.assertEqual(cycle(10, now), (1, 1))
+        self.assertEqual(
+            flush_outbox(state, now=now, sender=lambda **_: True),
+            1,
+        )
+        self.assertEqual(cycle(10, now + timedelta(minutes=1)), (0, 0))
+        self.assertEqual(
+            enqueue_adaptive_plan_reviews(
+                state,
+                now=now + timedelta(minutes=2),
+                quotes=[
+                    quote(
+                        "002759",
+                        10,
+                        0.2,
+                        now + timedelta(minutes=2),
+                        stale=True,
+                    )
+                ],
+                candidates=[plan],
+            ),
+            0,
+        )
+        self.assertEqual(cycle(10, now + timedelta(minutes=3)), (1, 0))
+        clear_removed_adaptive_plan_reviews(
+            state,
+            now=now + timedelta(minutes=4),
+            candidates=[],
+        )
+        watch_state = state["watch_decision_notifications"][
+            "SECONDARY_ACCOUNT_WATCH"
+        ]["002759"]["adaptive_entry_review"]
+        self.assertEqual(watch_state["status"], "active")
+        self.assertEqual(cycle(10, now + timedelta(minutes=5)), (1, 0))
+        self.assertEqual(cycle(10.5, now + timedelta(minutes=6)), (0, 0))
+        watch_state = state["watch_decision_notifications"][
+            "SECONDARY_ACCOUNT_WATCH"
+        ]["002759"]["adaptive_entry_review"]
+        self.assertEqual(watch_state["status"], "cleared")
+        self.assertEqual(cycle(10, now + timedelta(minutes=7)), (1, 1))
+
+        state = intraday_session_module._empty_state(now)
+        self.assertEqual(cycle(10, now), (1, 1))
+        self.assertEqual(
+            flush_outbox(state, now=now, sender=lambda **_: False),
+            0,
+        )
+        clear_removed_adaptive_plan_reviews(
+            state,
+            now=now + timedelta(minutes=1),
+            candidates=[],
+        )
+        failed_state = state["watch_decision_notifications"][
+            "SECONDARY_ACCOUNT_WATCH"
+        ]["002759"]["adaptive_entry_review"]
+        self.assertEqual(failed_state["status"], "cleared")
+        self.assertEqual(state["outbox"], [])
+        self.assertEqual(cycle(10, now + timedelta(minutes=2)), (1, 1))
 
     def test_private_watch_config_accepts_only_runtime_held_positions(self):
         parsed = load_private_watch_config(
@@ -441,6 +711,34 @@ class AccountWatchLayerTests(unittest.TestCase):
             ),
             0,
         )
+        for condition in ("target_reached", "adaptive_risk_review"):
+            with self.subTest(condition=condition):
+                isolated_state = intraday_session_module._empty_state(now)
+                candidate_sell_event = {
+                    **stop_event,
+                    "event_id": f"candidate-{condition}",
+                    "condition": condition,
+                    "payload": {
+                        **stop_event["payload"],
+                        "stop_loss": 8.5,
+                        "target_price": 10.5,
+                    },
+                }
+                self.assertEqual(
+                    process_watch_account_decisions(
+                        isolated_state,
+                        now=now,
+                        raw_events=[candidate_sell_event],
+                        levels={
+                            "002759": ReferenceLevels(
+                                stop_loss=8.5,
+                                target_price=10.5,
+                            )
+                        },
+                    ),
+                    0,
+                )
+                self.assertEqual(isolated_state["outbox"], [])
         entry_event = {
             **stop_event,
             "event_id": "candidate-entry",

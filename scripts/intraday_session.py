@@ -63,6 +63,7 @@ from scripts.level2_adapter import (  # noqa: E402
 from scripts.normalize_stock_list import canonical_symbol, normalize_stock_list  # noqa: E402
 from scripts.shadow_ab_experiment import (  # noqa: E402
     BASELINE_DATE as SHADOW_BASELINE_DATE,
+    DEFAULT_COSTS as SHADOW_DEFAULT_COSTS,
     ExperimentInputError as ShadowExperimentError,
     execute_pending as execute_shadow_pending,
     initial_symbols as shadow_initial_symbols,
@@ -1153,6 +1154,151 @@ def load_candidate_plans(
     return normalised
 
 
+def _decision_signal_data_quality(raw_value: Any) -> Any:
+    """Return the conservative quality value consumed by the adaptive gate."""
+
+    if raw_value in (None, ""):
+        return None
+    try:
+        value = json.loads(raw_value) if isinstance(raw_value, str) else raw_value
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    if isinstance(value, Mapping):
+        level = str(value.get("level") or "").strip().lower()
+        if level:
+            return level
+        score = _finite_float(value.get("overall_score", value.get("score")))
+        if score is None:
+            return None
+        return score / 100.0 if score > 1 else score
+    return value
+
+
+def load_fixed_watch_candidate_plans(
+    database_path: Path,
+    *,
+    now: Optional[datetime] = None,
+    max_signal_age_days: int = DEFAULT_REFERENCE_SIGNAL_MAX_AGE_DAYS,
+) -> List[Dict[str, Any]]:
+    """Load only fixed SECONDARY candidates from reliable close-analysis plans.
+
+    The database is queried once per configured fixed candidate, never scanned.
+    Returned plans still pass through ``enqueue_adaptive_plan_reviews`` and the
+    existing after-cost adaptive policy before any watch-only event is created.
+    """
+
+    if not database_path.exists():
+        return []
+    fixed_symbols = [
+        symbol
+        for symbol, symbol_contexts in watch_contexts_by_symbol().items()
+        if any(
+            str(context.get("layer") or "") == "SECONDARY_ACCOUNT_WATCH"
+            and str(context.get("status") or "") == "candidate"
+            for context in symbol_contexts
+        )
+    ]
+    if not fixed_symbols:
+        return []
+    try:
+        connection = sqlite3.connect(f"file:{database_path}?mode=ro", uri=True)
+        connection.row_factory = sqlite3.Row
+    except sqlite3.Error:
+        return []
+    current = now or datetime.now(SHANGHAI_TZ)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=SHANGHAI_TZ)
+    current_utc = current.astimezone(timezone.utc)
+    cutoff_utc = current_utc - timedelta(days=max(0, max_signal_age_days))
+    current_text = current_utc.strftime("%Y-%m-%d %H:%M:%S")
+    cutoff_text = cutoff_utc.strftime("%Y-%m-%d %H:%M:%S")
+    plans: List[Dict[str, Any]] = []
+    try:
+        for symbol in fixed_symbols:
+            aliases = [symbol.upper()]
+            if symbol.isdigit() and len(symbol) == 6:
+                exchange = _a_share_exchange(symbol).upper()
+                aliases.extend(
+                    (
+                        f"{exchange}{symbol}",
+                        f"{exchange}.{symbol}",
+                        f"{symbol}.{exchange}",
+                    )
+                )
+            aliases = list(dict.fromkeys(aliases))
+            placeholders = ",".join("?" for _ in aliases)
+            try:
+                row = connection.execute(
+                    f"""
+                    SELECT stock_name, confidence, entry_low, entry_high,
+                           stop_loss, target_price, data_quality_summary_json
+                    FROM decision_signals
+                    WHERE UPPER(stock_code) IN ({placeholders})
+                      AND source_type = 'analysis'
+                      AND source_report_id IS NOT NULL
+                      AND status = 'active'
+                      AND plan_quality = 'complete'
+                      AND action IN ('buy', 'add', 'hold', 'watch')
+                      AND created_at IS NOT NULL
+                      AND datetime(created_at) <= datetime(?)
+                      AND datetime(created_at) >= datetime(?)
+                      AND expires_at IS NOT NULL
+                      AND datetime(expires_at) > datetime(?)
+                    ORDER BY datetime(created_at) DESC, id DESC
+                    LIMIT 1
+                    """,
+                    (*aliases, current_text, cutoff_text, current_text),
+                ).fetchone()
+            except sqlite3.Error:
+                continue
+            if row is None:
+                continue
+            entry_low, entry_high, stop_loss, target_price = (
+                _positive_float(row[field])
+                for field in ("entry_low", "entry_high", "stop_loss", "target_price")
+            )
+            confidence = _finite_float(row["confidence"])
+            data_quality = _decision_signal_data_quality(
+                row["data_quality_summary_json"]
+            )
+            if (
+                any(
+                    value is None
+                    for value in (entry_low, entry_high, stop_loss, target_price)
+                )
+                or entry_low > entry_high
+                or confidence is None
+                or data_quality in (None, "")
+            ):
+                continue
+            plan_price = (entry_low + entry_high) / 2.0
+            if not stop_loss < plan_price < target_price:
+                continue
+            plans.append(
+                {
+                    "scope": "watchlist",
+                    "symbol": symbol,
+                    "name": str(row["stock_name"] or ""),
+                    "position_state": "flat",
+                    "expected_holding_days": DEFAULT_EXPECTED_HOLDING_DAYS,
+                    "confidence": confidence,
+                    "data_quality": data_quality,
+                    "market_costs": dict(SHADOW_DEFAULT_COSTS),
+                    "plan": {
+                        "entry_low": entry_low,
+                        "entry_high": entry_high,
+                        "plan_price": plan_price,
+                        "stop_loss": stop_loss,
+                        "target_price": target_price,
+                    },
+                    "source": "p3_close_analysis",
+                }
+            )
+    finally:
+        connection.close()
+    return plans
+
+
 def _candidate_plan_payload(
     candidate: Mapping[str, Any],
     quote: RealtimeQuote,
@@ -1278,6 +1424,48 @@ def _clear_adaptive_entry_review(
     )
 
 
+def _clear_watch_entry_notification(
+    state: MutableMapping[str, Any],
+    *,
+    symbol: str,
+    now: datetime,
+    reason: str,
+    only_if_unnotified: bool = False,
+) -> None:
+    """Re-arm a watch Push only after a true zone exit or plan removal."""
+
+    watch_notifications = state.get("watch_decision_notifications")
+    if isinstance(watch_notifications, MutableMapping):
+        for layer_state in watch_notifications.values():
+            if not isinstance(layer_state, MutableMapping):
+                continue
+            symbol_state = layer_state.get(symbol)
+            if not isinstance(symbol_state, MutableMapping):
+                continue
+            watch_entry = symbol_state.get("adaptive_entry_review")
+            if (
+                isinstance(watch_entry, MutableMapping)
+                and watch_entry.get("status") == "active"
+                and (
+                    not only_if_unnotified
+                    or not watch_entry.get("notified_at")
+                )
+            ):
+                watch_entry["status"] = "cleared"
+                watch_entry["cleared_at"] = _iso(now)
+    _cancel_outbox_events(
+        state,
+        now=now,
+        predicate=lambda event: (
+            event.get("symbol") == symbol
+            and str(event.get("condition") or "").endswith(
+                ":adaptive_entry_review"
+            )
+        ),
+        reason=reason,
+    )
+
+
 def enqueue_adaptive_plan_reviews(
     state: MutableMapping[str, Any],
     *,
@@ -1384,16 +1572,16 @@ def enqueue_adaptive_plan_reviews(
         )
         if position_state == "flat" and not in_entry_zone:
             if entry_state.get("status") == "active":
-                entry_state["status"] = "cleared"
-                entry_state["cleared_at"] = _iso(now)
-                reviews["adaptive_entry_review"] = entry_state
-                _cancel_outbox_events(
+                _clear_adaptive_entry_review(
                     state,
+                    symbol=symbol,
                     now=now,
-                    predicate=lambda event, current_symbol=symbol: (
-                        event.get("symbol") == current_symbol
-                        and event.get("condition") == "adaptive_entry_review"
-                    ),
+                    reason="candidate_left_entry_zone_before_delivery",
+                )
+                _clear_watch_entry_notification(
+                    state,
+                    symbol=symbol,
+                    now=now,
                     reason="candidate_left_entry_zone_before_delivery",
                 )
             continue
@@ -1568,6 +1756,23 @@ def clear_removed_adaptive_plan_reviews(
                     and str(event.get("condition") or "").startswith("adaptive_")
                 ),
                 reason="candidate_removed_or_scan_became_untrusted",
+            )
+        if "adaptive_entry_review" in reviews:
+            _clear_adaptive_entry_review(
+                state,
+                symbol=symbol,
+                now=now,
+                reason="candidate_removed_or_scan_became_untrusted",
+            )
+            # A temporarily missing producer/DB is not evidence that price
+            # left the entry zone.  Preserve a delivered fingerprint, but
+            # re-arm a watch event that never reached the user.
+            _clear_watch_entry_notification(
+                state,
+                symbol=symbol,
+                now=now,
+                reason="candidate_removed_or_scan_became_untrusted",
+                only_if_unnotified=True,
             )
     return cleared
 
@@ -2261,6 +2466,7 @@ def process_watch_account_decisions(
                 "status": "cleared" if transition == "cleared" else "active",
                 "fingerprint": fingerprint,
                 "decision_event_id": decision_event["event_id"],
+                "notified_at": None,
                 "updated_at": _iso(now),
             }
         )
@@ -2440,6 +2646,22 @@ def flush_outbox(
             condition_state["last_notified_at"] = _iso(now)
             condition_state["last_notified_price"] = event.get("price")
             condition_state["last_event_id"] = event.get("event_id")
+        payload = event.get("payload") or {}
+        account_layer = str(payload.get("account_layer") or "")
+        event_condition = str(event.get("condition") or "")
+        if account_layer and event_condition.startswith(f"watch:{account_layer}:"):
+            watch_condition = event_condition.rsplit(":", 1)[-1]
+            watch_state = (
+                state.get("watch_decision_notifications", {})
+                .get(account_layer, {})
+                .get(str(event.get("symbol") or ""), {})
+                .get(watch_condition)
+            )
+            if (
+                isinstance(watch_state, MutableMapping)
+                and watch_state.get("decision_event_id") == event.get("event_id")
+            ):
+                watch_state["notified_at"] = _iso(now)
         if event.get("condition") == "data_quality":
             provider = state.setdefault("provider", {})
             if event.get("transition") == "degraded":
@@ -3275,7 +3497,35 @@ def run_session(
             report_path=report_path,
         )
 
-    candidate_plans = load_candidate_plans(candidate_plans_path, now=started)
+    scanner_candidate_plans = load_candidate_plans(candidate_plans_path, now=started)
+    fixed_watch_candidate_plans = load_fixed_watch_candidate_plans(
+        database_path,
+        now=started,
+    )
+    candidate_plans = list(scanner_candidate_plans)
+    candidate_symbols = set()
+    for candidate in candidate_plans:
+        try:
+            candidate_symbols.add(
+                canonical_symbol(
+                    str(candidate.get("symbol") or candidate.get("code") or "")
+                )
+            )
+        except Exception:
+            continue
+    for candidate in fixed_watch_candidate_plans:
+        try:
+            symbol = canonical_symbol(
+                str(candidate.get("symbol") or candidate.get("code") or "")
+            )
+        except Exception:
+            continue
+        # Preserve the existing trusted market-scan plan when both sources
+        # contain the same symbol; P3 is a fixed-candidate fallback only.
+        if symbol in candidate_symbols:
+            continue
+        candidate_plans.append(candidate)
+        candidate_symbols.add(symbol)
     extra_candidates: List[str] = []
     for candidate in candidate_plans:
         try:
@@ -3347,6 +3597,8 @@ def run_session(
     provider["candidate_plan_monitoring"] = {
         "path": str(candidate_plans_path) if candidate_plans_path else "",
         "plan_count": len(candidate_plans),
+        "trusted_scan_plan_count": len(scanner_candidate_plans),
+        "fixed_watch_plan_count": len(fixed_watch_candidate_plans),
         "extra_symbols": extra_candidates,
         "extra_symbol_limit": MAX_EXTRA_CANDIDATE_SYMBOLS,
     }
