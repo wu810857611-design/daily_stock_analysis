@@ -51,6 +51,7 @@ from scripts.shadow_ab_experiment import (
     record_signal as record_shadow_signal,
     save_state as save_shadow_state,
 )
+from scripts.check_intraday_integrations import verify_state
 
 
 TZ = ZoneInfo("Asia/Shanghai")
@@ -931,6 +932,44 @@ class TencentBatchTests(unittest.TestCase):
         self.assertEqual(result["HK06181"].name, "老铺黄金")
         self.assertFalse(result["HK06181"].is_stale)
         self.assertEqual(fetcher.last_diagnostics["hk_fresh_upgraded"], 1)
+        self.assertEqual(fetcher.last_diagnostics["hk_provider_timestamped"], 1)
+        self.assertFalse(fetcher.last_diagnostics["hk_degraded"])
+        self.assertEqual(fetcher.last_diagnostics["hk_degradation_reasons"], {})
+
+    def test_market_aware_fetcher_reports_missing_provider_timestamp(self):
+        now = datetime(2026, 8, 11, 14, 45, tzinfo=TZ)
+        delayed_hk = RealtimeQuote(
+            symbol="HK06181",
+            price=383.8,
+            provider_timestamp=(now - timedelta(minutes=15)).isoformat(),
+            is_stale=True,
+            source="tencent_batch",
+        )
+        missing_timestamp = RealtimeQuote(
+            symbol="HK06181",
+            price=365.4,
+            provider_timestamp=None,
+            fetched_at=now.isoformat(),
+            is_stale=True,
+            source="longbridge_batch",
+        )
+        fetcher = DecisionQuoteFetcher(
+            tencent_fetcher=FakeFetcher([{"HK06181": delayed_hk}]),
+            longbridge_fetcher=FakeLongbridgeFetcher(
+                [{"HK06181": missing_timestamp}]
+            ),
+        )
+
+        result = fetcher.fetch(["HK06181"], now=now)
+
+        self.assertIs(result["HK06181"], delayed_hk)
+        self.assertEqual(fetcher.last_diagnostics["hk_fresh_upgraded"], 0)
+        self.assertEqual(fetcher.last_diagnostics["hk_provider_timestamped"], 0)
+        self.assertTrue(fetcher.last_diagnostics["hk_degraded"])
+        self.assertEqual(
+            fetcher.last_diagnostics["hk_degradation_reasons"],
+            {"longbridge_provider_timestamp_missing": 1},
+        )
 
     def test_mixed_a_h_batch_uses_one_request_and_enforces_freshness(self):
         now = datetime(2026, 7, 28, 10, 30, 30, tzinfo=TZ)
@@ -1918,6 +1957,142 @@ class StateMachineTests(unittest.TestCase):
         self.assertFalse(
             any("卖出" in item["message"] for item in state["event_ledger"])
         )
+
+
+class PushOutcomeTests(unittest.TestCase):
+    @staticmethod
+    def _decision_event(now, *, action_code):
+        return {
+            "event_id": f"event-{action_code}",
+            "created_at": now.isoformat(),
+            "symbol": "603083",
+            "name": "剑桥科技",
+            "condition": "watch:SISTER_MANAGED_WATCH:target_reached",
+            "transition": "watch_human_review",
+            "severity": "warning",
+            "price": 159.56,
+            "change_pct": 4.73,
+            "reference_price": 159.44,
+            "message": "测试决策",
+            "decision_result": "push_watch_account_decision",
+            "attempts": 0,
+            "next_attempt_at": now.isoformat(),
+            "payload": {
+                "kind": "trade_decision",
+                "action": "不操作" if action_code == "hold" else "建议卖出持仓1/4",
+                "action_code": action_code,
+                "account_layer": "SISTER_MANAGED_WATCH",
+                "account_prefix": "【妹妹账户】",
+            },
+        }
+
+    def test_hold_decision_is_audited_but_not_sent(self):
+        now = datetime(2026, 8, 12, 14, 0, tzinfo=TZ)
+        event = self._decision_event(now, action_code="hold")
+        state = intraday_session_module._empty_state(now)
+        state["outbox"] = [event]
+        state["event_ledger"] = [event]
+        calls = []
+        with patch.dict(os.environ, {"PUSHPLUS_TOKEN": "configured"}, clear=False):
+            intraday_session_module._initialize_pushplus_session(state, now=now)
+            notified = flush_outbox(
+                state,
+                now=now,
+                sender=lambda **payload: calls.append(payload) or True,
+            )
+
+        self.assertEqual(notified, 0)
+        self.assertEqual(calls, [])
+        self.assertEqual(state["outbox"], [])
+        self.assertEqual(
+            state["cancelled_events"][-1]["cancel_reason"],
+            "no_effective_trade_action",
+        )
+        self.assertEqual(
+            state["provider"]["pushplus_session"]["status"],
+            "no_action_no_send",
+        )
+
+    def test_explicit_sell_decision_records_successful_push(self):
+        now = datetime(2026, 8, 12, 14, 26, tzinfo=TZ)
+        event = self._decision_event(now, action_code="reduce_1_4")
+        state = intraday_session_module._empty_state(now)
+        state["outbox"] = [event]
+        state["event_ledger"] = [event]
+        with patch.dict(os.environ, {"PUSHPLUS_TOKEN": "configured"}, clear=False):
+            intraday_session_module._initialize_pushplus_session(state, now=now)
+            notified = flush_outbox(state, now=now, sender=lambda **_: True)
+
+        self.assertEqual(notified, 1)
+        self.assertEqual(state["outbox"], [])
+        pushplus = state["provider"]["pushplus_session"]
+        self.assertEqual(pushplus["status"], "actionable_sent")
+        self.assertEqual(pushplus["actionable_sent"], 1)
+
+    def test_strict_verifier_accepts_no_action_without_sending(self):
+        result = verify_state(
+            {
+                "provider": {
+                    "degraded": False,
+                    "calendar_degraded": False,
+                    "quote_fetcher": {
+                        "longbridge_configured": True,
+                        "hk_requested": 6,
+                        "hk_fresh_upgraded": 6,
+                        "hk_provider_timestamped": 6,
+                    },
+                    "integration_verification": {
+                        "hk_cycles_checked": 1,
+                        "hk_cycles_fully_fresh": 1,
+                        "hk_degraded_cycles": 0,
+                        "hk_degradation_reasons": {},
+                        "primary_degraded_cycles": 0,
+                    },
+                    "pushplus_session": {
+                        "configured": True,
+                        "status": "no_action_no_send",
+                        "pending_actionable": 0,
+                        "pending_system": 0,
+                    },
+                }
+            }
+        )
+
+        self.assertTrue(result["passed"])
+
+    def test_strict_verifier_fails_on_degradation_or_push_retry(self):
+        result = verify_state(
+            {
+                "provider": {
+                    "degraded": True,
+                    "quote_fetcher": {
+                        "longbridge_configured": False,
+                        "hk_requested": 6,
+                        "hk_fresh_upgraded": 0,
+                        "hk_provider_timestamped": 0,
+                    },
+                    "integration_verification": {
+                        "hk_cycles_checked": 1,
+                        "hk_cycles_fully_fresh": 0,
+                        "hk_degraded_cycles": 1,
+                        "hk_degradation_reasons": {
+                            "longbridge_unconfigured": 6
+                        },
+                        "primary_degraded_cycles": 1,
+                    },
+                    "pushplus_session": {
+                        "configured": True,
+                        "status": "send_failed",
+                        "pending_actionable": 1,
+                        "pending_system": 0,
+                    },
+                }
+            }
+        )
+
+        self.assertFalse(result["passed"])
+        self.assertIn("hk_degradation_observed", result["issues"])
+        self.assertIn("pushplus_send_failed", result["issues"])
 
 
 class CycleTests(unittest.TestCase):
