@@ -1,3 +1,4 @@
+import base64
 import json
 import os
 import sqlite3
@@ -12,6 +13,8 @@ from zoneinfo import ZoneInfo
 from scripts import intraday_session as intraday_session_module
 from scripts.intraday_monitor import ReferenceLevels
 from scripts.intraday_session import (
+    DecisionQuoteFetcher,
+    LongbridgeBatchQuoteFetcher,
     RealtimeQuote,
     SessionError,
     TencentBatchQuoteFetcher,
@@ -25,6 +28,7 @@ from scripts.intraday_session import (
     load_reference_levels_batch,
     load_state_v2,
     parse_tencent_batch,
+    parse_longbridge_batch,
     process_actionable_decisions,
     process_watch_account_decisions,
     resolve_session_end,
@@ -92,6 +96,11 @@ class FakeFetcher:
         if callable(batch):
             return batch(symbols, now)
         return dict(batch)
+
+
+class FakeLongbridgeFetcher(FakeFetcher):
+    min_interval_seconds = 30
+    configured = True
 
 
 class FakeClock:
@@ -244,11 +253,12 @@ class AccountWatchLayerTests(unittest.TestCase):
         self.assertEqual(result.coverage, 1.0)
         self.assertEqual(shadow["signal_ledger"], [])
         self.assertEqual(shadow["execution_ledger"], [])
-        self.assertEqual(len(state["outbox"]), 1)
-        payload = state["outbox"][0]["payload"]
-        self.assertEqual(payload["account_layer"], "SECONDARY_ACCOUNT_WATCH")
-        self.assertEqual(payload["action"], "继续观察")
-        self.assertEqual(payload["conclusion"], "候选观察，进入计划买入区")
+        self.assertEqual(state["outbox"], [])
+        self.assertEqual(
+            state["event_ledger"][-1]["watch_decision_results"]
+            ["SECONDARY_ACCOUNT_WATCH"],
+            "no_operation_no_explicit_buy_size",
+        )
 
     def test_fixed_candidate_plan_loader_fails_closed_without_entry_zone(self):
         now = datetime(2026, 8, 10, 10, 0, tzinfo=TZ)
@@ -358,10 +368,10 @@ class AccountWatchLayerTests(unittest.TestCase):
             )
             return raw_created, watch_created
 
-        self.assertEqual(cycle(10, now), (1, 1))
+        self.assertEqual(cycle(10, now), (1, 0))
         self.assertEqual(
             flush_outbox(state, now=now, sender=lambda **_: True),
-            1,
+            0,
         )
         self.assertEqual(cycle(10, now + timedelta(minutes=1)), (0, 0))
         self.assertEqual(
@@ -387,20 +397,17 @@ class AccountWatchLayerTests(unittest.TestCase):
             now=now + timedelta(minutes=4),
             candidates=[],
         )
-        watch_state = state["watch_decision_notifications"][
-            "SECONDARY_ACCOUNT_WATCH"
-        ]["002759"]["adaptive_entry_review"]
-        self.assertEqual(watch_state["status"], "active")
+        self.assertEqual(
+            state["watch_decision_notifications"]
+            ["SECONDARY_ACCOUNT_WATCH"]["002759"]["adaptive_entry_review"],
+            {},
+        )
         self.assertEqual(cycle(10, now + timedelta(minutes=5)), (1, 0))
         self.assertEqual(cycle(10.5, now + timedelta(minutes=6)), (0, 0))
-        watch_state = state["watch_decision_notifications"][
-            "SECONDARY_ACCOUNT_WATCH"
-        ]["002759"]["adaptive_entry_review"]
-        self.assertEqual(watch_state["status"], "cleared")
-        self.assertEqual(cycle(10, now + timedelta(minutes=7)), (1, 1))
+        self.assertEqual(cycle(10, now + timedelta(minutes=7)), (1, 0))
 
         state = intraday_session_module._empty_state(now)
-        self.assertEqual(cycle(10, now), (1, 1))
+        self.assertEqual(cycle(10, now), (1, 0))
         self.assertEqual(
             flush_outbox(state, now=now, sender=lambda **_: False),
             0,
@@ -410,12 +417,8 @@ class AccountWatchLayerTests(unittest.TestCase):
             now=now + timedelta(minutes=1),
             candidates=[],
         )
-        failed_state = state["watch_decision_notifications"][
-            "SECONDARY_ACCOUNT_WATCH"
-        ]["002759"]["adaptive_entry_review"]
-        self.assertEqual(failed_state["status"], "cleared")
         self.assertEqual(state["outbox"], [])
-        self.assertEqual(cycle(10, now + timedelta(minutes=2)), (1, 1))
+        self.assertEqual(cycle(10, now + timedelta(minutes=2)), (1, 0))
 
     def test_private_watch_config_accepts_only_runtime_held_positions(self):
         parsed = load_private_watch_config(
@@ -672,7 +675,10 @@ class AccountWatchLayerTests(unittest.TestCase):
         )
         self.assertEqual(created, 1)
         self.assertEqual(len(state["outbox"]), 1)
-        self.assertEqual(state["outbox"][0]["payload"]["action"], "人工复核清仓")
+        self.assertEqual(
+            state["outbox"][0]["payload"]["action"],
+            "建议卖出全部持仓",
+        )
         sent = []
         self.assertEqual(
             flush_outbox(
@@ -762,12 +768,9 @@ class AccountWatchLayerTests(unittest.TestCase):
                 raw_events=[entry_event],
                 levels={},
             ),
-            1,
+            0,
         )
-        payload = state["outbox"][0]["payload"]
-        self.assertEqual(payload["account_layer"], "SECONDARY_ACCOUNT_WATCH")
-        self.assertEqual(payload["action"], "继续观察")
-        self.assertIn("候选观察", payload["conclusion"])
+        self.assertEqual(state["outbox"], [])
 
     def test_shared_symbol_has_one_quote_but_separate_account_contexts(self):
         symbols = all_quote_symbols()
@@ -780,6 +783,155 @@ class AccountWatchLayerTests(unittest.TestCase):
 
 
 class TencentBatchTests(unittest.TestCase):
+    def test_longbridge_fetcher_caps_hk_batches_at_twenty(self):
+        now = datetime(2026, 8, 11, 14, 45, tzinfo=TZ)
+        calls = []
+
+        class FakeContext:
+            def quote(self, provider_symbols):
+                calls.append(list(provider_symbols))
+                return [
+                    {
+                        "symbol": symbol,
+                        "last_done": "10.5",
+                        "prev_close": "10",
+                        "timestamp": now,
+                    }
+                    for symbol in provider_symbols
+                ]
+
+        symbols = [f"HK{index:05d}" for index in range(1, 22)]
+        fetcher = LongbridgeBatchQuoteFetcher(
+            configured=True,
+            chunk_size=999,
+            context_factory=FakeContext,
+        )
+
+        result = fetcher.fetch(symbols, now=now)
+
+        self.assertEqual([len(chunk) for chunk in calls], [20, 1])
+        self.assertEqual(set(result), set(symbols))
+        self.assertTrue(all(not item.is_stale for item in result.values()))
+
+    def test_oauth_cache_secret_accepts_wrapped_base64(self):
+        payload = b'{"access_token":"test-only"}'
+        encoded = base64.b64encode(payload).decode("ascii")
+        wrapped = f"{encoded[:8]}\n{encoded[8:]}"
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            cache_path = Path(temporary_directory) / "oauth-cache"
+            with patch.dict(
+                os.environ,
+                {"LONGBRIDGE_OAUTH_TOKEN_CACHE_B64": wrapped},
+                clear=False,
+            ), patch.object(
+                intraday_session_module,
+                "_longbridge_oauth_cache_path",
+                return_value=cache_path,
+            ):
+                restored = intraday_session_module._restore_longbridge_oauth_cache(
+                    "test-client"
+                )
+
+            self.assertEqual(restored, cache_path)
+            self.assertEqual(cache_path.read_bytes(), payload)
+
+    def test_oauth_cache_secret_rejects_non_json_payload(self):
+        encoded = base64.b64encode(b"not-json").decode("ascii")
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            cache_path = Path(temporary_directory) / "oauth-cache"
+            with patch.dict(
+                os.environ,
+                {"LONGBRIDGE_OAUTH_TOKEN_CACHE_B64": encoded},
+                clear=False,
+            ), patch.object(
+                intraday_session_module,
+                "_longbridge_oauth_cache_path",
+                return_value=cache_path,
+            ):
+                with self.assertRaises(SessionError):
+                    intraday_session_module._restore_longbridge_oauth_cache(
+                        "test-client"
+                    )
+            self.assertFalse(cache_path.exists())
+
+    def test_longbridge_batch_uses_provider_timestamp_and_rejects_delay(self):
+        now = datetime(2026, 8, 11, 14, 45, tzinfo=TZ)
+        fresh = parse_longbridge_batch(
+            [
+                {
+                    "symbol": "6181.HK",
+                    "last_done": "365.4",
+                    "prev_close": "395.6",
+                    "volume": 123456,
+                    "timestamp": int((now - timedelta(seconds=12)).timestamp()),
+                }
+            ],
+            ["HK06181"],
+            fetched_at=now,
+            freshness_seconds=90,
+        )["HK06181"]
+        self.assertFalse(fresh.is_stale)
+        self.assertEqual(fresh.source, "longbridge_batch")
+        self.assertAlmostEqual(fresh.change_pct, -7.63, places=2)
+        self.assertEqual(fresh.stale_seconds, 12)
+
+        delayed = parse_longbridge_batch(
+            [
+                {
+                    "symbol": "6181.HK",
+                    "last_done": "365.4",
+                    "prev_close": "395.6",
+                    "timestamp": int((now - timedelta(minutes=15)).timestamp()),
+                }
+            ],
+            ["HK06181"],
+            fetched_at=now,
+            freshness_seconds=90,
+        )["HK06181"]
+        self.assertTrue(delayed.is_stale)
+        self.assertEqual(delayed.stale_seconds, 900)
+
+    def test_market_aware_fetcher_replaces_only_hk_with_fresh_longbridge(self):
+        now = datetime(2026, 8, 11, 14, 45, tzinfo=TZ)
+        cn = quote("300408", 40, 0.2, now)
+        delayed_hk = RealtimeQuote(
+            symbol="HK06181",
+            name="老铺黄金",
+            price=383.8,
+            change_pct=-2.98,
+            provider_timestamp=(now - timedelta(minutes=15)).isoformat(),
+            fetched_at=now.isoformat(),
+            stale_seconds=900,
+            is_stale=True,
+            source="tencent_batch",
+        )
+        fresh_hk = RealtimeQuote(
+            symbol="HK06181",
+            price=365.4,
+            change_pct=-7.63,
+            provider_timestamp=(now - timedelta(seconds=5)).isoformat(),
+            fetched_at=now.isoformat(),
+            stale_seconds=5,
+            is_stale=False,
+            source="longbridge_batch",
+        )
+        fetcher = DecisionQuoteFetcher(
+            tencent_fetcher=FakeFetcher(
+                [{"300408": cn, "HK06181": delayed_hk}]
+            ),
+            longbridge_fetcher=FakeLongbridgeFetcher(
+                [{"HK06181": fresh_hk}]
+            ),
+        )
+
+        result = fetcher.fetch(["300408", "HK06181"], now=now)
+
+        self.assertIs(result["300408"], cn)
+        self.assertEqual(result["HK06181"].price, 365.4)
+        self.assertEqual(result["HK06181"].name, "老铺黄金")
+        self.assertFalse(result["HK06181"].is_stale)
+        self.assertEqual(fetcher.last_diagnostics["hk_fresh_upgraded"], 1)
+
     def test_mixed_a_h_batch_uses_one_request_and_enforces_freshness(self):
         now = datetime(2026, 7, 28, 10, 30, 30, tzinfo=TZ)
         payload = "\n".join(
@@ -1169,15 +1321,21 @@ class StateMachineTests(unittest.TestCase):
             1,
         )
         self.assertEqual(len(state["outbox"]), 1)
-        self.assertEqual(state["outbox"][0]["payload"]["action"], "模拟减仓1/3")
+        self.assertEqual(state["outbox"][0]["payload"]["action"], "建议减仓1/3")
         self.assertEqual(len(shadow["signal_ledger"]), 1)
         pushed = []
         flush_outbox(
             state,
             now=now,
             sender=lambda **payload: pushed.append(payload) or True,
+            position_quantities={"PRIMARY_PORTFOLIO": {"688333": 100}},
         )
-        self.assertIn("建议动作：模拟减仓1/3", pushed[0]["content"])
+        self.assertIn("建议动作：建议减仓1/3", pushed[0]["content"])
+        self.assertIn("建议数量：33 股", pushed[0]["content"])
+        self.assertIn("触发价：110.000", pushed[0]["content"])
+        self.assertIn("委托参考价：109.000", pushed[0]["content"])
+        self.assertIn("失效条件：", pushed[0]["content"])
+        self.assertIn("有效期：2026-08-10T15:00:00+08:00", pushed[0]["content"])
 
         later = now + timedelta(minutes=20)
         start = len(state["event_ledger"])
@@ -1236,6 +1394,56 @@ class StateMachineTests(unittest.TestCase):
             "no_operation_price_move_only",
         )
 
+    def test_laopu_large_drop_holds_above_stop_and_sells_after_stop_break(self):
+        now = datetime(2026, 8, 11, 14, 45, tzinfo=TZ)
+        state = load_state_v2(Path("/path/that/does/not/exist"), now=now)
+        shadow = synthetic_shadow_state()
+        levels = {"HK06181": ReferenceLevels(stop_loss=353)}
+
+        first = run_cycle(
+            symbols=["HK06181"],
+            primary_symbols=["HK06181"],
+            state=state,
+            levels=levels,
+            fetcher=FakeFetcher(
+                [{"HK06181": quote("HK06181", 365.4, -7.63, now)}]
+            ),
+            now=now,
+            shadow_state=shadow,
+            notification_sender=lambda **_: False,
+        )
+        self.assertEqual(first.valid_quote_count, 1)
+        self.assertEqual(state["outbox"], [])
+        self.assertEqual(
+            state["symbols"]["HK06181"]["conditions"]["sharp_drop"]
+            ["status"],
+            "active",
+        )
+
+        later = now + timedelta(minutes=1)
+        run_cycle(
+            symbols=["HK06181"],
+            primary_symbols=["HK06181"],
+            state=state,
+            levels=levels,
+            fetcher=FakeFetcher(
+                [{"HK06181": quote("HK06181", 352.8, -10.82, later)}]
+            ),
+            now=later,
+            shadow_state=shadow,
+            notification_sender=lambda **_: False,
+        )
+        self.assertEqual(len(state["outbox"]), 2)
+        primary_event = next(
+            event
+            for event in state["outbox"]
+            if not (event.get("payload") or {}).get("account_layer")
+        )
+        self.assertEqual(
+            primary_event["payload"]["conclusion"],
+            "建议止损减仓1/3",
+        )
+
     def test_same_cycle_keeps_only_strongest_action_per_symbol(self):
         now = datetime(2026, 8, 10, 10, 0, tzinfo=TZ)
         state = load_state_v2(Path("/path/that/does/not/exist"), now=now)
@@ -1285,12 +1493,62 @@ class StateMachineTests(unittest.TestCase):
             1,
         )
         self.assertEqual(len(state["outbox"]), 1)
-        self.assertEqual(state["outbox"][0]["payload"]["action"], "模拟减仓1/2")
+        self.assertEqual(state["outbox"][0]["payload"]["action"], "建议减仓1/2")
         self.assertEqual(len(shadow["signal_ledger"]), 1)
         self.assertEqual(
             stop_event["decision_result"],
             "merged_into_stronger_same_cycle_decision",
         )
+
+    def test_private_share_quantity_is_rendered_but_never_persisted(self):
+        now = datetime(2026, 8, 10, 10, 0, tzinfo=TZ)
+        state = load_state_v2(Path("/path/that/does/not/exist"), now=now)
+        shadow = synthetic_shadow_state()
+        shadow["strategy_shadow_portfolio"]["positions"]["688333"][
+            "quantity"
+        ] = 4321
+        raw_event = {
+            "event_id": "private-quantity-stop",
+            "symbol": "688333",
+            "name": "铂力特",
+            "condition": "stop_loss",
+            "transition": "activated",
+            "severity": "high",
+            "price": 99,
+            "change_pct": -2,
+            "reference_price": 100,
+            "payload": {
+                "quote_time": now.isoformat(),
+                "data_quality": "fresh_l1",
+            },
+        }
+
+        self.assertEqual(
+            process_actionable_decisions(
+                state,
+                now=now,
+                raw_events=[raw_event],
+                levels={"688333": ReferenceLevels(stop_loss=100)},
+                shadow_state=shadow,
+            ),
+            1,
+        )
+        self.assertNotIn("4321", json.dumps(state, ensure_ascii=False))
+
+        sent = []
+        self.assertEqual(
+            flush_outbox(
+                state,
+                now=now,
+                sender=lambda **payload: sent.append(payload) or True,
+                position_quantities={
+                    "PRIMARY_PORTFOLIO": {"688333": 4321}
+                },
+            ),
+            1,
+        )
+        self.assertIn("建议数量：1440 股", sent[0]["content"])
+        self.assertNotIn("4321", json.dumps(state, ensure_ascii=False))
 
     def test_observed_candidate_rechecks_when_same_currency_cash_appears(self):
         now = datetime(2026, 8, 10, 10, 0, tzinfo=TZ)
@@ -1336,11 +1594,13 @@ class StateMachineTests(unittest.TestCase):
                 shadow_state=shadow,
                 signal_recorder=record_shadow_signal,
             ),
-            1,
+            0,
         )
+        self.assertEqual(state["outbox"], [])
         self.assertEqual(
-            state["outbox"][0]["payload"]["conclusion"],
-            "进入观察，等待资金条件",
+            state["decision_notifications"]["HK00700"]
+            ["adaptive_entry_review"]["last_action"],
+            "observe",
         )
         self.assertEqual(shadow["signal_ledger"], [])
 
@@ -1393,7 +1653,7 @@ class StateMachineTests(unittest.TestCase):
             1,
         )
         self.assertEqual(len(state["outbox"]), 1)
-        self.assertEqual(state["outbox"][0]["payload"]["action"], "模拟买入0.25成")
+        self.assertEqual(state["outbox"][0]["payload"]["action"], "建议买入0.25成")
         self.assertEqual(len(shadow["signal_ledger"]), 1)
 
     def test_legacy_raw_outbox_is_audited_but_never_pushed(self):

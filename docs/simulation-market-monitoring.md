@@ -11,8 +11,10 @@
   cron-job.org 在交易日北京时间 09:20 以 `workflow_dispatch` 触发
   `session=morning`，12:50 触发 `session=afternoon`。GitHub Actions 页面仍可用
   Run workflow 手动选择 `auto`、`morning` 或 `afternoon`。每个连续监控时段正常约
-  60 秒取一次基础实时行情；价格临近风险位或条件位时约 30 秒一次；数据源降级
-  时放慢到约 120 秒。
+  60 秒取一次基础实时行情；A 股使用腾讯批量行情，港股在配置 Longbridge 凭据后
+  优先使用带最新成交时间戳的授权 L1 批量行情；价格临近风险位或条件位时约 30 秒
+  一次，数据源降级时放慢到约 120 秒。腾讯港股延迟行情只保留为诊断证据，不会
+  被放宽新鲜度后用于买卖判断。
 - `02-market-scan.yml`：北京时间 10:30、14:30 和 19:15 分层扫描 A 股全市场与
   港股通成分。全市场阶段不调用模型；只对规则短名单加载历史，再让通义千问和
   DeepSeek 独立复核。
@@ -39,12 +41,14 @@
 `target_reached`、adaptive、数据质量、信号时间、行情时间、价格、原因和决策结果
 仍完整留账，但原始事件不会未经决策加工直接推送。
 
-用户端 Push 只回答“现在怎么办”：仅当模拟操作建议改变、风险实质升级、有效
+用户端 Push 只回答“现在怎么办”：仅当操作建议改变、风险实质升级、有效
 突破/跌破新的可靠关键位、相对上次显著恶化、风险解除后重新触发，或新可靠计划
 替换旧计划时发送。普通涨跌阈值触发但最佳动作仍为“不操作”时不推送；冷却时间
-届满本身也不会机械重发。推送中的买入、加仓、减仓、清仓均明确标为模拟，并包含
-当前价格、模拟仓位变化、可靠依据、关键价位、下一触发条件和数据质量；证据不足时
-保持“不操作/等待条件”，不编造持仓、成本、Level-2、资金、新闻或盘口。
+届满本身也不会机械重发。推送中的买入、加仓、减仓、止盈和止损均给出当前价格、
+建议数量或仓位比例、触发价、委托参考价、失效条件、有效期、可靠依据、下一触发
+条件和数据质量；下单仍需人工确认，系统不会连接券商。没有可靠资金与仓位尺寸的
+候选观察只留审计记录，不冒充可执行买入建议，也不编造持仓、成本、Level-2、资金、
+新闻或盘口。
 
 数据覆盖不足只有在连续多轮且已经影响决策可靠性时推送一次降级提醒；同一降级
 状态不重复刷屏，可靠行情恢复后只推送一次恢复通知并清除告警状态。
@@ -94,7 +98,9 @@ PushPlus 发送。公开 artifact 仅允许保存不含绝对资产信息的运�
 
 公开代码只保存 symbol、账户层和 held/candidate 状态。第二账户及妹妹账户的真实
 数量与成本如需用于人工风险复核，只能放入 GitHub Repository Secret
-`WATCH_ACCOUNTS_PRIVATE_JSON`；运行时只校验使用，不输出日志、不落明文 artifact。
+`WATCH_ACCOUNTS_PRIVATE_JSON`；运行时只在生成 Push 文案时读取建议股数，不输出日志、
+不写入会话状态、报告或明文 artifact。PRIMARY 数量同样只从已加密的 A/B 状态在内存
+中读取。没有私密数量时，卖出建议只写“全部持仓”或持仓比例，不猜测股数。
 普通涨跌、cooldown 到期和结论未变化继续不 Push；旁路提醒只有在关键位、风险等级
 或人工复核动作发生实质变化时才发送，并带清晰账户前缀。
 
@@ -157,10 +163,16 @@ Level-2 只允许使用交易所授权、持牌数据商或用户本人账户已
 | `INTRADAY_DEGRADED_INTERVAL_SECONDS` | `120` | 数据源降级时的间隔 |
 | `INTRADAY_QUOTE_FRESHNESS_SECONDS` | `90` | 行情最大允许年龄 |
 | `INTRADAY_MIN_QUOTE_COVERAGE` | `0.8` | 最低基础行情覆盖率 |
+| `LONGBRIDGE_OAUTH_CLIENT_ID` | - | 港股实时 L1 的 OAuth client_id（Variable 或 Secret） |
+| `LONGBRIDGE_OAUTH_TOKEN_CACHE_B64` | - | 港股实时 L1 的 OAuth token cache（Secret） |
 | `MARKET_SCAN_TOP_A_HISTORY` | `40` | 进入历史计算的 A 股数量 |
 | `MARKET_SCAN_TOP_HK_HISTORY` | `20` | 进入历史计算的港股通数量 |
 | `MARKET_SCAN_FINAL_TOP_N` | `12` | 进入双模型复核的最多数量 |
 | `MARKET_SCAN_MIN_NET_RR` | `1.8` | 扣费后最低风险收益比 |
+
+港股实时监控也兼容 Legacy `LONGBRIDGE_APP_KEY`、`LONGBRIDGE_APP_SECRET`、
+`LONGBRIDGE_ACCESS_TOKEN` 三件套；OAuth 与 Legacy 均未配置或认证失败时，港股行情
+会严格降级并停止交易类建议，不会把腾讯约 15 分钟延迟行情伪装成实时数据。
 
 模型密钥和 PushPlus Token 使用既有 `LLM_DASHSCOPE_API_KEY`、
 `LLM_DEEPSEEK_API_KEY` 与 `PUSHPLUS_TOKEN` secrets。停用新增能力时，在

@@ -8,7 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 > For user-friendly release highlights, see the [GitHub Releases](https://github.com/ZhuLinsen/daily_stock_analysis/releases) page.
 
 ## [Unreleased]
-- [修复] SECONDARY 固定候选可只读复用最新有效的 P3 收盘分析买入区，并继续通过现有数据质量、行情新鲜度与扣费后风险收益门生成仅供人工复核的候选观察提醒；同状态不重复，离区后重入才重新提醒，且始终隔离于 PRIMARY A/B。
+- [修复] 分钟盘中监控为港股接入带提供方成交时间戳的 Longbridge 授权 L1 批量行情并保留腾讯严格降级，禁止延迟行情触发买卖建议；PushPlus 仅发送止盈、止损或可信计划形成的明确动作，并补齐建议数量、触发价、委托参考价、失效条件与有效期，私密持仓数量只在内存中用于生成通知。
+- [修复] SECONDARY 固定候选可只读复用最新有效的 P3 收盘分析买入区，并继续通过现有数据质量、行情新鲜度与扣费后风险收益门生成审计事件；因缺少可靠资金与仓位尺寸，不再把进入观察区推送成可执行买入建议，且始终隔离于 PRIMARY A/B。
 - [修复] PRIMARY 真实持仓 A/B 实验锁定 2026-08-07 基准汇率 `1 HKD = 0.8865 CNY`，正式 NAV、收益、回撤、现金及仓位统一使用人民币；A/H 共用人民币模拟购买力，A 股买入按 100 股整数手，既有加密状态只迁移不重建。
 - [新功能] 新增父亲、本人第二账户与妹妹账户的隔离观察层；相同 symbol 复用一次行情与收盘研究，PRIMARY 覆盖率、信号、成交和绩效保持独立，私密数量与成本仅接受 `WATCH_ACCOUNTS_PRIVATE_JSON` Secret 注入。
 - [改进] PRIMARY 14 只成为每日收盘 P0 股票池，其他账户按 P1-P3 有限降级执行；旧 100 万元 paper tracker 退出正常 full 推送，仅保留手动“旧版标准化20日模拟实验（非真实持仓A/B）”入口及历史状态。
