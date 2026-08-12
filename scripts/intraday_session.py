@@ -199,12 +199,71 @@ def _parse_iso(value: Any) -> Optional[datetime]:
 def _is_user_push_allowed(event: Mapping[str, Any]) -> bool:
     payload = event.get("payload") or {}
     return bool(
-        payload.get("kind") == "trade_decision"
+        _is_actionable_trade_decision(event)
         or (
             event.get("symbol") == "SYSTEM"
             and event.get("condition") in _SYSTEM_PUSH_CONDITIONS
         )
     )
+
+
+def _is_actionable_trade_decision(event: Mapping[str, Any]) -> bool:
+    payload = event.get("payload") or {}
+    return bool(
+        payload.get("kind") == "trade_decision"
+        and str(payload.get("action_code") or "") in _TRADE_ACTION_LABELS
+    )
+
+
+def _initialize_pushplus_session(
+    state: MutableMapping[str, Any], *, now: datetime
+) -> MutableMapping[str, Any]:
+    session: MutableMapping[str, Any] = {
+        "started_at": _iso(now),
+        "configured": bool(os.getenv("PUSHPLUS_TOKEN", "").strip()),
+        "status": "no_action_no_send",
+        "actionable_sent": 0,
+        "system_sent": 0,
+        "failed_attempts": 0,
+        "suppressed_no_action": 0,
+        "pending_actionable": 0,
+        "pending_system": 0,
+        "last_failure": None,
+    }
+    state.setdefault("provider", {})["pushplus_session"] = session
+    return session
+
+
+def _refresh_pushplus_session(
+    state: MutableMapping[str, Any],
+) -> Optional[MutableMapping[str, Any]]:
+    session = state.setdefault("provider", {}).get("pushplus_session")
+    if not isinstance(session, MutableMapping):
+        return None
+    outbox = [
+        event
+        for event in state.get("outbox", [])
+        if isinstance(event, Mapping) and _is_user_push_allowed(event)
+    ]
+    session["pending_actionable"] = sum(
+        1 for event in outbox if _is_actionable_trade_decision(event)
+    )
+    session["pending_system"] = len(outbox) - int(
+        session["pending_actionable"]
+    )
+    if not session.get("configured"):
+        session["status"] = "not_configured"
+    elif session["pending_actionable"] or session["pending_system"]:
+        session["status"] = (
+            "send_failed"
+            if int(session.get("failed_attempts") or 0) > 0
+            else "pending_retry"
+        )
+    elif int(session.get("actionable_sent") or 0) > 0:
+        session["status"] = "actionable_sent"
+    else:
+        session["status"] = "no_action_no_send"
+    return session
 
 
 def _suppress_legacy_raw_outbox(
@@ -222,12 +281,27 @@ def _suppress_legacy_raw_outbox(
                 {
                     **event,
                     "cancelled_at": _iso(now),
-                    "cancel_reason": "legacy_raw_event_requires_decision_gate",
+                    "cancel_reason": (
+                        "no_effective_trade_action"
+                        if (event.get("payload") or {}).get("kind")
+                        == "trade_decision"
+                        else "legacy_raw_event_requires_decision_gate"
+                    ),
                 }
             )
     if not suppressed:
+        _refresh_pushplus_session(state)
         return 0
     state["outbox"] = kept
+    session = state.setdefault("provider", {}).get("pushplus_session")
+    if isinstance(session, MutableMapping):
+        session["suppressed_no_action"] = int(
+            session.get("suppressed_no_action") or 0
+        ) + sum(
+            1
+            for event in suppressed
+            if (event.get("payload") or {}).get("kind") == "trade_decision"
+        )
     state.setdefault("cancelled_events", []).extend(suppressed)
     ledger = state.setdefault("event_ledger", [])
     ledger_ids = {str(item.get("event_id") or "") for item in ledger}
@@ -235,6 +309,7 @@ def _suppress_legacy_raw_outbox(
         if str(event.get("event_id") or "") not in ledger_ids:
             event["decision_result"] = "suppressed_legacy_raw_push"
             ledger.append(event)
+    _refresh_pushplus_session(state)
     return len(suppressed)
 
 
@@ -776,10 +851,24 @@ class DecisionQuoteFetcher:
         results = self.tencent_fetcher.fetch(canonical, now=fetched_at)
         hk_symbols = [symbol for symbol in canonical if symbol.startswith("HK")]
         upgraded = 0
+        provider_timestamped = 0
+        degradation_reasons: Dict[str, int] = {}
         longbridge = self.longbridge_fetcher.fetch(hk_symbols, now=fetched_at)
         for symbol in hk_symbols:
             candidate = longbridge.get(symbol)
-            if candidate is None or candidate.price is None or candidate.is_stale:
+            if candidate is not None and candidate.provider_timestamp:
+                provider_timestamped += 1
+            reason = ""
+            if candidate is None:
+                reason = "longbridge_quote_missing"
+            elif candidate.price is None:
+                reason = candidate.source or "longbridge_price_missing"
+            elif not candidate.provider_timestamp:
+                reason = "longbridge_provider_timestamp_missing"
+            elif candidate.is_stale:
+                reason = "longbridge_provider_timestamp_stale"
+            if reason:
+                degradation_reasons[reason] = degradation_reasons.get(reason, 0) + 1
                 continue
             baseline = results.get(symbol)
             if baseline is not None and not candidate.name:
@@ -792,6 +881,9 @@ class DecisionQuoteFetcher:
             "longbridge_configured": bool(self.longbridge_fetcher.configured),
             "hk_requested": len(hk_symbols),
             "hk_fresh_upgraded": upgraded,
+            "hk_provider_timestamped": provider_timestamped,
+            "hk_degraded": bool(hk_symbols and upgraded != len(hk_symbols)),
+            "hk_degradation_reasons": degradation_reasons,
             "strict_no_delayed_trade_decisions": True,
         }
         return results
@@ -3165,6 +3257,7 @@ def flush_outbox(
         if next_attempt is None or next_attempt <= now:
             due.append(event)
     if not due:
+        _refresh_pushplus_session(state)
         return 0
 
     content = render_outbox(
@@ -3187,6 +3280,7 @@ def flush_outbox(
         title_prefix = "【多账户】"
     else:
         title_prefix = ""
+    failure_reason: Optional[str] = None
     try:
         sent = bool(
             sender(
@@ -3200,19 +3294,39 @@ def flush_outbox(
     except Exception as exc:
         print(f"PushPlus 推送异常，保留 outbox 重试: {exc}", file=sys.stderr)
         sent = False
+        failure_reason = f"sender_exception:{type(exc).__name__}"
 
     if not sent:
+        session = state.setdefault("provider", {}).get("pushplus_session")
+        if isinstance(session, MutableMapping):
+            session["failed_attempts"] = int(
+                session.get("failed_attempts") or 0
+            ) + 1
+            session["last_failure"] = failure_reason or "sender_returned_false"
         for event in due:
             attempts = int(event.get("attempts") or 0) + 1
             event["attempts"] = attempts
             delay = min(600, 30 * (2 ** min(attempts - 1, 5)))
             event["next_attempt_at"] = _iso(now + timedelta(seconds=delay))
+        _refresh_pushplus_session(state)
         return 0
 
     sent_ids = {event["event_id"] for event in due}
     state["outbox"] = [
         event for event in state.get("outbox", []) if event.get("event_id") not in sent_ids
     ]
+    session = state.setdefault("provider", {}).get("pushplus_session")
+    if isinstance(session, MutableMapping):
+        actionable_sent = sum(
+            1 for event in due if _is_actionable_trade_decision(event)
+        )
+        session["actionable_sent"] = int(
+            session.get("actionable_sent") or 0
+        ) + actionable_sent
+        session["system_sent"] = int(session.get("system_sent") or 0) + (
+            len(due) - actionable_sent
+        )
+        session["last_failure"] = None
     for event in due:
         symbol_state = state.get("symbols", {}).get(event.get("symbol"), {})
         condition_state = symbol_state.get("conditions", {}).get(event.get("condition"))
@@ -3242,6 +3356,7 @@ def flush_outbox(
                 provider["health_alert_notified"] = True
             elif event.get("transition") == "recovered":
                 provider["health_alert_notified"] = False
+    _refresh_pushplus_session(state)
     return len(due)
 
 
@@ -3386,9 +3501,38 @@ def run_cycle(
     ]
     fetcher_diagnostics = getattr(fetcher, "last_diagnostics", None)
     if isinstance(fetcher_diagnostics, Mapping):
-        state.setdefault("provider", {})["quote_fetcher"] = dict(
-            fetcher_diagnostics
-        )
+        provider_state = state.setdefault("provider", {})
+        quote_diagnostics = dict(fetcher_diagnostics)
+        provider_state["quote_fetcher"] = quote_diagnostics
+        verification = provider_state.get("integration_verification")
+        hk_requested = int(quote_diagnostics.get("hk_requested") or 0)
+        if isinstance(verification, MutableMapping) and hk_requested > 0:
+            verification["hk_cycles_checked"] = int(
+                verification.get("hk_cycles_checked") or 0
+            ) + 1
+            fully_fresh = (
+                int(quote_diagnostics.get("hk_fresh_upgraded") or 0)
+                == hk_requested
+                and int(quote_diagnostics.get("hk_provider_timestamped") or 0)
+                == hk_requested
+            )
+            if fully_fresh:
+                verification["hk_cycles_fully_fresh"] = int(
+                    verification.get("hk_cycles_fully_fresh") or 0
+                ) + 1
+            else:
+                verification["hk_degraded_cycles"] = int(
+                    verification.get("hk_degraded_cycles") or 0
+                ) + 1
+                cumulative_reasons = verification.setdefault(
+                    "hk_degradation_reasons", {}
+                )
+                for reason, count in (
+                    quote_diagnostics.get("hk_degradation_reasons") or {}
+                ).items():
+                    cumulative_reasons[str(reason)] = int(
+                        cumulative_reasons.get(str(reason)) or 0
+                    ) + int(count or 0)
     primary_valid = [
         quote
         for quote in quotes
@@ -3578,6 +3722,11 @@ def run_cycle(
 
     degraded = int(provider.get("consecutive_low_coverage") or 0) >= low_coverage_limit
     provider["degraded"] = degraded
+    verification = provider.get("integration_verification")
+    if isinstance(verification, MutableMapping) and degraded:
+        verification["primary_degraded_cycles"] = int(
+            verification.get("primary_degraded_cycles") or 0
+        ) + 1
     created = recovery_events
     if degraded:
         created += _queue_data_health_event(
@@ -3727,6 +3876,8 @@ def render_session_report(
     reference = provider_status.get("reference_levels") or {}
     level2 = provider_status.get("level2") or {}
     quote_fetcher = provider_status.get("quote_fetcher") or {}
+    integration_verification = provider_status.get("integration_verification") or {}
+    pushplus_session = provider_status.get("pushplus_session") or {}
     late_schedule = provider_status.get("late_schedule") or {}
     lines = [
         "# 分钟级盘中模拟监控",
@@ -3775,6 +3926,46 @@ def render_session_report(
             f"最近一轮新鲜覆盖 {quote_fetcher.get('hk_fresh_upgraded', 0)}/"
             f"{quote_fetcher.get('hk_requested', 0)}。"
         )
+        lines.append(
+            "- 港股提供方时间戳："
+            f"{quote_fetcher.get('hk_provider_timestamped', 0)}/"
+            f"{quote_fetcher.get('hk_requested', 0)}；"
+            f"本会话完整新鲜轮次 {integration_verification.get('hk_cycles_fully_fresh', 0)}/"
+            f"{integration_verification.get('hk_cycles_checked', 0)}。"
+        )
+        hk_reasons = integration_verification.get("hk_degradation_reasons") or {}
+        if isinstance(hk_reasons, Mapping) and hk_reasons:
+            lines.append(
+                "- 港股行情降级原因："
+                + "；".join(
+                    f"{reason}={count}"
+                    for reason, count in sorted(hk_reasons.items())
+                )
+            )
+        elif int(integration_verification.get("hk_cycles_checked") or 0) > 0:
+            lines.append("- 港股行情降级：本会话未发生。")
+    if pushplus_session:
+        push_status = str(pushplus_session.get("status") or "unknown")
+        if push_status == "actionable_sent":
+            push_text = (
+                "明确买卖建议已发送 "
+                f"{int(pushplus_session.get('actionable_sent') or 0)} 条"
+            )
+        elif push_status in {"send_failed", "pending_retry"}:
+            push_text = (
+                "发送失败，待重试 "
+                f"{int(pushplus_session.get('pending_actionable') or 0)} 条买卖建议、"
+                f"{int(pushplus_session.get('pending_system') or 0)} 条系统通知"
+            )
+        elif push_status == "not_configured":
+            push_text = "未配置 PushPlus"
+        else:
+            push_text = "无有效买卖动作，未发送交易建议"
+        if int(pushplus_session.get("system_sent") or 0) > 0:
+            push_text += (
+                f"；另发送系统通知 {int(pushplus_session.get('system_sent') or 0)} 条"
+            )
+        lines.append(f"- PushPlus 结果：{push_text}。")
     level2_statuses = level2.get("statuses") or {}
     if isinstance(level2_statuses, Mapping) and level2_statuses:
         lines.append(
@@ -3973,6 +4164,15 @@ def run_session(
             )
         state = load_state_v2(state_path, now=started)
         provider = state.setdefault("provider", {})
+        _initialize_pushplus_session(state, now=started)
+        provider["integration_verification"] = {
+            "started_at": _iso(started),
+            "hk_cycles_checked": 0,
+            "hk_cycles_fully_fresh": 0,
+            "hk_degraded_cycles": 0,
+            "hk_degradation_reasons": {},
+            "primary_degraded_cycles": 0,
+        }
         delay_seconds = max(0.0, (started - end_at).total_seconds())
         provider["session_status"] = "late_schedule_skipped"
         provider["late_schedule"] = {
@@ -4057,6 +4257,13 @@ def run_session(
         if event_id and not event_pending:
             notification_state["status"] = "sent"
             notification_state["notified_at"] = _iso(started)
+        _refresh_pushplus_session(state)
+        pushplus_session = provider.get("pushplus_session")
+        if isinstance(pushplus_session, MutableMapping):
+            pushplus_session["ended_at"] = _iso(started)
+        verification = provider.get("integration_verification")
+        if isinstance(verification, MutableMapping):
+            verification["ended_at"] = _iso(started)
         state["updated_at"] = _iso(started)
         if shadow_state is not None and shadow_state_path is not None:
             record_shadow_status(
@@ -4192,6 +4399,15 @@ def run_session(
     }
     provider = state.setdefault("provider", {})
     provider.pop("late_schedule", None)
+    _initialize_pushplus_session(state, now=started)
+    provider["integration_verification"] = {
+        "started_at": _iso(started),
+        "hk_cycles_checked": 0,
+        "hk_cycles_fully_fresh": 0,
+        "hk_degraded_cycles": 0,
+        "hk_degradation_reasons": {},
+        "primary_degraded_cycles": 0,
+    }
     provider["reference_levels"] = reference_summary
     provider["candidate_plan_monitoring"] = {
         "path": str(candidate_plans_path) if candidate_plans_path else "",
@@ -4392,6 +4608,13 @@ def run_session(
 
     ended = clock().astimezone(SHANGHAI_TZ)
     provider["session_status"] = termination_reason
+    _refresh_pushplus_session(state)
+    pushplus_session = provider.get("pushplus_session")
+    if isinstance(pushplus_session, MutableMapping):
+        pushplus_session["ended_at"] = _iso(ended)
+    verification = provider.get("integration_verification")
+    if isinstance(verification, MutableMapping):
+        verification["ended_at"] = _iso(ended)
     state["updated_at"] = _iso(ended)
     if shadow_state is not None and shadow_state_path is not None:
         if (
