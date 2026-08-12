@@ -15,6 +15,8 @@ cadence instead of terminating the whole session.
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
 import hashlib
 import json
 import math
@@ -24,7 +26,7 @@ import sqlite3
 import sys
 import tempfile
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, time as datetime_time, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, MutableMapping, Optional, Sequence
@@ -86,6 +88,7 @@ DEFAULT_NORMAL_INTERVAL_SECONDS = 60.0
 DEFAULT_FAST_INTERVAL_SECONDS = 30.0
 DEFAULT_DEGRADED_INTERVAL_SECONDS = 120.0
 DEFAULT_FRESHNESS_SECONDS = 90.0
+DEFAULT_LONGBRIDGE_CHUNK_SIZE = 20
 DEFAULT_MIN_QUOTE_COVERAGE = 0.8
 DEFAULT_NEAR_LEVEL_PCT = 0.75
 DEFAULT_NEAR_CHANGE_POINTS = 0.5
@@ -391,6 +394,406 @@ class TencentBatchQuoteFetcher:
                         is_stale=True,
                         source="tencent_batch_error",
                     )
+        return results
+
+
+def to_longbridge_symbol(symbol: str) -> str:
+    canonical = canonical_symbol(symbol)
+    if canonical.startswith("HK") and canonical[2:].isdigit():
+        digits = canonical[2:].lstrip("0") or "0"
+        return f"{digits}.HK"
+    raise SessionError(f"Longbridge 盘中行情仅接收港股代码: {symbol}")
+
+
+def from_longbridge_symbol(provider_symbol: str) -> Optional[str]:
+    token = str(provider_symbol or "").strip().upper()
+    if not token.endswith(".HK"):
+        return None
+    digits = token[:-3]
+    if not digits.isdigit():
+        return None
+    return f"HK{digits.zfill(5)}"
+
+
+def parse_longbridge_timestamp(raw: Any) -> Optional[datetime]:
+    """Normalise SDK datetime or Unix timestamps without guessing local time."""
+
+    if isinstance(raw, datetime):
+        parsed = raw
+    else:
+        number = _finite_float(raw)
+        if number is None:
+            return None
+        # Be tolerant of millisecond timestamps while rejecting impossible
+        # magnitudes rather than interpreting them as a far-future quote.
+        if number > 10_000_000_000:
+            number /= 1000.0
+        try:
+            parsed = datetime.fromtimestamp(number, tz=timezone.utc)
+        except (OSError, OverflowError, ValueError):
+            return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=SHANGHAI_TZ)
+    return parsed.astimezone(SHANGHAI_TZ)
+
+
+def _provider_field(value: Any, name: str) -> Any:
+    if isinstance(value, Mapping):
+        return value.get(name)
+    return getattr(value, name, None)
+
+
+def parse_longbridge_batch(
+    records: Sequence[Any],
+    requested_symbols: Sequence[str],
+    *,
+    fetched_at: datetime,
+    freshness_seconds: float = DEFAULT_FRESHNESS_SECONDS,
+) -> Dict[str, RealtimeQuote]:
+    """Convert one authenticated Longbridge batch into fail-closed quotes."""
+
+    requested = {canonical_symbol(symbol) for symbol in requested_symbols}
+    parsed: Dict[str, RealtimeQuote] = {}
+    for record in records or ():
+        symbol = from_longbridge_symbol(str(_provider_field(record, "symbol") or ""))
+        if symbol is None or symbol not in requested:
+            continue
+        price = _positive_float(_provider_field(record, "last_done"))
+        previous_close = _positive_float(_provider_field(record, "prev_close"))
+        change_pct = (
+            (price - previous_close) / previous_close * 100
+            if price is not None and previous_close is not None
+            else None
+        )
+        volume = _nonnegative_float(_provider_field(record, "volume"))
+        provider_time = parse_longbridge_timestamp(
+            _provider_field(record, "timestamp")
+        )
+        age_seconds: Optional[float] = None
+        fresh = False
+        if provider_time is not None:
+            age_seconds = (
+                fetched_at.astimezone(SHANGHAI_TZ) - provider_time
+            ).total_seconds()
+            fresh = -30.0 <= age_seconds <= freshness_seconds
+        parsed[symbol] = RealtimeQuote(
+            symbol=symbol,
+            price=price,
+            change_pct=change_pct,
+            volume=volume,
+            provider_timestamp=_iso(provider_time) if provider_time else None,
+            fetched_at=_iso(fetched_at),
+            stale_seconds=max(0.0, age_seconds) if age_seconds is not None else None,
+            is_stale=not fresh or price is None,
+            source="longbridge_batch",
+        )
+
+    for symbol in requested:
+        parsed.setdefault(
+            symbol,
+            RealtimeQuote(
+                symbol=symbol,
+                fetched_at=_iso(fetched_at),
+                is_stale=True,
+                source="longbridge_batch_missing",
+            ),
+        )
+    return parsed
+
+
+def _longbridge_oauth_client_id() -> str:
+    explicit = os.getenv("LONGBRIDGE_OAUTH_CLIENT_ID", "").strip()
+    if explicit:
+        return explicit
+    # The application already supports APP_KEY as the OAuth client-id alias
+    # when no Legacy access token is configured.
+    if not os.getenv("LONGBRIDGE_ACCESS_TOKEN", "").strip():
+        return os.getenv("LONGBRIDGE_APP_KEY", "").strip()
+    return ""
+
+
+def _longbridge_oauth_cache_path(client_id: str) -> Path:
+    if not re.fullmatch(r"[A-Za-z0-9._-]{1,160}", client_id):
+        raise SessionError("Longbridge OAuth client_id 格式不安全")
+    return Path.home() / ".longbridge" / "openapi" / "tokens" / client_id
+
+
+def _restore_longbridge_oauth_cache(client_id: str) -> Path:
+    path = _longbridge_oauth_cache_path(client_id)
+    encoded = "".join(
+        os.getenv("LONGBRIDGE_OAUTH_TOKEN_CACHE_B64", "").split()
+    )
+    if not encoded:
+        return path
+    try:
+        payload = base64.b64decode(encoded, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise SessionError("Longbridge OAuth token cache 不是有效 base64") from exc
+    if not payload:
+        raise SessionError("Longbridge OAuth token cache 为空")
+    try:
+        cache_data = json.loads(payload.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise SessionError("Longbridge OAuth token cache 不是有效 JSON") from exc
+    if not isinstance(cache_data, dict) or not cache_data:
+        raise SessionError("Longbridge OAuth token cache 结构无效")
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", dir=str(path.parent)
+    )
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_name, path)
+    except Exception:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+        try:
+            os.unlink(temporary_name)
+        except OSError:
+            pass
+        raise
+    return path
+
+
+def longbridge_intraday_configured() -> bool:
+    legacy = all(
+        os.getenv(name, "").strip()
+        for name in (
+            "LONGBRIDGE_APP_KEY",
+            "LONGBRIDGE_APP_SECRET",
+            "LONGBRIDGE_ACCESS_TOKEN",
+        )
+    )
+    client_id = _longbridge_oauth_client_id()
+    if not client_id:
+        return legacy
+    try:
+        cache_exists = _longbridge_oauth_cache_path(client_id).is_file()
+    except SessionError:
+        cache_exists = False
+    return bool(
+        legacy
+        or os.getenv("LONGBRIDGE_OAUTH_TOKEN_CACHE_B64", "").strip()
+        or cache_exists
+    )
+
+
+def _noninteractive_longbridge_context() -> Any:
+    """Create an authenticated quote context without ever opening a login UI."""
+
+    from longbridge.openapi import Config, QuoteContext
+
+    for key in (
+        "LONGBRIDGE_HTTP_URL",
+        "LONGBRIDGE_QUOTE_WS_URL",
+        "LONGBRIDGE_TRADE_WS_URL",
+        "LONGBRIDGE_REGION",
+    ):
+        if key in os.environ and not os.environ[key].strip():
+            del os.environ[key]
+    region = os.getenv("LONGBRIDGE_REGION", "").strip()
+    if region and not os.getenv("LONGPORT_REGION", "").strip():
+        os.environ["LONGPORT_REGION"] = region
+    os.environ.setdefault("LONGBRIDGE_PRINT_QUOTE_PACKAGES", "false")
+
+    client_id = _longbridge_oauth_client_id()
+    config = None
+    oauth_error: Optional[Exception] = None
+    if client_id:
+        try:
+            cache_path = _restore_longbridge_oauth_cache(client_id)
+            if cache_path.is_file():
+                from longbridge.openapi import OAuthBuilder
+
+                def reject_interactive_refresh(_url: str) -> None:
+                    raise SessionError(
+                        "Longbridge OAuth 缓存需要重新授权；盘中任务禁止交互登录"
+                    )
+
+                oauth = OAuthBuilder(client_id).build(reject_interactive_refresh)
+                from_oauth = getattr(Config, "from_oauth", None)
+                if from_oauth is not None:
+                    config = from_oauth(oauth)
+                else:
+                    raise AttributeError("Config.from_oauth")
+        except Exception as exc:
+            # A complete Legacy triplet may still provide a non-interactive
+            # fallback.  Preserve only the exception type for a safe error if
+            # no such fallback is available; never include credential data.
+            oauth_error = exc
+            config = None
+
+    legacy_values = [
+        os.getenv("LONGBRIDGE_APP_KEY", "").strip(),
+        os.getenv("LONGBRIDGE_APP_SECRET", "").strip(),
+        os.getenv("LONGBRIDGE_ACCESS_TOKEN", "").strip(),
+    ]
+    if config is None and all(legacy_values):
+        for factory_name in ("from_apikey_env", "from_env"):
+            factory = getattr(Config, factory_name, None)
+            if factory is None:
+                continue
+            try:
+                config = factory()
+                break
+            except Exception:
+                continue
+        if config is None:
+            config = Config.from_apikey(*legacy_values)
+    if config is None:
+        if oauth_error is not None:
+            raise SessionError(
+                "Longbridge OAuth 无交互认证失败："
+                f"{type(oauth_error).__name__}"
+            ) from oauth_error
+        raise SessionError("Longbridge 已声明但没有可用的无交互认证配置")
+    try:
+        return QuoteContext(config)
+    except TypeError:
+        creator = getattr(QuoteContext, "create", None)
+        if creator is None:
+            raise
+        return creator(config)
+
+
+class LongbridgeBatchQuoteFetcher:
+    """Authenticated HK L1 batch quotes with provider-time freshness checks."""
+
+    min_interval_seconds = 30.0
+
+    def __init__(
+        self,
+        *,
+        freshness_seconds: float = DEFAULT_FRESHNESS_SECONDS,
+        chunk_size: int = DEFAULT_LONGBRIDGE_CHUNK_SIZE,
+        context_factory: Callable[[], Any] = _noninteractive_longbridge_context,
+        configured: Optional[bool] = None,
+    ):
+        self.freshness_seconds = freshness_seconds
+        self.chunk_size = min(DEFAULT_LONGBRIDGE_CHUNK_SIZE, max(1, int(chunk_size)))
+        self.context_factory = context_factory
+        self.configured = (
+            longbridge_intraday_configured() if configured is None else bool(configured)
+        )
+        self._context: Any = None
+
+    def fetch(
+        self, symbols: Sequence[str], *, now: Optional[datetime] = None
+    ) -> Dict[str, RealtimeQuote]:
+        fetched_at = now or datetime.now(SHANGHAI_TZ)
+        canonical = list(
+            dict.fromkeys(
+                canonical_symbol(symbol)
+                for symbol in symbols
+                if canonical_symbol(symbol).startswith("HK")
+            )
+        )
+        if not canonical:
+            return {}
+        if not self.configured:
+            return {
+                symbol: RealtimeQuote(
+                    symbol=symbol,
+                    fetched_at=_iso(fetched_at),
+                    is_stale=True,
+                    source="longbridge_unconfigured",
+                )
+                for symbol in canonical
+            }
+        try:
+            if self._context is None:
+                self._context = self.context_factory()
+            results: Dict[str, RealtimeQuote] = {}
+            for offset in range(0, len(canonical), self.chunk_size):
+                chunk = canonical[offset : offset + self.chunk_size]
+                records = self._context.quote(
+                    [to_longbridge_symbol(symbol) for symbol in chunk]
+                )
+                results.update(
+                    parse_longbridge_batch(
+                        records,
+                        chunk,
+                        fetched_at=fetched_at,
+                        freshness_seconds=self.freshness_seconds,
+                    )
+                )
+            return results
+        except Exception as exc:
+            # Keep the Tencent fallback available, but do not treat its delayed
+            # HK quote as a tradeable price.  Do not log credential values.
+            print(
+                "Longbridge 港股批量行情失败，保留严格降级："
+                f"{type(exc).__name__}",
+                file=sys.stderr,
+            )
+            self._context = None
+            return {
+                symbol: RealtimeQuote(
+                    symbol=symbol,
+                    fetched_at=_iso(fetched_at),
+                    is_stale=True,
+                    source="longbridge_batch_error",
+                )
+                for symbol in canonical
+            }
+
+
+class DecisionQuoteFetcher:
+    """Tencent baseline plus authenticated Longbridge upgrades for HK quotes."""
+
+    min_interval_seconds = 30.0
+
+    def __init__(
+        self,
+        *,
+        freshness_seconds: float = DEFAULT_FRESHNESS_SECONDS,
+        tencent_fetcher: Optional[TencentBatchQuoteFetcher] = None,
+        longbridge_fetcher: Optional[LongbridgeBatchQuoteFetcher] = None,
+    ):
+        self.tencent_fetcher = tencent_fetcher or TencentBatchQuoteFetcher(
+            freshness_seconds=freshness_seconds
+        )
+        self.longbridge_fetcher = longbridge_fetcher or LongbridgeBatchQuoteFetcher(
+            freshness_seconds=freshness_seconds
+        )
+        self.min_interval_seconds = max(
+            float(getattr(self.tencent_fetcher, "min_interval_seconds", 0.0)),
+            float(getattr(self.longbridge_fetcher, "min_interval_seconds", 0.0)),
+        )
+        self.last_diagnostics: Dict[str, Any] = {}
+
+    def fetch(
+        self, symbols: Sequence[str], *, now: Optional[datetime] = None
+    ) -> Dict[str, RealtimeQuote]:
+        fetched_at = now or datetime.now(SHANGHAI_TZ)
+        canonical = list(dict.fromkeys(canonical_symbol(symbol) for symbol in symbols))
+        results = self.tencent_fetcher.fetch(canonical, now=fetched_at)
+        hk_symbols = [symbol for symbol in canonical if symbol.startswith("HK")]
+        upgraded = 0
+        longbridge = self.longbridge_fetcher.fetch(hk_symbols, now=fetched_at)
+        for symbol in hk_symbols:
+            candidate = longbridge.get(symbol)
+            if candidate is None or candidate.price is None or candidate.is_stale:
+                continue
+            baseline = results.get(symbol)
+            if baseline is not None and not candidate.name:
+                candidate = replace(candidate, name=baseline.name)
+            results[symbol] = candidate
+            upgraded += 1
+        self.last_diagnostics = {
+            "baseline": "tencent_batch",
+            "hk_realtime_source": "longbridge_batch",
+            "longbridge_configured": bool(self.longbridge_fetcher.configured),
+            "hk_requested": len(hk_symbols),
+            "hk_fresh_upgraded": upgraded,
+            "strict_no_delayed_trade_decisions": True,
+        }
         return results
 
 
@@ -1778,15 +2181,31 @@ def clear_removed_adaptive_plan_reviews(
 
 
 _TRADE_ACTION_LABELS = {
-    "buy_0_25": "模拟买入0.25成",
-    "buy_0_5": "模拟买入0.5成",
-    "add_0_25": "模拟加仓0.25成",
-    "add_0_5": "模拟加仓0.5成",
-    "reduce_1_4": "模拟减仓1/4",
-    "reduce_1_3": "模拟减仓1/3",
-    "reduce_1_2": "模拟减仓1/2",
-    "clear": "模拟清仓",
+    "buy_0_25": "建议买入0.25成",
+    "buy_0_5": "建议买入0.5成",
+    "add_0_25": "建议加仓0.25成",
+    "add_0_5": "建议加仓0.5成",
+    "reduce_1_4": "建议减仓1/4",
+    "reduce_1_3": "建议减仓1/3",
+    "reduce_1_2": "建议减仓1/2",
+    "clear": "建议清仓",
 }
+
+_SELL_ACTION_FRACTIONS = {
+    "reduce_1_4": 0.25,
+    "reduce_1_3": 1.0 / 3.0,
+    "reduce_1_2": 0.5,
+    "clear": 1.0,
+}
+
+
+def _decision_valid_until(now: datetime, symbol: str) -> str:
+    close_time = (
+        datetime_time(16, 0)
+        if symbol.startswith("HK")
+        else datetime_time(15, 0)
+    )
+    return _iso(datetime.combine(now.date(), close_time, tzinfo=SHANGHAI_TZ))
 
 
 def _shadow_strategy_quantity(
@@ -2036,6 +2455,7 @@ def process_actionable_decisions(
         conclusion = "不操作 / 继续持有"
         position_change = "0"
         basis = "当前证据不足以改变模拟仓位。"
+        invalidation = "出现更新且可靠的关键位或研究计划后重新评估。"
         severity = str(raw_event.get("severity") or "info")
 
         if price is None or data_quality not in {"fresh_l1", "high", "medium"}:
@@ -2052,16 +2472,19 @@ def process_actionable_decisions(
                 continue
             if price <= key_level * 0.98 or severity == "critical":
                 action = "clear"
-                conclusion = "模拟清仓"
+                conclusion = "建议止损清仓"
                 position_change = "-100%"
             else:
                 action = "reduce_1_3"
-                conclusion = "模拟减仓1/3"
+                conclusion = "建议止损减仓1/3"
                 position_change = "-1/3"
             basis = "价格有效跌破系统已有可靠止损参考位，既有风险确认条件已满足。"
+            invalidation = (
+                f"价格重新站回 {key_level * 1.005:.3f} 后撤销本止损建议。"
+            )
             next_trigger = (
-                f"若继续跌至 {key_level * 0.98:.3f} 或风险升级则模拟清仓；"
-                f"重新站回 {key_level * 1.005:.3f} 则撤销本风险预案。"
+                f"若继续跌至 {key_level * 0.98:.3f} 或风险升级则建议清仓；"
+                f"{invalidation}"
             )
         elif condition == "target_reached":
             key_level = _positive_float(reference.target_price) or _positive_float(
@@ -2072,16 +2495,19 @@ def process_actionable_decisions(
                 continue
             if price >= key_level * 1.05:
                 action = "reduce_1_2"
-                conclusion = "模拟减仓1/2"
+                conclusion = "建议止盈减仓1/2"
                 position_change = "-1/2"
             else:
                 action = "reduce_1_4"
-                conclusion = "模拟减仓1/4"
+                conclusion = "建议止盈减仓1/4"
                 position_change = "-1/4"
             basis = "价格有效到达系统已有可靠目标参考位，按既定计划锁定部分收益。"
+            invalidation = (
+                f"价格回落至 {key_level * 0.995:.3f} 下方后撤销本止盈建议。"
+            )
             next_trigger = (
-                f"若继续有效突破 {key_level * 1.05:.3f} 则升级为模拟减仓1/2；"
-                f"回落至 {key_level * 0.995:.3f} 下方则撤销本止盈预案。"
+                f"若继续有效突破 {key_level * 1.05:.3f} 则升级为建议减仓1/2；"
+                f"{invalidation}"
             )
         elif condition == "adaptive_entry_review":
             key_level = _positive_float(raw_payload.get("entry_low"))
@@ -2102,15 +2528,47 @@ def process_actionable_decisions(
                 market_costs=(raw_payload.get("market_costs") or {}),
             )
             if affordable_action is None:
-                action = "observe"
-                conclusion = "进入观察，等待资金条件"
-                position_change = "0"
-                basis = "候选已通过扣费后的风险收益门槛并进入可靠买入区，但同币种现金不足以覆盖最小模拟仓位和成本。"
+                observe_fingerprint = hashlib.sha256(
+                    json.dumps(
+                        {
+                            "condition": condition,
+                            "action": "observe",
+                            "plan_fingerprint": raw_payload.get(
+                                "plan_fingerprint"
+                            ),
+                        },
+                        sort_keys=True,
+                    ).encode("utf-8")
+                ).hexdigest()[:20]
+                observe_state = (
+                    state.setdefault("decision_notifications", {})
+                    .setdefault(symbol, {})
+                    .setdefault(condition, {})
+                )
+                observe_state.update(
+                    {
+                        "status": "active",
+                        "fingerprint": observe_fingerprint,
+                        "last_action": "observe",
+                        "source_event_id": raw_event.get("event_id"),
+                        "source_payload": dict(raw_payload),
+                        "updated_at": _iso(now),
+                    }
+                )
+                _mark_raw_decision(
+                    raw_event,
+                    result="no_operation_insufficient_cash_for_explicit_buy",
+                )
+                continue
             else:
                 action = affordable_action
                 conclusion = _TRADE_ACTION_LABELS[action]
                 position_change = "+5% NAV" if action == "buy_0_5" else "+2.5% NAV"
                 basis = "候选已进入可信计划区，并通过交易成本、数据质量和风险收益门槛。"
+            invalidation = (
+                f"价格跌破 {stop_loss:.3f}、离开 {key_level:.3f}–{entry_high:.3f} "
+                f"买入区或超过 {target:.3f} 后，本建议失效。"
+            )
             next_trigger = (
                 f"仅在 {key_level:.3f}–{entry_high:.3f} 内维持预案；"
                 f"跌破 {stop_loss:.3f} 或超过 {target:.3f} 时取消追入。"
@@ -2123,12 +2581,15 @@ def process_actionable_decisions(
                 _mark_raw_decision(raw_event, result="no_operation_no_shadow_holding_or_level")
                 continue
             action = "reduce_1_2"
-            conclusion = "模拟减仓1/2"
+            conclusion = "建议风险减仓1/2"
             position_change = "-1/2"
             basis = "模拟持仓触及已落盘候选计划风险位，确定性风险门已触发。"
+            invalidation = (
+                f"价格重新站回 {key_level * 1.005:.3f} 后撤销剩余减仓建议。"
+            )
             next_trigger = (
-                f"若继续跌破 {key_level * 0.98:.3f} 则模拟清仓；"
-                f"重新站回 {key_level * 1.005:.3f} 则撤销剩余减仓预案。"
+                f"若继续跌破 {key_level * 0.98:.3f} 则建议清仓；"
+                f"{invalidation}"
             )
         else:
             _mark_raw_decision(raw_event, result="no_operation_unsupported_event")
@@ -2216,9 +2677,14 @@ def process_actionable_decisions(
                 "kind": "trade_decision",
                 "conclusion": conclusion,
                 "action": _TRADE_ACTION_LABELS.get(action, "不操作 / 等待条件"),
+                "action_code": action,
                 "position_change": position_change,
                 "basis": basis,
                 "key_level": key_level,
+                "trigger_price": key_level,
+                "order_price": price,
+                "invalidation": invalidation,
+                "valid_until": _decision_valid_until(now, symbol),
                 "next_trigger": next_trigger,
                 "data_quality": data_quality,
                 "quote_time": quote_time,
@@ -2323,10 +2789,12 @@ def process_watch_account_decisions(
         reference = levels.get(symbol, ReferenceLevels())
         key_level: Optional[float] = None
         action = "不操作"
+        action_code = "hold"
         position_change = "0"
         conclusion = "继续持有"
         basis = "没有新的可靠条件改变当前人工复核结论。"
         next_trigger = "等待新的可靠关键位或研究计划。"
+        invalidation = "出现新的可靠关键位或研究计划后重新评估。"
 
         if transition == "cleared":
             if condition_state.get("status") != "active":
@@ -2334,23 +2802,15 @@ def process_watch_account_decisions(
             conclusion = "风险解除，继续持有" if status != "candidate" else "风险解除，继续观察"
             basis = "此前已提醒的风险条件已由新鲜行情确认解除。"
             action = "不操作"
+            action_code = "hold"
         elif condition == "adaptive_entry_review":
-            if status != "candidate":
-                continue
-            low = _positive_float(raw_payload.get("entry_low"))
-            high = _positive_float(raw_payload.get("entry_high"))
-            stop = _positive_float(raw_payload.get("stop_loss"))
-            target = _positive_float(raw_payload.get("target_price"))
-            if not all((low, high, stop, target)):
-                continue
-            key_level = low
-            conclusion = "候选观察，进入计划买入区"
-            action = "继续观察"
-            basis = "候选首次进入已有可信计划的可操作观察区；尚未确认实际买入。"
-            next_trigger = (
-                f"仅在 {low:.3f}–{high:.3f} 内保持候选；"
-                f"跌破 {stop:.3f} 或超过 {target:.3f} 时取消候选预案。"
+            # A watch-only candidate has neither durable cash nor an approved
+            # position size.  Entering a zone is therefore not an executable
+            # buy decision and must remain in the audit ledger only.
+            event.setdefault("watch_decision_results", {})[layer] = (
+                "no_operation_no_explicit_buy_size"
             )
+            continue
         elif status == "candidate":
             # A not-yet-held candidate can never receive a reduce/clear alert.
             continue
@@ -2361,21 +2821,27 @@ def process_watch_account_decisions(
             if key_level is None:
                 continue
             if price <= key_level * 0.98 or event.get("severity") == "critical":
-                conclusion = "人工复核清仓"
-                action = "人工复核清仓"
-                position_change = "人工复核 -100%"
+                conclusion = "建议止损清仓"
+                action = "建议卖出全部持仓"
+                action_code = "clear"
+                position_change = "-100%"
             elif condition == "adaptive_risk_review":
-                conclusion = "人工复核减仓1/2"
-                action = "人工复核减仓1/2"
-                position_change = "人工复核 -1/2"
+                conclusion = "建议风险减仓1/2"
+                action = "建议卖出持仓1/2"
+                action_code = "reduce_1_2"
+                position_change = "-1/2"
             else:
-                conclusion = "人工复核减仓1/3"
-                action = "人工复核减仓1/3"
-                position_change = "人工复核 -1/3"
+                conclusion = "建议止损减仓1/3"
+                action = "建议卖出持仓1/3"
+                action_code = "reduce_1_3"
+                position_change = "-1/3"
             basis = "价格有效跌破已有可靠风险参考位，需要人工复核持仓风险。"
+            invalidation = (
+                f"价格重新站回 {key_level * 1.005:.3f} 后撤销本卖出建议。"
+            )
             next_trigger = (
                 f"若继续跌至 {key_level * 0.98:.3f} 则风险升级；"
-                f"重新站回 {key_level * 1.005:.3f} 则撤销本预案。"
+                f"{invalidation}"
             )
         elif condition == "target_reached":
             key_level = _positive_float(reference.target_price) or _positive_float(
@@ -2384,17 +2850,22 @@ def process_watch_account_decisions(
             if key_level is None:
                 continue
             if price >= key_level * 1.05:
-                conclusion = "人工复核减仓1/2"
-                action = "人工复核减仓1/2"
-                position_change = "人工复核 -1/2"
+                conclusion = "建议止盈减仓1/2"
+                action = "建议卖出持仓1/2"
+                action_code = "reduce_1_2"
+                position_change = "-1/2"
             else:
-                conclusion = "人工复核减仓1/4"
-                action = "人工复核减仓1/4"
-                position_change = "人工复核 -1/4"
+                conclusion = "建议止盈减仓1/4"
+                action = "建议卖出持仓1/4"
+                action_code = "reduce_1_4"
+                position_change = "-1/4"
             basis = "价格到达已有可靠目标参考位，需要人工复核是否锁定部分收益。"
+            invalidation = (
+                f"价格回落至 {key_level * 0.995:.3f} 下方后撤销本止盈建议。"
+            )
             next_trigger = (
                 f"继续有效突破 {key_level * 1.05:.3f} 则风险收益结论升级；"
-                f"回落至 {key_level * 0.995:.3f} 下方则撤销本预案。"
+                f"{invalidation}"
             )
         else:
             continue
@@ -2449,9 +2920,14 @@ def process_watch_account_decisions(
                 "holding_status": status,
                 "conclusion": conclusion,
                 "action": action,
+                "action_code": action_code,
                 "position_change": position_change,
                 "basis": basis,
                 "key_level": key_level,
+                "trigger_price": key_level,
+                "order_price": price,
+                "invalidation": invalidation,
+                "valid_until": _decision_valid_until(now, symbol),
                 "next_trigger": next_trigger,
                 "data_quality": data_quality,
                 "quote_time": raw_payload.get("quote_time"),
@@ -2477,7 +2953,88 @@ def process_watch_account_decisions(
     return created
 
 
-def render_outbox(events: Sequence[Mapping[str, Any]], now: datetime) -> str:
+def _delivery_position_quantities(
+    shadow_state: Optional[Mapping[str, Any]],
+    private_watch_config: Optional[Mapping[str, Any]],
+) -> Dict[str, Dict[str, float]]:
+    """Build a transient quantity index that must never enter session state."""
+
+    result: Dict[str, Dict[str, float]] = {}
+    if shadow_state:
+        raw_positions = (
+            shadow_state.get("strategy_shadow_portfolio", {}).get("positions", {})
+        )
+        if isinstance(raw_positions, Mapping):
+            result["PRIMARY_PORTFOLIO"] = {
+                str(symbol): float(position.get("quantity"))
+                for symbol, position in raw_positions.items()
+                if isinstance(position, Mapping)
+                and _positive_float(position.get("quantity")) is not None
+            }
+    account_layers = {
+        "secondary_account": "SECONDARY_ACCOUNT_WATCH",
+        "sister_managed": "SISTER_MANAGED_WATCH",
+    }
+    for account, layer in account_layers.items():
+        account_payload = (private_watch_config or {}).get(account) or {}
+        positions = account_payload.get("positions") or []
+        if not isinstance(positions, list):
+            continue
+        layer_positions: Dict[str, float] = {}
+        for position in positions:
+            if not isinstance(position, Mapping):
+                continue
+            quantity = _positive_float(position.get("quantity"))
+            if quantity is None:
+                continue
+            layer_positions[str(position.get("symbol") or "")] = quantity
+        if layer_positions:
+            result[layer] = layer_positions
+    return result
+
+
+def _format_share_quantity(value: float) -> str:
+    return f"{value:.0f}" if float(value).is_integer() else f"{value:g}"
+
+
+def _suggested_quantity_text(
+    event: Mapping[str, Any],
+    position_quantities: Optional[Mapping[str, Mapping[str, float]]],
+) -> str:
+    payload = event.get("payload") or {}
+    action_code = str(payload.get("action_code") or "")
+    layer = str(payload.get("account_layer") or "PRIMARY_PORTFOLIO")
+    symbol = str(event.get("symbol") or "")
+    held_quantity = _positive_float(
+        (position_quantities or {}).get(layer, {}).get(symbol)
+    )
+    fraction = _SELL_ACTION_FRACTIONS.get(action_code)
+    if fraction is not None:
+        if held_quantity is not None:
+            suggested = (
+                held_quantity
+                if fraction >= 1.0
+                else float(math.floor(held_quantity * fraction))
+            )
+            if suggested >= 1:
+                return f"{_format_share_quantity(suggested)} 股"
+        if fraction >= 1.0:
+            return "全部持仓"
+        denominator = round(1.0 / fraction)
+        return f"当前持仓的 1/{denominator}"
+    if action_code in {"buy_0_25", "add_0_25"}:
+        return "策略净值的 2.5%（股数按下一笔新鲜报价计算）"
+    if action_code in {"buy_0_5", "add_0_5"}:
+        return "策略净值的 5%（股数按下一笔新鲜报价计算）"
+    return "0 股"
+
+
+def render_outbox(
+    events: Sequence[Mapping[str, Any]],
+    now: datetime,
+    *,
+    position_quantities: Optional[Mapping[str, Mapping[str, float]]] = None,
+) -> str:
     labels = {
         "sharp_drop": "日内跌幅风险",
         "sharp_rise": "日内快速上涨",
@@ -2490,12 +3047,12 @@ def render_outbox(events: Sequence[Mapping[str, Any]], now: datetime) -> str:
         "adaptive_risk_review": "模拟持仓风险复核",
     }
     lines = [
-        "# 盘中模拟决策提醒",
+        "# 盘中交易决策提醒",
         "",
         f"- 时间：{_iso(now)}",
         f"- 新事件：{len(events)}",
         "",
-        "> 仅供模拟和人工复核，不构成交易指令；系统不会连接券商或自动下单。",
+        "> 仅推送具有可靠行情、持仓和关键位依据的明确建议；系统不会自动下单。",
         "",
     ]
     for event in events:
@@ -2510,7 +3067,8 @@ def render_outbox(events: Sequence[Mapping[str, Any]], now: datetime) -> str:
             account_prefix = str(payload.get("account_prefix") or "")
             if account_prefix:
                 display = f"{account_prefix}{display}"
-            key_level = _positive_float(payload.get("key_level"))
+            trigger_price = _positive_float(payload.get("trigger_price"))
+            order_price = _positive_float(payload.get("order_price"))
             lines.extend(
                 [
                     f"## {display}｜{payload.get('conclusion') or '等待条件'}",
@@ -2522,13 +3080,24 @@ def render_outbox(events: Sequence[Mapping[str, Any]], now: datetime) -> str:
                         else "- 当前涨跌：无可靠数据"
                     ),
                     f"- 建议动作：{payload.get('action') or '不操作'}",
-                    f"- 模拟仓位变化：{payload.get('position_change') or '0'}",
+                    (
+                        "- 建议数量："
+                        + _suggested_quantity_text(event, position_quantities)
+                    ),
+                    f"- 建议仓位变化：{payload.get('position_change') or '0'}",
                     f"- 主要依据：{payload.get('basis') or event.get('message')}",
                     (
-                        f"- 关键价位：{key_level:.3f}"
-                        if key_level is not None
-                        else "- 关键价位：没有可用的可靠关键位"
+                        f"- 触发价：{trigger_price:.3f}"
+                        if trigger_price is not None
+                        else "- 触发价：没有可用的可靠关键位"
                     ),
+                    (
+                        f"- 委托参考价：{order_price:.3f}"
+                        if order_price is not None
+                        else "- 委托参考价：等待下一笔新鲜报价"
+                    ),
+                    f"- 失效条件：{payload.get('invalidation') or '等待新的可靠条件'}",
+                    f"- 有效期：{payload.get('valid_until') or '仅限本交易日'}",
                     f"- 下一触发条件：{payload.get('next_trigger') or '等待新的可靠条件'}",
                     (
                         f"- 数据质量：{payload.get('data_quality') or 'unknown'}；"
@@ -2536,7 +3105,7 @@ def render_outbox(events: Sequence[Mapping[str, Any]], now: datetime) -> str:
                     ),
                     f"- 信号号：`{payload.get('signal_id') or event.get('event_id')}`",
                     "",
-                    "仅供模拟和人工复核，不构成交易指令；系统不会连接券商或自动下单。",
+                    "这是研究系统给出的明确操作建议；下单前仍需人工确认，系统不会自动连接券商。",
                     "",
                 ]
             )
@@ -2582,6 +3151,7 @@ def flush_outbox(
     now: datetime,
     sender: Callable[..., bool] = _default_notification_sender,
     event_predicate: Optional[Callable[[Mapping[str, Any]], bool]] = None,
+    position_quantities: Optional[Mapping[str, Mapping[str, float]]] = None,
 ) -> int:
     _suppress_legacy_raw_outbox(state, now=now)
     # Defensive restart guard: an event retained by a prior failed delivery
@@ -2597,7 +3167,11 @@ def flush_outbox(
     if not due:
         return 0
 
-    content = render_outbox(due, now)
+    content = render_outbox(
+        due,
+        now,
+        position_quantities=position_quantities,
+    )
     account_prefixes = {
         str((event.get("payload") or {}).get("account_prefix") or "")
         for event in due
@@ -2617,7 +3191,7 @@ def flush_outbox(
         sent = bool(
             sender(
                 title=(
-                    f"{title_prefix}盘中模拟决策提醒 - "
+                    f"{title_prefix}盘中交易决策提醒 - "
                     f"{now.strftime('%m-%d %H:%M')}"
                 ),
                 content=content,
@@ -2778,6 +3352,7 @@ def run_cycle(
         Callable[[MutableMapping[str, Any], Mapping[str, Any]], Mapping[str, Any]]
     ] = None,
     shadow_freshness_seconds: float = DEFAULT_FRESHNESS_SECONDS,
+    private_watch_config: Optional[Mapping[str, Any]] = None,
 ) -> CycleResult:
     ledger_start = len(state.setdefault("event_ledger", []))
     clear_removed_adaptive_plan_reviews(
@@ -2809,6 +3384,11 @@ def run_cycle(
         )
         for symbol in canonical
     ]
+    fetcher_diagnostics = getattr(fetcher, "last_diagnostics", None)
+    if isinstance(fetcher_diagnostics, Mapping):
+        state.setdefault("provider", {})["quote_fetcher"] = dict(
+            fetcher_diagnostics
+        )
     primary_valid = [
         quote
         for quote in quotes
@@ -3096,7 +3676,15 @@ def run_cycle(
     provider["last_checked_at"] = _iso(now)
     state["updated_at"] = _iso(now)
 
-    notified = flush_outbox(state, now=now, sender=notification_sender)
+    notified = flush_outbox(
+        state,
+        now=now,
+        sender=notification_sender,
+        position_quantities=_delivery_position_quantities(
+            shadow_state,
+            private_watch_config,
+        ),
+    )
     provider_minimum = max(0.0, float(getattr(fetcher, "min_interval_seconds", 0.0)))
     if fresh_risk_or_near:
         # Partial provider degradation must not slow symbols whose own fresh
@@ -3138,6 +3726,7 @@ def render_session_report(
     provider_status = provider_status or {}
     reference = provider_status.get("reference_levels") or {}
     level2 = provider_status.get("level2") or {}
+    quote_fetcher = provider_status.get("quote_fetcher") or {}
     late_schedule = provider_status.get("late_schedule") or {}
     lines = [
         "# 分钟级盘中模拟监控",
@@ -3159,7 +3748,8 @@ def render_session_report(
         "",
         "## 数据能力说明",
         "",
-        "- 实时价格：腾讯批量基础行情；提供方时间戳缺失或超过 90 秒时不触发交易类提醒。",
+        "- 实时价格：A股使用腾讯批量基础行情；港股优先使用已授权的 Longbridge L1，腾讯仅作严格降级。",
+        "- 行情时效：提供方时间戳缺失或超过配置的新鲜度阈值时，不生成交易建议。",
         "- 成交量：仅在基础行情字段可用时记录。",
         "- 分时 K 线：本监控尚未采集，不会声称已分析。",
         (
@@ -3177,6 +3767,14 @@ def render_session_report(
         ),
         "- 数据等级护栏：L1 永远不会标记或展示为 Level-2。",
     ]
+    if quote_fetcher:
+        lines.append(
+            "- 港股实时源状态："
+            f"Longbridge "
+            f"{'已配置' if quote_fetcher.get('longbridge_configured') else '未配置'}；"
+            f"最近一轮新鲜覆盖 {quote_fetcher.get('hk_fresh_upgraded', 0)}/"
+            f"{quote_fetcher.get('hk_requested', 0)}。"
+        )
     level2_statuses = level2.get("statuses") or {}
     if isinstance(level2_statuses, Mapping) and level2_statuses:
         lines.append(
@@ -3344,10 +3942,11 @@ def run_session(
         raise SessionError("late_start_policy 必须是 error 或 skip")
 
     started = clock().astimezone(SHANGHAI_TZ)
+    private_watch_config: Dict[str, Any] = {}
     try:
-        # Validate the optional Secret without logging or persisting its
-        # contents. Intraday decisions use only public held/candidate roles.
-        load_private_watch_config()
+        # Keep private sizes in memory only so a Push can state a concrete
+        # quantity.  They are never copied into state, reports or artifacts.
+        private_watch_config = load_private_watch_config()
     except ValueError:
         # A malformed optional side-account payload must never block PRIMARY.
         # Ignore its private fields without echoing any payload value.
@@ -3633,7 +4232,7 @@ def run_session(
             )
         provider["reference_alert_active"] = False
 
-    quote_fetcher = fetcher or TencentBatchQuoteFetcher(
+    quote_fetcher = fetcher or DecisionQuoteFetcher(
         freshness_seconds=freshness_seconds
     )
     depth_adapter = level2_adapter or Level2DataAdapter()
@@ -3745,6 +4344,7 @@ def run_session(
                     record_shadow_signal if shadow_state is not None else None
                 ),
                 shadow_freshness_seconds=freshness_seconds,
+                private_watch_config=private_watch_config,
             )
             quote_cycles += 1
             created_total += last_cycle.new_event_count
@@ -3754,7 +4354,13 @@ def run_session(
             # Markets are closed/lunching/unknown.  Pending outbox events are
             # still retried without fetching prices.
             notified_total += flush_outbox(
-                state, now=now, sender=notification_sender
+                state,
+                now=now,
+                sender=notification_sender,
+                position_quantities=_delivery_position_quantities(
+                    shadow_state,
+                    private_watch_config,
+                ),
             )
             state["updated_at"] = _iso(now)
 
