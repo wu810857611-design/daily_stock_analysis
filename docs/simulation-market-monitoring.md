@@ -18,6 +18,8 @@
 - `02-market-scan.yml`：北京时间 10:30、14:30 和 19:15 分层扫描 A 股全市场与
   港股通成分。全市场阶段不调用模型；只对规则短名单加载历史，再让通义千问和
   DeepSeek 独立复核。
+- `04-longbridge-preflight.yml`：手动、只读检查 Longbridge OAuth 行情包与港股
+  提供方时间戳；该工作流不注入 PushPlus，不创建交易上下文，也不下单。
 
 外部触发和 GitHub runner 仍可能排队，因此这些时间不是交易所级低延迟保证。任何
 超过
@@ -173,6 +175,43 @@ Level-2 只允许使用交易所授权、持牌数据商或用户本人账户已
 港股实时监控也兼容 Legacy `LONGBRIDGE_APP_KEY`、`LONGBRIDGE_APP_SECRET`、
 `LONGBRIDGE_ACCESS_TOKEN` 三件套；OAuth 与 Legacy 均未配置或认证失败时，港股行情
 会严格降级并停止交易类建议，不会把腾讯约 15 分钟延迟行情伪装成实时数据。
+
+### OAuth 显示 `HK_Basic` / 行情恰好延迟 15 分钟
+
+Longbridge 在 2026-07 修复过一次 OAuth 行情权限绑定问题。服务端修复后，旧 OAuth
+缓存不能只等待 refresh token 自动刷新，必须在可交互电脑上重新授权一次。仓库的
+辅助脚本会先把旧缓存移动到带时间戳的备份，再打开官方授权流程：
+
+```bash
+python -m pip install 'longbridge>=4.0.5,<5'
+python scripts/generate_longbridge_oauth_token.py \
+  --client-id "$LONGBRIDGE_OAUTH_CLIENT_ID" \
+  --force-reauthorize \
+  --require-hk-realtime \
+  --verify-symbol 700.HK
+```
+
+成功输出必须包含港股个股实时包（通常为 `HK_L1_OpenAPI`）；只有 `HK_Basic` 或只有
+恒生指数实时包均不通过。随后把新生成的
+`~/.longbridge/openapi/tokens/<client_id>` 重新 base64 编码，覆盖 GitHub
+Environment `STOCK_LIST` 中原有的 `LONGBRIDGE_OAUTH_TOKEN_CACHE_B64` Secret。
+Linux 可执行：
+
+```bash
+LB_TOKEN_CACHE="$HOME/.longbridge/openapi/tokens/$LONGBRIDGE_OAUTH_CLIENT_ID"
+base64 -w 0 "$LB_TOKEN_CACHE"
+```
+
+macOS 可执行 `base64 < "$LB_TOKEN_CACHE" | tr -d '\n'`。不要把输出写入仓库、
+日志或 artifact。更新 Secret 后，先手动运行
+`Longbridge 港股实时行情只读预检`：`permission` 模式可在午休/休市时验证权限包；
+`live` 模式须在港股连续交易时段运行，并要求每只测试标的的提供方时间戳不超过
+配置的新鲜度阈值。两个模式都不会发送 PushPlus。
+
+如果强制重新授权后仍只有 `HK_Basic`，再到 Longbridge Developer Center 检查
+OpenAPI（不是 App/PC/Web）的港股行情权限；账户确有实时包却未下发时，应把
+`quote_package_details()` 的非敏感包名和 member ID 私下提供给 Longbridge 支持，
+而不是通过调大 `INTRADAY_QUOTE_FRESHNESS_SECONDS` 绕过。
 
 模型密钥和 PushPlus Token 使用既有 `LLM_DASHSCOPE_API_KEY`、
 `LLM_DEEPSEEK_API_KEY` 与 `PUSHPLUS_TOKEN` secrets。停用新增能力时，在

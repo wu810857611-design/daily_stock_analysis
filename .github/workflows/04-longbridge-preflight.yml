@@ -1,0 +1,85 @@
+name: Longbridge 港股实时行情只读预检
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'permission 可在休市时验权限；live 仅在港股连续交易时段验时间戳'
+        required: true
+        default: permission
+        type: choice
+        options:
+          - permission
+          - live
+      symbols:
+        description: '用于预检的高流动性港股代码，逗号分隔'
+        required: true
+        default: '700.HK,9988.HK'
+        type: string
+      freshness_seconds:
+        description: 'live 模式允许的最大行情年龄（秒）'
+        required: true
+        default: '90'
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  preflight:
+    runs-on: ubuntu-latest
+    environment: STOCK_LIST
+    timeout-minutes: 10
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v5
+
+      - name: 设置 Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: 安装 Longbridge SDK
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install 'longbridge>=4.0.5,<5'
+
+      - name: 只读检查港股行情权限与提供方时间戳
+        shell: bash
+        env:
+          PREFLIGHT_MODE: ${{ inputs.mode }}
+          PREFLIGHT_SYMBOLS: ${{ inputs.symbols }}
+          PREFLIGHT_FRESHNESS_SECONDS: ${{ inputs.freshness_seconds }}
+          LONGBRIDGE_OAUTH_CLIENT_ID: ${{ vars.LONGBRIDGE_OAUTH_CLIENT_ID || secrets.LONGBRIDGE_OAUTH_CLIENT_ID }}
+          LONGBRIDGE_OAUTH_TOKEN_CACHE_B64: ${{ secrets.LONGBRIDGE_OAUTH_TOKEN_CACHE_B64 }}
+          LONGBRIDGE_APP_KEY: ${{ secrets.LONGBRIDGE_APP_KEY }}
+          LONGBRIDGE_APP_SECRET: ${{ secrets.LONGBRIDGE_APP_SECRET }}
+          LONGBRIDGE_ACCESS_TOKEN: ${{ secrets.LONGBRIDGE_ACCESS_TOKEN }}
+          LONGBRIDGE_REGION: ${{ vars.LONGBRIDGE_REGION || secrets.LONGBRIDGE_REGION }}
+          LONGBRIDGE_HTTP_URL: ${{ vars.LONGBRIDGE_HTTP_URL || secrets.LONGBRIDGE_HTTP_URL }}
+          LONGBRIDGE_QUOTE_WS_URL: ${{ vars.LONGBRIDGE_QUOTE_WS_URL || secrets.LONGBRIDGE_QUOTE_WS_URL }}
+          LONGBRIDGE_TRADE_WS_URL: ${{ vars.LONGBRIDGE_TRADE_WS_URL || secrets.LONGBRIDGE_TRADE_WS_URL }}
+          LONGBRIDGE_PRINT_QUOTE_PACKAGES: 'false'
+        run: |
+          set -euo pipefail
+          mkdir -p reports
+          MODE_ARGS=()
+          if [ "$PREFLIGHT_MODE" = "permission" ]; then
+            MODE_ARGS+=(--permission-only)
+          fi
+          python3 scripts/check_longbridge_realtime.py \
+            --symbols "$PREFLIGHT_SYMBOLS" \
+            --freshness-seconds "$PREFLIGHT_FRESHNESS_SECONDS" \
+            --json-output reports/longbridge_preflight.json \
+            "${MODE_ARGS[@]}"
+
+      - name: 保存非敏感预检产物
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: longbridge-realtime-preflight-${{ github.run_id }}
+          path: reports/longbridge_preflight.json
+          if-no-files-found: warn
+          retention-days: 7
