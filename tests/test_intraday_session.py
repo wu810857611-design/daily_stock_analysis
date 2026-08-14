@@ -104,6 +104,7 @@ class FakeFetcher:
 class FakeLongbridgeFetcher(FakeFetcher):
     min_interval_seconds = 30
     configured = True
+    realtime_entitled = True
 
 
 class FakeClock:
@@ -504,6 +505,39 @@ class AccountWatchLayerTests(unittest.TestCase):
             coverage["SISTER_MANAGED_WATCH"]["drives_primary_degradation"]
         )
 
+    def test_live_hk_snapshot_without_recent_trade_does_not_degrade_primary(self):
+        now = datetime(2026, 8, 10, 10, 0, tzinfo=TZ)
+        state = intraday_session_module._empty_state(now)
+        inactive_snapshot = RealtimeQuote(
+            symbol="HK02522",
+            name="一脉阳光",
+            price=4.82,
+            provider_timestamp=(now - timedelta(minutes=4)).isoformat(),
+            fetched_at=now.isoformat(),
+            stale_seconds=240,
+            provider_snapshot_fresh=True,
+            is_stale=True,
+            source="longbridge_batch",
+        )
+
+        result = run_cycle(
+            symbols=["HK02522"],
+            primary_symbols=["HK02522"],
+            state=state,
+            levels={"HK02522": ReferenceLevels(stop_loss=5.0)},
+            fetcher=FakeFetcher([{"HK02522": inactive_snapshot}]),
+            now=now,
+            min_quote_coverage=1.0,
+            low_coverage_limit=1,
+            notification_sender=lambda **_: True,
+        )
+
+        self.assertEqual(result.valid_quote_count, 1)
+        self.assertEqual(result.coverage, 1.0)
+        self.assertFalse(result.degraded)
+        self.assertEqual(state["outbox"], [])
+        self.assertEqual(state["event_ledger"], [])
+
     def test_side_layer_never_calls_primary_signal_recorder(self):
         now = datetime(2026, 8, 10, 10, 0, tzinfo=TZ)
         state = intraday_session_module._empty_state(now)
@@ -791,6 +825,15 @@ class TencentBatchTests(unittest.TestCase):
         calls = []
 
         class FakeContext:
+            def quote_package_details(self):
+                return [
+                    SimpleNamespace(
+                        key="HK_L1_OpenAPI",
+                        name="LV1 Real-time Quotes",
+                        description="",
+                    )
+                ]
+
             def quote(self, provider_symbols):
                 calls.append(list(provider_symbols))
                 return [
@@ -815,6 +858,45 @@ class TencentBatchTests(unittest.TestCase):
         self.assertEqual([len(chunk) for chunk in calls], [20, 1])
         self.assertEqual(set(result), set(symbols))
         self.assertTrue(all(not item.is_stale for item in result.values()))
+        self.assertTrue(
+            all(item.provider_snapshot_fresh for item in result.values())
+        )
+
+    def test_longbridge_fetcher_fails_closed_without_hk_realtime_package(self):
+        now = datetime(2026, 8, 11, 14, 45, tzinfo=TZ)
+
+        class BasicOnlyContext:
+            def quote_package_details(self):
+                return [
+                    SimpleNamespace(
+                        key="HK_Basic",
+                        name="15-min Delay",
+                        description="",
+                    )
+                ]
+
+            def quote(self, provider_symbols):
+                return [
+                    {
+                        "symbol": symbol,
+                        "last_done": "10.5",
+                        "prev_close": "10",
+                        "timestamp": now - timedelta(minutes=15),
+                    }
+                    for symbol in provider_symbols
+                ]
+
+        fetcher = LongbridgeBatchQuoteFetcher(
+            configured=True,
+            context_factory=BasicOnlyContext,
+        )
+
+        result = fetcher.fetch(["HK00700"], now=now)["HK00700"]
+
+        self.assertFalse(fetcher.realtime_entitled)
+        self.assertFalse(result.provider_snapshot_fresh)
+        self.assertTrue(result.is_stale)
+        self.assertEqual(result.source, "longbridge_realtime_permission_missing")
 
     def test_oauth_cache_secret_accepts_wrapped_base64(self):
         payload = b'{"access_token":"test-only"}'
@@ -894,6 +976,27 @@ class TencentBatchTests(unittest.TestCase):
         self.assertTrue(delayed.is_stale)
         self.assertEqual(delayed.stale_seconds, 900)
 
+    def test_realtime_entitled_snapshot_separates_live_path_from_old_trade(self):
+        now = datetime(2026, 8, 11, 14, 45, tzinfo=TZ)
+        snapshot = parse_longbridge_batch(
+            [
+                {
+                    "symbol": "2522.HK",
+                    "last_done": "4.82",
+                    "prev_close": "4.75",
+                    "timestamp": int((now - timedelta(minutes=4)).timestamp()),
+                }
+            ],
+            ["HK02522"],
+            fetched_at=now,
+            freshness_seconds=90,
+            realtime_entitled=True,
+        )["HK02522"]
+
+        self.assertTrue(snapshot.provider_snapshot_fresh)
+        self.assertTrue(snapshot.is_stale)
+        self.assertEqual(snapshot.stale_seconds, 240)
+
     @unittest.skipUnless(hasattr(time, "tzset"), "requires POSIX timezone support")
     def test_longbridge_naive_sdk_timestamp_uses_runner_local_timezone(self):
         original_tz = os.environ.get("TZ")
@@ -931,6 +1034,7 @@ class TencentBatchTests(unittest.TestCase):
             provider_timestamp=(now - timedelta(seconds=5)).isoformat(),
             fetched_at=now.isoformat(),
             stale_seconds=5,
+            provider_snapshot_fresh=True,
             is_stale=False,
             source="longbridge_batch",
         )
@@ -953,6 +1057,45 @@ class TencentBatchTests(unittest.TestCase):
         self.assertEqual(fetcher.last_diagnostics["hk_provider_timestamped"], 1)
         self.assertFalse(fetcher.last_diagnostics["hk_degraded"])
         self.assertEqual(fetcher.last_diagnostics["hk_degradation_reasons"], {})
+
+    def test_market_aware_fetcher_keeps_live_snapshot_without_recent_trade(self):
+        now = datetime(2026, 8, 11, 14, 45, tzinfo=TZ)
+        delayed_hk = RealtimeQuote(
+            symbol="HK02522",
+            price=4.70,
+            provider_timestamp=(now - timedelta(minutes=15)).isoformat(),
+            is_stale=True,
+            source="tencent_batch",
+        )
+        live_snapshot = RealtimeQuote(
+            symbol="HK02522",
+            price=4.82,
+            provider_timestamp=(now - timedelta(minutes=4)).isoformat(),
+            fetched_at=now.isoformat(),
+            stale_seconds=240,
+            provider_snapshot_fresh=True,
+            is_stale=True,
+            source="longbridge_batch",
+        )
+        fetcher = DecisionQuoteFetcher(
+            tencent_fetcher=FakeFetcher([{"HK02522": delayed_hk}]),
+            longbridge_fetcher=FakeLongbridgeFetcher(
+                [{"HK02522": live_snapshot}]
+            ),
+        )
+
+        result = fetcher.fetch(["HK02522"], now=now)
+
+        self.assertEqual(result["HK02522"], live_snapshot)
+        self.assertTrue(result["HK02522"].is_stale)
+        self.assertEqual(
+            fetcher.last_diagnostics["hk_live_snapshot_covered"], 1
+        )
+        self.assertEqual(fetcher.last_diagnostics["hk_fresh_upgraded"], 0)
+        self.assertEqual(
+            fetcher.last_diagnostics["hk_price_timestamp_stale"], 1
+        )
+        self.assertFalse(fetcher.last_diagnostics["hk_degraded"])
 
     def test_market_aware_fetcher_reports_missing_provider_timestamp(self):
         now = datetime(2026, 8, 11, 14, 45, tzinfo=TZ)
@@ -1449,6 +1592,96 @@ class StateMachineTests(unittest.TestCase):
         self.assertEqual(
             state["event_ledger"][start]["decision_result"],
             "no_operation_price_move_only",
+        )
+
+    def test_signal_time_is_not_before_provider_quote_time(self):
+        now = datetime(2026, 8, 10, 10, 0, tzinfo=TZ)
+        quote_time = now + timedelta(seconds=3)
+        state = load_state_v2(Path("/path/that/does/not/exist"), now=now)
+        state["provider"]["integration_verification"] = {
+            "signal_persist_failures": 0,
+            "signal_persist_failure_reasons": {},
+        }
+        shadow = synthetic_shadow_state()
+        raw_event = {
+            "event_id": "provider-clock-ahead",
+            "symbol": "688333",
+            "name": "铂力特",
+            "condition": "stop_loss",
+            "transition": "activated",
+            "severity": "high",
+            "price": 99,
+            "change_pct": -2,
+            "reference_price": 100,
+            "payload": {
+                "quote_time": quote_time.isoformat(),
+                "data_quality": "fresh_l1",
+            },
+        }
+
+        created = process_actionable_decisions(
+            state,
+            now=now,
+            raw_events=[raw_event],
+            levels={"688333": ReferenceLevels(stop_loss=100)},
+            shadow_state=shadow,
+            signal_recorder=record_shadow_signal,
+        )
+
+        self.assertEqual(created, 1)
+        self.assertEqual(len(shadow["signal_ledger"]), 1)
+        self.assertEqual(
+            shadow["signal_ledger"][0]["signal_time"],
+            quote_time.isoformat(),
+        )
+        self.assertEqual(raw_event["decision_result"], "decision:reduce_1_3")
+        self.assertEqual(
+            state["provider"]["integration_verification"]
+            ["signal_persist_failures"],
+            0,
+        )
+
+    def test_signal_persist_failure_is_counted_for_strict_validation(self):
+        now = datetime(2026, 8, 10, 10, 0, tzinfo=TZ)
+        state = load_state_v2(Path("/path/that/does/not/exist"), now=now)
+        state["provider"]["integration_verification"] = {
+            "signal_persist_failures": 0,
+            "signal_persist_failure_reasons": {},
+        }
+        shadow = synthetic_shadow_state()
+        raw_event = {
+            "event_id": "persist-failure",
+            "symbol": "688333",
+            "name": "铂力特",
+            "condition": "stop_loss",
+            "transition": "activated",
+            "severity": "high",
+            "price": 99,
+            "reference_price": 100,
+            "payload": {
+                "quote_time": now.isoformat(),
+                "data_quality": "fresh_l1",
+            },
+        }
+
+        def failing_recorder(*_args, **_kwargs):
+            raise ValueError("synthetic failure")
+
+        created = process_actionable_decisions(
+            state,
+            now=now,
+            raw_events=[raw_event],
+            levels={"688333": ReferenceLevels(stop_loss=100)},
+            shadow_state=shadow,
+            signal_recorder=failing_recorder,
+        )
+
+        self.assertEqual(created, 0)
+        verification = state["provider"]["integration_verification"]
+        self.assertEqual(verification["signal_persist_failures"], 1)
+        self.assertEqual(
+            verification["signal_persist_failure_reasons"],
+            {"ValueError": 1},
         )
 
     def test_laopu_large_drop_holds_above_stop_and_sells_after_stop_break(self):
@@ -2055,16 +2288,22 @@ class PushOutcomeTests(unittest.TestCase):
                     "calendar_degraded": False,
                     "quote_fetcher": {
                         "longbridge_configured": True,
+                        "hk_realtime_entitled": True,
                         "hk_requested": 6,
+                        "hk_live_snapshot_covered": 6,
                         "hk_fresh_upgraded": 6,
                         "hk_provider_timestamped": 6,
                     },
                     "integration_verification": {
                         "hk_cycles_checked": 1,
+                        "hk_cycles_fully_live": 1,
                         "hk_cycles_fully_fresh": 1,
                         "hk_degraded_cycles": 0,
                         "hk_degradation_reasons": {},
                         "primary_degraded_cycles": 0,
+                        "calendar_degraded_cycles": 0,
+                        "signal_persist_failures": 0,
+                        "hk_price_timestamp_stale_observations": 17,
                     },
                     "pushplus_session": {
                         "configured": True,
@@ -2085,18 +2324,26 @@ class PushOutcomeTests(unittest.TestCase):
                     "degraded": True,
                     "quote_fetcher": {
                         "longbridge_configured": False,
+                        "hk_realtime_entitled": False,
                         "hk_requested": 6,
+                        "hk_live_snapshot_covered": 0,
                         "hk_fresh_upgraded": 0,
                         "hk_provider_timestamped": 0,
                     },
                     "integration_verification": {
                         "hk_cycles_checked": 1,
+                        "hk_cycles_fully_live": 0,
                         "hk_cycles_fully_fresh": 0,
                         "hk_degraded_cycles": 1,
                         "hk_degradation_reasons": {
                             "longbridge_unconfigured": 6
                         },
                         "primary_degraded_cycles": 1,
+                        "calendar_degraded_cycles": 1,
+                        "signal_persist_failures": 1,
+                        "signal_persist_failure_reasons": {
+                            "ExperimentInputError": 1
+                        },
                     },
                     "pushplus_session": {
                         "configured": True,
@@ -2109,7 +2356,14 @@ class PushOutcomeTests(unittest.TestCase):
         )
 
         self.assertFalse(result["passed"])
+        self.assertIn(
+            "longbridge_realtime_permission_unverified", result["issues"]
+        )
         self.assertIn("hk_degradation_observed", result["issues"])
+        self.assertIn(
+            "market_calendar_degradation_observed", result["issues"]
+        )
+        self.assertIn("signal_persist_failure_observed", result["issues"])
         self.assertIn("pushplus_send_failed", result["issues"])
 
 
@@ -2821,9 +3075,17 @@ class SessionLoopTests(unittest.TestCase):
                 sleeper=clock.sleep,
             )
             report = (root / "report.md").read_text(encoding="utf-8")
+            saved_state = json.loads(
+                (root / "state.json").read_text(encoding="utf-8")
+            )
         self.assertEqual(result.termination_reason, "calendar_unknown_no_open_market")
         self.assertEqual(clock.sleeps, [])
         self.assertIn("calendar_unknown_no_open_market", report)
+        self.assertEqual(
+            saved_state["provider"]["integration_verification"]
+            ["calendar_degraded_cycles"],
+            1,
+        )
 
     def test_expired_explicit_session_fails_instead_of_zero_loop_green(self):
         now = datetime(2026, 7, 28, 12, 10, tzinfo=TZ)
@@ -3003,6 +3265,9 @@ class SessionLoopTests(unittest.TestCase):
         self.assertNotIn("SHADOW_AB_INITIAL_PORTFOLIO_JSON", workflow)
         self.assertIn("WATCH_ACCOUNTS_PRIVATE_JSON", workflow)
         self.assertIn("拒绝重新初始化", workflow)
+        self.assertIn("name: 严格验证行情与 PushPlus", workflow)
+        self.assertIn("if: ${{ !cancelled() }}", workflow)
+        self.assertNotIn("verify_integrations:", workflow)
         daily_workflow = (
             Path(__file__).resolve().parents[1]
             / ".github"

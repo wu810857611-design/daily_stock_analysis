@@ -62,6 +62,10 @@ from scripts.level2_adapter import (  # noqa: E402
     Level2Assessment,
     Level2DataAdapter,
 )
+from scripts.generate_longbridge_oauth_token import (  # noqa: E402
+    _has_hk_realtime_package,
+    _package_rows,
+)
 from scripts.normalize_stock_list import canonical_symbol, normalize_stock_list  # noqa: E402
 from scripts.shadow_ab_experiment import (  # noqa: E402
     BASELINE_DATE as SHADOW_BASELINE_DATE,
@@ -125,6 +129,7 @@ class RealtimeQuote:
     provider_timestamp: Optional[str] = None
     fetched_at: Optional[str] = None
     stale_seconds: Optional[float] = None
+    provider_snapshot_fresh: bool = False
     is_stale: bool = True
     source: str = ""
 
@@ -194,6 +199,24 @@ def _parse_iso(value: Any) -> Optional[datetime]:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=SHANGHAI_TZ)
     return parsed.astimezone(SHANGHAI_TZ)
+
+
+def _signal_time_at_or_after_quote(now: datetime, quote_time: Any) -> datetime:
+    """Keep signal ordering valid when a provider timestamp leads cycle start.
+
+    ``run_cycle`` intentionally freezes ``now`` before network I/O for
+    deterministic state transitions.  A quote received a few seconds later
+    can therefore carry a valid provider timestamp after that frozen value.
+    The signal was observed no earlier than the quote, so persist the later of
+    the two without changing or fabricating the provider timestamp.
+    """
+
+    observed_at = now
+    if observed_at.tzinfo is None:
+        observed_at = observed_at.replace(tzinfo=SHANGHAI_TZ)
+    observed_at = observed_at.astimezone(SHANGHAI_TZ)
+    parsed_quote_time = _parse_iso(quote_time)
+    return max(observed_at, parsed_quote_time or observed_at)
 
 
 def _is_user_push_allowed(event: Mapping[str, Any]) -> bool:
@@ -531,8 +554,17 @@ def parse_longbridge_batch(
     *,
     fetched_at: datetime,
     freshness_seconds: float = DEFAULT_FRESHNESS_SECONDS,
+    realtime_entitled: bool = False,
 ) -> Dict[str, RealtimeQuote]:
-    """Convert one authenticated Longbridge batch into fail-closed quotes."""
+    """Convert one authenticated Longbridge batch into fail-closed quotes.
+
+    Longbridge documents ``timestamp`` as the time of the latest price, not
+    the time at which the snapshot response was generated.  A real-time
+    entitled pull can therefore be a live snapshot even when an illiquid
+    security has not traded within the decision freshness window.  Preserve
+    that distinction: ``provider_snapshot_fresh`` proves the live data path,
+    while ``is_stale`` continues to block decisions on an old last trade.
+    """
 
     requested = {canonical_symbol(symbol) for symbol in requested_symbols}
     parsed: Dict[str, RealtimeQuote] = {}
@@ -552,12 +584,16 @@ def parse_longbridge_batch(
             _provider_field(record, "timestamp")
         )
         age_seconds: Optional[float] = None
-        fresh = False
+        price_time_fresh = False
+        provider_snapshot_fresh = False
         if provider_time is not None:
             age_seconds = (
                 fetched_at.astimezone(SHANGHAI_TZ) - provider_time
             ).total_seconds()
-            fresh = -30.0 <= age_seconds <= freshness_seconds
+            price_time_fresh = -30.0 <= age_seconds <= freshness_seconds
+            provider_snapshot_fresh = bool(
+                realtime_entitled and price is not None and age_seconds >= -30.0
+            )
         parsed[symbol] = RealtimeQuote(
             symbol=symbol,
             price=price,
@@ -566,7 +602,8 @@ def parse_longbridge_batch(
             provider_timestamp=_iso(provider_time) if provider_time else None,
             fetched_at=_iso(fetched_at),
             stale_seconds=max(0.0, age_seconds) if age_seconds is not None else None,
-            is_stale=not fresh or price is None,
+            provider_snapshot_fresh=provider_snapshot_fresh,
+            is_stale=not price_time_fresh or price is None,
             source="longbridge_batch",
         )
 
@@ -745,7 +782,7 @@ def _noninteractive_longbridge_context() -> Any:
 
 
 class LongbridgeBatchQuoteFetcher:
-    """Authenticated HK L1 batch quotes with provider-time freshness checks."""
+    """Authenticated HK L1 snapshots with separate price-time safeguards."""
 
     min_interval_seconds = 30.0
 
@@ -764,6 +801,7 @@ class LongbridgeBatchQuoteFetcher:
             longbridge_intraday_configured() if configured is None else bool(configured)
         )
         self._context: Any = None
+        self.realtime_entitled: Optional[bool] = None
 
     def fetch(
         self, symbols: Sequence[str], *, now: Optional[datetime] = None
@@ -779,6 +817,7 @@ class LongbridgeBatchQuoteFetcher:
         if not canonical:
             return {}
         if not self.configured:
+            self.realtime_entitled = False
             return {
                 symbol: RealtimeQuote(
                     symbol=symbol,
@@ -791,6 +830,9 @@ class LongbridgeBatchQuoteFetcher:
         try:
             if self._context is None:
                 self._context = self.context_factory()
+                self.realtime_entitled = _has_hk_realtime_package(
+                    _package_rows(self._context)
+                )
             results: Dict[str, RealtimeQuote] = {}
             for offset in range(0, len(canonical), self.chunk_size):
                 chunk = canonical[offset : offset + self.chunk_size]
@@ -803,8 +845,19 @@ class LongbridgeBatchQuoteFetcher:
                         chunk,
                         fetched_at=fetched_at,
                         freshness_seconds=self.freshness_seconds,
+                        realtime_entitled=bool(self.realtime_entitled),
                     )
                 )
+            if not self.realtime_entitled:
+                results = {
+                    symbol: replace(
+                        quote,
+                        provider_snapshot_fresh=False,
+                        is_stale=True,
+                        source="longbridge_realtime_permission_missing",
+                    )
+                    for symbol, quote in results.items()
+                }
             return results
         except Exception as exc:
             # Keep the Tencent fallback available, but do not treat its delayed
@@ -815,6 +868,7 @@ class LongbridgeBatchQuoteFetcher:
                 file=sys.stderr,
             )
             self._context = None
+            self.realtime_entitled = None
             return {
                 symbol: RealtimeQuote(
                     symbol=symbol,
@@ -859,6 +913,7 @@ class DecisionQuoteFetcher:
         hk_symbols = [symbol for symbol in canonical if symbol.startswith("HK")]
         upgraded = 0
         provider_timestamped = 0
+        inactive_price_timestamps = 0
         degradation_reasons: Dict[str, int] = {}
         longbridge = self.longbridge_fetcher.fetch(hk_symbols, now=fetched_at)
         for symbol in hk_symbols:
@@ -872,8 +927,10 @@ class DecisionQuoteFetcher:
                 reason = candidate.source or "longbridge_price_missing"
             elif not candidate.provider_timestamp:
                 reason = "longbridge_provider_timestamp_missing"
-            elif candidate.is_stale:
-                reason = "longbridge_provider_timestamp_stale"
+            elif candidate.source == "longbridge_realtime_permission_missing":
+                reason = "longbridge_realtime_permission_missing"
+            elif not candidate.provider_snapshot_fresh:
+                reason = "longbridge_provider_snapshot_unverified"
             if reason:
                 degradation_reasons[reason] = degradation_reasons.get(reason, 0) + 1
                 continue
@@ -882,18 +939,39 @@ class DecisionQuoteFetcher:
                 candidate = replace(candidate, name=baseline.name)
             results[symbol] = candidate
             upgraded += 1
+            if candidate.is_stale:
+                inactive_price_timestamps += 1
         self.last_diagnostics = {
             "baseline": "tencent_batch",
             "hk_realtime_source": "longbridge_batch",
             "longbridge_configured": bool(self.longbridge_fetcher.configured),
+            "hk_realtime_entitled": bool(
+                getattr(self.longbridge_fetcher, "realtime_entitled", False)
+            ),
             "hk_requested": len(hk_symbols),
-            "hk_fresh_upgraded": upgraded,
+            "hk_live_snapshot_covered": upgraded,
+            "hk_fresh_upgraded": upgraded - inactive_price_timestamps,
             "hk_provider_timestamped": provider_timestamped,
+            "hk_price_timestamp_stale": inactive_price_timestamps,
             "hk_degraded": bool(hk_symbols and upgraded != len(hk_symbols)),
             "hk_degradation_reasons": degradation_reasons,
             "strict_no_delayed_trade_decisions": True,
         }
         return results
+
+
+def _quote_has_live_snapshot(quote: RealtimeQuote) -> bool:
+    """Return whether provider availability is healthy for coverage checks.
+
+    An old latest-trade time remains non-tradeable (``is_stale``), but an
+    authenticated real-time Longbridge snapshot is still a healthy data path
+    when the security simply had no new trade.
+    """
+
+    return bool(
+        quote.price is not None
+        and (not quote.is_stale or quote.provider_snapshot_fresh)
+    )
 
 
 def _empty_state(now: Optional[datetime] = None) -> Dict[str, Any]:
@@ -2730,12 +2808,13 @@ def process_actionable_decisions(
 
         signal_id = ""
         if action in _TRADE_ACTION_LABELS and signal_recorder is not None and shadow_state:
+            signal_time = _signal_time_at_or_after_quote(now, quote_time)
             signal = {
                 "signal_id": f"signal-{raw_event.get('event_id')}",
                 "event_id": str(raw_event.get("event_id") or ""),
                 "trade_date": now.date().isoformat(),
                 "symbol": symbol,
-                "signal_time": _iso(now),
+                "signal_time": _iso(signal_time),
                 "quote_time": quote_time,
                 "signal_price": price,
                 "action": action,
@@ -2755,6 +2834,20 @@ def process_actionable_decisions(
                 saved_signal = signal_recorder(shadow_state, signal)
             except Exception as exc:
                 _mark_raw_decision(raw_event, result=f"signal_persist_failed:{exc}")
+                verification = (
+                    state.setdefault("provider", {}).get(
+                        "integration_verification"
+                    )
+                )
+                if isinstance(verification, MutableMapping):
+                    verification["signal_persist_failures"] = int(
+                        verification.get("signal_persist_failures") or 0
+                    ) + 1
+                    reasons = verification.setdefault(
+                        "signal_persist_failure_reasons", {}
+                    )
+                    reason = type(exc).__name__
+                    reasons[reason] = int(reasons.get(reason) or 0) + 1
                 continue
             signal_id = str(saved_signal.get("signal_id") or signal["signal_id"])
 
@@ -3517,15 +3610,15 @@ def run_cycle(
             verification["hk_cycles_checked"] = int(
                 verification.get("hk_cycles_checked") or 0
             ) + 1
-            fully_fresh = (
-                int(quote_diagnostics.get("hk_fresh_upgraded") or 0)
+            fully_live = (
+                int(quote_diagnostics.get("hk_live_snapshot_covered") or 0)
                 == hk_requested
                 and int(quote_diagnostics.get("hk_provider_timestamped") or 0)
                 == hk_requested
             )
-            if fully_fresh:
-                verification["hk_cycles_fully_fresh"] = int(
-                    verification.get("hk_cycles_fully_fresh") or 0
+            if fully_live:
+                verification["hk_cycles_fully_live"] = int(
+                    verification.get("hk_cycles_fully_live") or 0
                 ) + 1
             else:
                 verification["hk_degraded_cycles"] = int(
@@ -3540,12 +3633,22 @@ def run_cycle(
                     cumulative_reasons[str(reason)] = int(
                         cumulative_reasons.get(str(reason)) or 0
                     ) + int(count or 0)
+            fully_fresh = (
+                int(quote_diagnostics.get("hk_fresh_upgraded") or 0)
+                == hk_requested
+            )
+            if fully_fresh:
+                verification["hk_cycles_fully_fresh"] = int(
+                    verification.get("hk_cycles_fully_fresh") or 0
+                ) + 1
+            verification["hk_price_timestamp_stale_observations"] = int(
+                verification.get("hk_price_timestamp_stale_observations") or 0
+            ) + int(quote_diagnostics.get("hk_price_timestamp_stale") or 0)
     primary_valid = [
         quote
         for quote in quotes
         if quote.symbol in primary_set
-        and quote.price is not None
-        and not quote.is_stale
+        and _quote_has_live_snapshot(quote)
     ]
     quote_map = {quote.symbol: quote for quote in quotes}
     if shadow_state is not None:
@@ -3593,8 +3696,7 @@ def run_cycle(
                     1
                     for quote in quotes
                     if quote.symbol in members
-                    and quote.price is not None
-                    and not quote.is_stale
+                    and _quote_has_live_snapshot(quote)
                 ),
                 "total": len(members),
                 "coverage": (
@@ -3602,8 +3704,7 @@ def run_cycle(
                         1
                         for quote in quotes
                         if quote.symbol in members
-                        and quote.price is not None
-                        and not quote.is_stale
+                        and _quote_has_live_snapshot(quote)
                     )
                     / len(members)
                     if members
@@ -3930,16 +4031,36 @@ def render_session_report(
             "- 港股实时源状态："
             f"Longbridge "
             f"{'已配置' if quote_fetcher.get('longbridge_configured') else '未配置'}；"
-            f"最近一轮新鲜覆盖 {quote_fetcher.get('hk_fresh_upgraded', 0)}/"
+            f"实时行情权限 {'已验证' if quote_fetcher.get('hk_realtime_entitled') else '未验证'}；"
+            f"最近一轮实时快照覆盖 {quote_fetcher.get('hk_live_snapshot_covered', 0)}/"
             f"{quote_fetcher.get('hk_requested', 0)}。"
         )
         lines.append(
             "- 港股提供方时间戳："
             f"{quote_fetcher.get('hk_provider_timestamped', 0)}/"
             f"{quote_fetcher.get('hk_requested', 0)}；"
-            f"本会话完整新鲜轮次 {integration_verification.get('hk_cycles_fully_fresh', 0)}/"
+            f"本会话完整实时快照轮次 {integration_verification.get('hk_cycles_fully_live', 0)}/"
             f"{integration_verification.get('hk_cycles_checked', 0)}。"
         )
+        lines.append(
+            "- 港股可用于建议的新鲜成交价："
+            f"最近一轮 {quote_fetcher.get('hk_fresh_upgraded', 0)}/"
+            f"{quote_fetcher.get('hk_requested', 0)}；"
+            f"本会话全数新鲜轮次 {integration_verification.get('hk_cycles_fully_fresh', 0)}/"
+            f"{integration_verification.get('hk_cycles_checked', 0)}。"
+        )
+        inactive_price_count = int(
+            integration_verification.get(
+                "hk_price_timestamp_stale_observations"
+            )
+            or 0
+        )
+        if inactive_price_count:
+            lines.append(
+                "- 港股无近期成交快照："
+                f"{inactive_price_count} 次；实时链路正常，但最新成交时间超过"
+                "交易建议阈值，已禁止触发买卖建议，不计作行情源降级。"
+            )
         hk_reasons = integration_verification.get("hk_degradation_reasons") or {}
         if isinstance(hk_reasons, Mapping) and hk_reasons:
             lines.append(
@@ -3951,6 +4072,15 @@ def render_session_report(
             )
         elif int(integration_verification.get("hk_cycles_checked") or 0) > 0:
             lines.append("- 港股行情降级：本会话未发生。")
+        lines.append(
+            "- PRIMARY/交易日历降级："
+            f"PRIMARY={int(integration_verification.get('primary_degraded_cycles') or 0)} 轮；"
+            f"交易日历={int(integration_verification.get('calendar_degraded_cycles') or 0)} 轮。"
+        )
+        signal_failures = int(
+            integration_verification.get("signal_persist_failures") or 0
+        )
+        lines.append(f"- 模拟信号落盘失败：{signal_failures} 次。")
     if pushplus_session:
         push_status = str(pushplus_session.get("status") or "unknown")
         if push_status == "actionable_sent":
@@ -4175,10 +4305,15 @@ def run_session(
         provider["integration_verification"] = {
             "started_at": _iso(started),
             "hk_cycles_checked": 0,
+            "hk_cycles_fully_live": 0,
             "hk_cycles_fully_fresh": 0,
             "hk_degraded_cycles": 0,
             "hk_degradation_reasons": {},
+            "hk_price_timestamp_stale_observations": 0,
             "primary_degraded_cycles": 0,
+            "calendar_degraded_cycles": 0,
+            "signal_persist_failures": 0,
+            "signal_persist_failure_reasons": {},
         }
         delay_seconds = max(0.0, (started - end_at).total_seconds())
         provider["session_status"] = "late_schedule_skipped"
@@ -4410,10 +4545,15 @@ def run_session(
     provider["integration_verification"] = {
         "started_at": _iso(started),
         "hk_cycles_checked": 0,
+        "hk_cycles_fully_live": 0,
         "hk_cycles_fully_fresh": 0,
         "hk_degraded_cycles": 0,
         "hk_degradation_reasons": {},
+        "hk_price_timestamp_stale_observations": 0,
         "primary_degraded_cycles": 0,
+        "calendar_degraded_cycles": 0,
+        "signal_persist_failures": 0,
+        "signal_persist_failure_reasons": {},
     }
     provider["reference_levels"] = reference_summary
     provider["candidate_plan_monitoring"] = {
@@ -4503,6 +4643,11 @@ def run_session(
             termination_reason = "calendar_unknown_no_open_market"
             provider["session_status"] = termination_reason
             provider["calendar_degraded"] = True
+            verification = provider.get("integration_verification")
+            if isinstance(verification, MutableMapping):
+                verification["calendar_degraded_cycles"] = int(
+                    verification.get("calendar_degraded_cycles") or 0
+                ) + 1
             state["updated_at"] = _iso(now)
             save_state_v2(state_path, state)
             if shadow_state is not None and shadow_state_path is not None:
@@ -4530,6 +4675,12 @@ def run_session(
             )
             break
         provider["calendar_degraded"] = "unknown" in phase_values
+        if provider["calendar_degraded"]:
+            verification = provider.get("integration_verification")
+            if isinstance(verification, MutableMapping):
+                verification["calendar_degraded_cycles"] = int(
+                    verification.get("calendar_degraded_cycles") or 0
+                ) + 1
         active = [
             canonical_symbol(symbol)
             for symbol in symbols

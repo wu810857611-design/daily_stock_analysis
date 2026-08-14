@@ -17,11 +17,6 @@ on:
         required: false
         default: '0'
         type: string
-      verify_integrations:
-        description: '严格验证 Longbridge 新鲜行情、降级状态与 PushPlus 结果'
-        required: false
-        default: false
-        type: boolean
 
 concurrency:
   group: intraday-session-${{ github.ref }}
@@ -476,7 +471,9 @@ jobs:
             "${PLAN_ARGS[@]}"
 
       - name: 严格验证行情与 PushPlus
-        if: ${{ inputs.verify_integrations }}
+        # 定时与手动盘中运行都必须留下同一份严格契约证据；即使前序步骤
+        # 失败，只要任务未取消也要执行并明确报出缺失/不完整状态。
+        if: ${{ !cancelled() }}
         run: python3 scripts/check_intraday_integrations.py
 
       - name: 打包盘中状态
