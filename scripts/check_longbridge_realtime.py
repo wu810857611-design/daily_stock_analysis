@@ -5,11 +5,10 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import os
 import re
 import sys
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence
 from zoneinfo import ZoneInfo
@@ -23,7 +22,11 @@ from scripts.generate_longbridge_oauth_token import (
     _package_rows,
     _provider_field,
 )
-from scripts.intraday_session import SessionError, _noninteractive_longbridge_context
+from scripts.intraday_session import (
+    SessionError,
+    _noninteractive_longbridge_context,
+    parse_longbridge_timestamp,
+)
 
 
 SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
@@ -45,27 +48,6 @@ def _normalise_symbols(raw: str) -> list[str]:
     if not symbols:
         raise ValueError("at least one HK symbol is required")
     return symbols
-
-
-def _parse_provider_timestamp(raw: Any) -> Optional[datetime]:
-    if isinstance(raw, datetime):
-        parsed = raw
-    else:
-        try:
-            number = float(raw)
-        except (TypeError, ValueError):
-            return None
-        if not math.isfinite(number):
-            return None
-        if number > 10_000_000_000:
-            number /= 1000.0
-        try:
-            parsed = datetime.fromtimestamp(number, tz=timezone.utc)
-        except (OSError, OverflowError, ValueError):
-            return None
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=SHANGHAI_TZ)
-    return parsed.astimezone(SHANGHAI_TZ)
 
 
 def verify_context(
@@ -94,7 +76,9 @@ def verify_context(
     for symbol in symbols:
         record = by_symbol.get(symbol.upper())
         price = _provider_field(record, "last_done") if record is not None else None
-        timestamp = _parse_provider_timestamp(_provider_field(record, "timestamp") if record is not None else None)
+        timestamp = parse_longbridge_timestamp(
+            _provider_field(record, "timestamp") if record is not None else None
+        )
         age_seconds = (observed_at - timestamp).total_seconds() if timestamp is not None else None
         fresh = bool(price not in (None, "") and age_seconds is not None and -30.0 <= age_seconds <= freshness_seconds)
         if record is None:

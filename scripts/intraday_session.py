@@ -491,7 +491,14 @@ def from_longbridge_symbol(provider_symbol: str) -> Optional[str]:
 
 
 def parse_longbridge_timestamp(raw: Any) -> Optional[datetime]:
-    """Normalise SDK datetime or Unix timestamps without guessing local time."""
+    """Normalise SDK datetime or Unix timestamps to the market timezone.
+
+    The Longbridge Python SDK builds naive ``datetime`` values with
+    ``datetime.fromtimestamp(..., tz=None)``.  Such values represent the
+    runner's local wall clock, not an Asia/Shanghai wall clock.  Interpret a
+    naive SDK value in the host timezone before converting it; GitHub-hosted
+    runners use UTC while a developer Mac may already use Asia/Shanghai.
+    """
 
     if isinstance(raw, datetime):
         parsed = raw
@@ -508,7 +515,7 @@ def parse_longbridge_timestamp(raw: Any) -> Optional[datetime]:
         except (OSError, OverflowError, ValueError):
             return None
     if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=SHANGHAI_TZ)
+        parsed = parsed.astimezone()
     return parsed.astimezone(SHANGHAI_TZ)
 
 

@@ -3,6 +3,7 @@ import json
 import os
 import sqlite3
 import tempfile
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -29,6 +30,7 @@ from scripts.intraday_session import (
     load_state_v2,
     parse_tencent_batch,
     parse_longbridge_batch,
+    parse_longbridge_timestamp,
     process_actionable_decisions,
     process_watch_account_decisions,
     resolve_session_end,
@@ -891,6 +893,22 @@ class TencentBatchTests(unittest.TestCase):
         )["HK06181"]
         self.assertTrue(delayed.is_stale)
         self.assertEqual(delayed.stale_seconds, 900)
+
+    @unittest.skipUnless(hasattr(time, "tzset"), "requires POSIX timezone support")
+    def test_longbridge_naive_sdk_timestamp_uses_runner_local_timezone(self):
+        original_tz = os.environ.get("TZ")
+        try:
+            os.environ["TZ"] = "UTC"
+            time.tzset()
+            parsed = parse_longbridge_timestamp(datetime(2026, 8, 14, 2, 0, 14))
+        finally:
+            if original_tz is None:
+                os.environ.pop("TZ", None)
+            else:
+                os.environ["TZ"] = original_tz
+            time.tzset()
+
+        self.assertEqual(parsed, datetime(2026, 8, 14, 10, 0, 14, tzinfo=TZ))
 
     def test_market_aware_fetcher_replaces_only_hk_with_fresh_longbridge(self):
         now = datetime(2026, 8, 11, 14, 45, tzinfo=TZ)
