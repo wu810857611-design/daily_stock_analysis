@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -102,6 +104,37 @@ def test_live_preflight_passes_realtime_package_and_fresh_provider_times():
     assert result["passed"] is True
     assert result["hk_realtime_package"] is True
     assert all(quote["fresh"] for quote in result["quotes"])
+
+
+@pytest.mark.skipif(not hasattr(time, "tzset"), reason="requires POSIX timezone support")
+def test_live_preflight_interprets_naive_sdk_timestamp_in_runner_timezone():
+    original_tz = os.environ.get("TZ")
+    try:
+        os.environ["TZ"] = "UTC"
+        time.tzset()
+        now = datetime(2026, 8, 14, 10, 0, 13, tzinfo=SHANGHAI_TZ)
+        context = FakeContext(
+            package_key="HK_L1_OpenAPI",
+            timestamp=datetime(2026, 8, 14, 2, 0, 14),
+        )
+
+        result = verify_context(
+            context,
+            symbols=["700.HK"],
+            now=now,
+            freshness_seconds=90,
+        )
+    finally:
+        if original_tz is None:
+            os.environ.pop("TZ", None)
+        else:
+            os.environ["TZ"] = original_tz
+        time.tzset()
+
+    assert result["passed"] is True
+    assert result["quotes"][0]["provider_timestamp"] == "2026-08-14T10:00:14+08:00"
+    assert result["quotes"][0]["age_seconds"] == 0.0
+    assert result["quotes"][0]["fresh"] is True
 
 
 def test_live_preflight_explains_oauth_hk_basic_delay():
