@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 > For user-friendly release highlights, see the [GitHub Releases](https://github.com/ZhuLinsen/daily_stock_analysis/releases) page.
 
 ## [Unreleased]
+- [修复] 分钟盘中监控把 Longbridge 已授权实时快照与“最新成交时间”拆分验收：实时权限、成功拉取和逐只提供方时间戳用于证明港股链路健康，超过交易新鲜度阈值的无近期成交快照仍禁止触发买卖建议但不再误报行情源/PRIMARY 降级；同时修复提供方时间略晚于循环起点导致的影子信号落盘失败，并让每次未取消的盘中 Actions 都强制执行行情、降级与 PushPlus 严格验收。
 - [修复] 针对 Longbridge 2026-07 OAuth 行情权限绑定修复后旧 token cache 仍返回 `HK_Basic`（约 15 分钟延迟）的场景，OAuth 辅助脚本新增带备份的强制重新授权与港股实时包校验；新增完全不注入 PushPlus/交易接口的手动只读预检工作流，可分别在休市时验证 `HK_L1_OpenAPI` 权限、在连续交易时段严格验证提供方时间戳新鲜度。
 - [修复] 分钟盘中监控为港股接入带提供方成交时间戳的 Longbridge 授权 L1 批量行情并保留腾讯严格降级，禁止延迟行情触发买卖建议；PushPlus 仅发送止盈、止损或可信计划形成的明确动作，并补齐建议数量、触发价、委托参考价、失效条件与有效期，私密持仓数量只在内存中用于生成通知。
 - [修复] SECONDARY 固定候选可只读复用最新有效的 P3 收盘分析买入区，并继续通过现有数据质量、行情新鲜度与扣费后风险收益门生成审计事件；因缺少可靠资金与仓位尺寸，不再把进入观察区推送成可执行买入建议，且始终隔离于 PRIMARY A/B。

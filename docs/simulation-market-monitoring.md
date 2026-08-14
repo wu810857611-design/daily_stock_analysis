@@ -12,9 +12,12 @@
   `session=morning`，12:50 触发 `session=afternoon`。GitHub Actions 页面仍可用
   Run workflow 手动选择 `auto`、`morning` 或 `afternoon`。每个连续监控时段正常约
   60 秒取一次基础实时行情；A 股使用腾讯批量行情，港股在配置 Longbridge 凭据后
-  优先使用带最新成交时间戳的授权 L1 批量行情；价格临近风险位或条件位时约 30 秒
-  一次，数据源降级时放慢到约 120 秒。腾讯港股延迟行情只保留为诊断证据，不会
-  被放宽新鲜度后用于买卖判断。
+  优先使用带最新成交时间戳的授权 L1 批量行情。港股连接建立时验证 OpenAPI 港股
+  个股实时权限，每轮验证本次快照拉取和逐只提供方时间戳；最新成交时间超过交易新鲜度
+  阈值时，实时链路仍可保持健康，但该价格不会触发买卖建议。价格临近风险位或
+  条件位时约 30 秒一次，数据源降级时放慢到约 120 秒。腾讯港股延迟行情只保留
+  为诊断证据，不会被放宽新鲜度后用于买卖判断。每次未取消的盘中 Actions 都会
+  强制执行 Longbridge、PRIMARY、交易日历和 PushPlus 严格验收，证据不完整即失败。
 - `02-market-scan.yml`：北京时间 10:30、14:30 和 19:15 分层扫描 A 股全市场与
   港股通成分。全市场阶段不调用模型；只对规则短名单加载历史，再让通义千问和
   DeepSeek 独立复核。
@@ -23,7 +26,10 @@
 
 外部触发和 GitHub runner 仍可能排队，因此这些时间不是交易所级低延迟保证。任何
 超过
-90 秒、缺少时间戳或关键字段不完整的行情，都不能触发交易类人工复核提醒。
+90 秒、缺少时间戳或关键字段不完整的最新成交价，都不能触发交易类人工复核提醒。
+Longbridge 官方字段中的 `timestamp` 是“最新价格时间”而不是响应生成时间；已验证
+实时权限且本次成功返回的快照，若只是因为标的没有近期成交而超过 90 秒，会单独
+记录为“无近期成交快照”，不冒充可交易新鲜价，也不误计为行情接口降级。
 若 dispatch 到达时原定交易时段已经结束，系统会保留上午/下午的原始审计身份、
 保留最近有效状态、记录 `late_schedule_skipped`，并通过可重试 outbox 发送该时段的
 能力提醒；不会把迟到的上午任务改写成下午任务，也不会回填或伪造已经错过的盘中
@@ -163,7 +169,7 @@ Level-2 只允许使用交易所授权、持牌数据商或用户本人账户已
 | `INTRADAY_NORMAL_INTERVAL_SECONDS` | `60` | 正常监控间隔 |
 | `INTRADAY_FAST_INTERVAL_SECONDS` | `30` | 临近或触发风险条件时的间隔 |
 | `INTRADAY_DEGRADED_INTERVAL_SECONDS` | `120` | 数据源降级时的间隔 |
-| `INTRADAY_QUOTE_FRESHNESS_SECONDS` | `90` | 行情最大允许年龄 |
+| `INTRADAY_QUOTE_FRESHNESS_SECONDS` | `90` | 可触发交易建议的最新成交价最大年龄 |
 | `INTRADAY_MIN_QUOTE_COVERAGE` | `0.8` | 最低基础行情覆盖率 |
 | `LONGBRIDGE_OAUTH_CLIENT_ID` | - | 港股实时 L1 的 OAuth client_id（Variable 或 Secret） |
 | `LONGBRIDGE_OAUTH_TOKEN_CACHE_B64` | - | 港股实时 L1 的 OAuth token cache（Secret） |

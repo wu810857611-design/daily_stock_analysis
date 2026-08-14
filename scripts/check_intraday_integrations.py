@@ -21,27 +21,35 @@ def verify_state(state: Mapping[str, Any]) -> dict[str, Any]:
     issues: list[str] = []
 
     hk_requested = int(quote_fetcher.get("hk_requested") or 0)
+    hk_live = int(quote_fetcher.get("hk_live_snapshot_covered") or 0)
     hk_fresh = int(quote_fetcher.get("hk_fresh_upgraded") or 0)
     hk_timestamped = int(quote_fetcher.get("hk_provider_timestamped") or 0)
     hk_cycles = int(integration.get("hk_cycles_checked") or 0)
+    hk_live_cycles = int(integration.get("hk_cycles_fully_live") or 0)
     hk_fresh_cycles = int(integration.get("hk_cycles_fully_fresh") or 0)
     hk_degraded_cycles = int(integration.get("hk_degraded_cycles") or 0)
     hk_reasons = dict(integration.get("hk_degradation_reasons") or {})
 
     if not quote_fetcher.get("longbridge_configured"):
         issues.append("longbridge_not_configured")
+    if not quote_fetcher.get("hk_realtime_entitled"):
+        issues.append("longbridge_realtime_permission_unverified")
     if hk_requested <= 0 or hk_cycles <= 0:
         issues.append("no_hk_quote_cycle_checked")
-    if hk_requested > 0 and hk_fresh != hk_requested:
-        issues.append("hk_fresh_coverage_incomplete")
+    if hk_requested > 0 and hk_live != hk_requested:
+        issues.append("hk_live_snapshot_coverage_incomplete")
     if hk_requested > 0 and hk_timestamped != hk_requested:
         issues.append("hk_provider_timestamp_incomplete")
-    if hk_cycles > 0 and hk_fresh_cycles != hk_cycles:
-        issues.append("hk_session_not_fully_fresh")
+    if hk_cycles > 0 and hk_live_cycles != hk_cycles:
+        issues.append("hk_session_not_fully_live")
     if hk_degraded_cycles > 0 or hk_reasons:
         issues.append("hk_degradation_observed")
     if int(integration.get("primary_degraded_cycles") or 0) > 0:
         issues.append("primary_quote_degradation_observed")
+    if int(integration.get("calendar_degraded_cycles") or 0) > 0:
+        issues.append("market_calendar_degradation_observed")
+    if int(integration.get("signal_persist_failures") or 0) > 0:
+        issues.append("signal_persist_failure_observed")
     if provider.get("degraded"):
         issues.append("primary_quote_currently_degraded")
     if provider.get("calendar_degraded"):
@@ -63,17 +71,34 @@ def verify_state(state: Mapping[str, Any]) -> dict[str, Any]:
             "longbridge_configured": bool(
                 quote_fetcher.get("longbridge_configured")
             ),
-            "latest_fresh": hk_fresh,
+            "hk_realtime_entitled": bool(
+                quote_fetcher.get("hk_realtime_entitled")
+            ),
+            "latest_live_snapshot": hk_live,
+            "latest_trade_price_fresh": hk_fresh,
             "latest_timestamped": hk_timestamped,
             "latest_requested": hk_requested,
-            "fully_fresh_cycles": hk_fresh_cycles,
+            "fully_live_cycles": hk_live_cycles,
+            "fully_trade_price_fresh_cycles": hk_fresh_cycles,
             "checked_cycles": hk_cycles,
+            "price_timestamp_stale_observations": int(
+                integration.get("hk_price_timestamp_stale_observations") or 0
+            ),
         },
         "degradation": {
             "hk_degraded_cycles": hk_degraded_cycles,
             "hk_reasons": hk_reasons,
             "primary_degraded_cycles": int(
                 integration.get("primary_degraded_cycles") or 0
+            ),
+            "calendar_degraded_cycles": int(
+                integration.get("calendar_degraded_cycles") or 0
+            ),
+            "signal_persist_failures": int(
+                integration.get("signal_persist_failures") or 0
+            ),
+            "signal_persist_failure_reasons": dict(
+                integration.get("signal_persist_failure_reasons") or {}
             ),
         },
         "pushplus": {
@@ -107,17 +132,47 @@ def render_markdown(result: Mapping[str, Any]) -> str:
             "",
             f"- 结论：{verdict}",
             (
-                "- Longbridge：最新轮新鲜行情 "
-                f"{market['latest_fresh']}/{market['latest_requested']}；"
+                "- Longbridge：实时权限 "
+                f"{'已验证' if market['hk_realtime_entitled'] else '未验证'}；"
+                "最新轮实时快照 "
+                f"{market['latest_live_snapshot']}/{market['latest_requested']}；"
                 f"提供方时间戳 {market['latest_timestamped']}/"
-                f"{market['latest_requested']}；完整新鲜轮次 "
-                f"{market['fully_fresh_cycles']}/{market['checked_cycles']}"
+                f"{market['latest_requested']}；完整实时快照轮次 "
+                f"{market['fully_live_cycles']}/{market['checked_cycles']}"
+            ),
+            (
+                "- 可用于建议的新鲜成交价：最新轮 "
+                f"{market['latest_trade_price_fresh']}/"
+                f"{market['latest_requested']}；全数新鲜轮次 "
+                f"{market['fully_trade_price_fresh_cycles']}/"
+                f"{market['checked_cycles']}"
+            ),
+            (
+                "- 无近期成交快照："
+                f"{market['price_timestamp_stale_observations']} 次；"
+                "这些快照不触发买卖建议，也不计作实时行情源降级"
             ),
             (
                 "- 行情降级：港股降级轮次 "
                 f"{degradation['hk_degraded_cycles']}；"
                 f"PRIMARY 降级轮次 {degradation['primary_degraded_cycles']}；"
+                f"交易日历降级轮次 {degradation['calendar_degraded_cycles']}；"
                 f"原因 {reason_text}"
+            ),
+            (
+                "- 信号落盘：失败 "
+                f"{degradation['signal_persist_failures']} 次；原因 "
+                + (
+                    "、".join(
+                        f"{reason}={count}"
+                        for reason, count in sorted(
+                            degradation[
+                                "signal_persist_failure_reasons"
+                            ].items()
+                        )
+                    )
+                    or "无"
+                )
             ),
             (
                 "- PushPlus："
