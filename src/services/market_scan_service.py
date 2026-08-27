@@ -29,6 +29,8 @@ from zoneinfo import ZoneInfo
 import numpy as np
 import pandas as pd
 
+from src.services.position_sizing_policy import classify_opportunity
+
 
 SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
 SCHEMA_VERSION = 1
@@ -1308,7 +1310,11 @@ class MarketScanService:
             )
             payload["review_request"] = {
                 "proposed_action": "advance_to_intraday_entry_zone_review",
-                "proposed_initial_position_fraction": INITIAL_POSITION_FRACTION,
+                "deterministic_initial_position_fraction_range": [0.025, 0.10],
+                "sizing_policy": (
+                    "规则门在双模型复核后按普通/强/极强机会分级，"
+                    "模型不得自行决定仓位"
+                ),
                 "immediate_buy": False,
                 "auto_order": False,
                 "human_confirmation_required": True,
@@ -1394,17 +1400,50 @@ class MarketScanService:
             action = "conditional_buy" if actionable else "watch"
             if actionable:
                 actionable_count += 1
+                opportunity = classify_opportunity(
+                    rank=rank,
+                    data_quality=evidence_contract["data_quality"],
+                    net_rr=plan.get("net_rr"),
+                    qwen_confidence=qwen.get("confidence"),
+                    deepseek_confidence=deepseek.get("confidence"),
+                )
                 evidence_contract.update(
                     {
-                        "simulated_portfolio_weight": INITIAL_POSITION_FRACTION,
-                        "simulation_advice": "进入买入区后建议首笔建仓2.5%",
+                        "simulated_portfolio_weight": (
+                            opportunity.initial_position_fraction
+                        ),
+                        "simulation_advice": (
+                            "进入买入区后建议首笔建仓"
+                            f"{opportunity.initial_position_fraction * 100:g}%"
+                        ),
                         "eligible_for_intraday_review": True,
+                        "opportunity_tier": opportunity.tier,
+                        "cash_floor_ratio": opportunity.cash_floor_ratio,
+                        "max_single_position_ratio": (
+                            opportunity.max_single_position_ratio
+                        ),
+                        "initial_position_fraction": (
+                            opportunity.initial_position_fraction
+                        ),
+                        "add_position_fraction": (
+                            opportunity.add_position_fraction
+                        ),
+                        "opportunity_tier_evidence": {
+                            "rank": rank,
+                            "data_quality": evidence_contract["data_quality"],
+                            "net_rr": plan.get("net_rr"),
+                            "qwen_confidence": qwen.get("confidence"),
+                            "deepseek_confidence": deepseek.get("confidence"),
+                        },
                     }
                 )
                 evidence_contract["view"] = {
                     **dict(evidence_contract.get("view") or {}),
                     "short_term": "双模型与规则门已通过，仅在新鲜价格进入计划区时首笔建仓",
-                    "swing": "以2.5%模拟净值小仓试错，严格执行计划止损与目标位",
+                    "swing": (
+                        f"首笔按{opportunity.initial_position_fraction * 100:g}%"
+                        "模拟净值分级试错，后续加仓仍需新一轮确认"
+                    ),
                 }
             elif not root_snapshot_complete:
                 count_candidate_rejection("root_snapshot_incomplete")
@@ -1555,7 +1594,8 @@ class MarketScanService:
                 "仅用于模拟研究和条件价格计划，不保证收益，不连接券商，也不会自动下单。"
                 "任何计划都需在执行前重新核对实时价格、公告、流动性和个人风险承受能力。"
                 "当前MVP仍缺少完整基本面、公告、政策、资金和可靠Level-2数据；只有规则、"
-                "扣费后风险回报与双模型同时通过的候选，才会以2.5%模拟净值进入盘中价格区复核。"
+                "扣费后风险回报与双模型同时通过的候选，才会按2.5%–10%模拟净值分级进入"
+                "盘中价格区复核。"
                 "最终是否执行仍由用户人工决定。"
             ),
         }

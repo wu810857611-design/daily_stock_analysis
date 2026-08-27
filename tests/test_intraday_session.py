@@ -1760,6 +1760,266 @@ class StateMachineTests(unittest.TestCase):
             "no_operation_insufficient_cash_for_explicit_buy",
         )
 
+    def test_exceptional_opportunity_can_cross_normal_cash_floor_one_tranche_at_a_time(self):
+        now = datetime(2026, 8, 10, 10, 0, tzinfo=TZ)
+        shadow = synthetic_shadow_state()
+        available_cash = float(shadow["initial_nav"]) * 0.20
+        shadow["strategy_shadow_portfolio"]["cash_cny"] = available_cash
+        shadow["strategy_shadow_portfolio"]["cash_by_currency"] = {
+            "CNY": available_cash,
+            "HKD": 0.0,
+        }
+        state = load_state_v2(Path("/path/that/does/not/exist"), now=now)
+        event = {
+            "event_id": "exceptional-soft-cash-floor",
+            "symbol": "600001",
+            "name": "极强候选",
+            "condition": "adaptive_entry_review",
+            "transition": "manual_review",
+            "severity": "warning",
+            "price": 100,
+            "reference_price": 99,
+            "payload": {
+                "quote_time": now.isoformat(),
+                "data_quality": "fresh_l1",
+                "entry_low": 99,
+                "entry_high": 101,
+                "stop_loss": 95,
+                "target_price": 120,
+                "confidence": 0.95,
+                "plan_fingerprint": "exceptional-plan-1",
+                "opportunity_tier": "exceptional",
+                "market_costs": {
+                    "entry_fee_bps": 3,
+                    "entry_slippage_bps": 7,
+                },
+            },
+        }
+
+        self.assertEqual(
+            process_actionable_decisions(
+                state,
+                now=now,
+                raw_events=[event],
+                levels={},
+                shadow_state=shadow,
+                signal_recorder=record_shadow_signal,
+            ),
+            1,
+        )
+        payload = state["outbox"][0]["payload"]
+        self.assertEqual(payload["action_code"], "buy_1_0")
+        self.assertEqual(payload["tranche_fraction"], 0.10)
+        self.assertEqual(payload["opportunity_tier"], "exceptional")
+        self.assertEqual(payload["max_single_position_ratio"], 0.50)
+        self.assertLess(payload["projected_cash_ratio"], 0.15)
+        self.assertEqual(shadow["signal_ledger"][-1]["action"], "buy_1.0_cheng")
+
+        repeat_event = {
+            **event,
+            "event_id": "exceptional-soft-cash-floor-repeat",
+            "payload": dict(event["payload"]),
+        }
+        self.assertEqual(
+            process_actionable_decisions(
+                state,
+                now=now + timedelta(minutes=1),
+                raw_events=[repeat_event],
+                levels={},
+                shadow_state=shadow,
+                signal_recorder=record_shadow_signal,
+            ),
+            0,
+        )
+        self.assertEqual(
+            repeat_event["decision_result"],
+            "no_operation_scan_already_sized",
+        )
+        self.assertEqual(len(shadow["signal_ledger"]), 1)
+
+    def test_held_exceptional_candidate_adds_only_after_right_side_confirmation(self):
+        now = datetime(2026, 8, 10, 10, 0, tzinfo=TZ)
+
+        def held_shadow(basis_price: float):
+            shadow = synthetic_shadow_state()
+            added_cash = float(shadow["initial_nav"]) * 0.50
+            shadow["strategy_shadow_portfolio"]["cash_cny"] = added_cash
+            shadow["strategy_shadow_portfolio"]["cash_by_currency"] = {
+                "CNY": added_cash,
+                "HKD": 0.0,
+            }
+            shadow["strategy_shadow_portfolio"]["positions"]["600001"] = {
+                "symbol": "600001",
+                "name": "极强候选",
+                "currency": "CNY",
+                "quantity": 100,
+                "historical_cost": basis_price,
+                "experiment_basis_price": basis_price,
+            }
+            shadow["strategy_shadow_portfolio"]["last_prices"]["600001"] = 100
+            return shadow
+
+        def entry_event(event_id: str, price: float):
+            return {
+                "event_id": event_id,
+                "symbol": "600001",
+                "name": "极强候选",
+                "condition": "adaptive_entry_review",
+                "transition": "manual_review",
+                "severity": "warning",
+                "price": price,
+                "reference_price": price - 1,
+                "payload": {
+                    "quote_time": now.isoformat(),
+                    "data_quality": "fresh_l1",
+                    "entry_low": price - 1,
+                    "entry_high": price + 1,
+                    "stop_loss": price - 5,
+                    "target_price": price + 20,
+                    "confidence": 0.95,
+                    "plan_fingerprint": event_id,
+                    "opportunity_tier": "exceptional",
+                    "market_costs": {
+                        "entry_fee_bps": 3,
+                        "entry_slippage_bps": 7,
+                    },
+                },
+            }
+
+        confirmed_shadow = held_shadow(99)
+        confirmed_state = load_state_v2(
+            Path("/path/that/does/not/exist"), now=now
+        )
+        confirmed_event = entry_event("right-side-confirmed", 100)
+        self.assertEqual(
+            process_actionable_decisions(
+                confirmed_state,
+                now=now,
+                raw_events=[confirmed_event],
+                levels={},
+                shadow_state=confirmed_shadow,
+                signal_recorder=record_shadow_signal,
+            ),
+            1,
+        )
+        confirmed_payload = confirmed_state["outbox"][0]["payload"]
+        self.assertEqual(confirmed_payload["action_code"], "add_0_5")
+        self.assertEqual(confirmed_payload["tranche_fraction"], 0.05)
+        self.assertEqual(
+            confirmed_shadow["signal_ledger"][-1]["action"],
+            "add_0.5_cheng",
+        )
+
+        losing_shadow = held_shadow(101)
+        losing_state = load_state_v2(
+            Path("/path/that/does/not/exist"), now=now
+        )
+        losing_event = entry_event("right-side-not-confirmed", 100)
+        self.assertEqual(
+            process_actionable_decisions(
+                losing_state,
+                now=now,
+                raw_events=[losing_event],
+                levels={},
+                shadow_state=losing_shadow,
+                signal_recorder=record_shadow_signal,
+            ),
+            0,
+        )
+        self.assertEqual(
+            losing_event["decision_result"],
+            "no_operation_add_requires_right_side_confirmation",
+        )
+        self.assertEqual(losing_shadow["signal_ledger"], [])
+
+    def test_strong_opportunity_falls_back_to_smaller_affordable_tranche(self):
+        now = datetime(2026, 8, 10, 10, 0, tzinfo=TZ)
+        shadow = synthetic_shadow_state()
+        available_cash = float(shadow["initial_nav"]) * 0.09
+        shadow["strategy_shadow_portfolio"]["cash_cny"] = available_cash
+        shadow["strategy_shadow_portfolio"]["cash_by_currency"] = {
+            "CNY": available_cash,
+            "HKD": 0.0,
+        }
+        state = load_state_v2(Path("/path/that/does/not/exist"), now=now)
+        event = {
+            "event_id": "strong-fallback-tranche",
+            "symbol": "600001",
+            "name": "强候选",
+            "condition": "adaptive_entry_review",
+            "transition": "manual_review",
+            "severity": "warning",
+            "price": 100,
+            "reference_price": 99,
+            "payload": {
+                "quote_time": now.isoformat(),
+                "data_quality": "fresh_l1",
+                "entry_low": 99,
+                "entry_high": 101,
+                "stop_loss": 95,
+                "target_price": 120,
+                "confidence": 0.90,
+                "plan_fingerprint": "strong-plan-1",
+                "opportunity_tier": "strong",
+                "market_costs": {
+                    "entry_fee_bps": 3,
+                    "entry_slippage_bps": 7,
+                },
+            },
+        }
+
+        self.assertEqual(
+            process_actionable_decisions(
+                state,
+                now=now,
+                raw_events=[event],
+                levels={},
+                shadow_state=shadow,
+                signal_recorder=record_shadow_signal,
+            ),
+            1,
+        )
+        payload = state["outbox"][0]["payload"]
+        self.assertEqual(payload["action_code"], "buy_0_25")
+        self.assertEqual(payload["opportunity_tier"], "strong")
+        self.assertEqual(payload["initial_position_fraction"], 0.05)
+        self.assertEqual(payload["tranche_fraction"], 0.025)
+        self.assertGreaterEqual(payload["projected_cash_ratio"], 0.05)
+
+    def test_exceptional_pending_tranches_never_exceed_half_position(self):
+        now = datetime(2026, 8, 10, 10, 0, tzinfo=TZ)
+        shadow = synthetic_shadow_state()
+        available_cash = float(shadow["initial_nav"])
+        shadow["strategy_shadow_portfolio"]["cash_cny"] = available_cash
+        shadow["strategy_shadow_portfolio"]["cash_by_currency"] = {
+            "CNY": available_cash,
+            "HKD": 0.0,
+        }
+        for index in range(20):
+            record_shadow_signal(
+                shadow,
+                event_id=f"pending-half-position-{index}",
+                symbol="600001",
+                signal_time=(now + timedelta(seconds=index)).isoformat(),
+                quote_time=now.isoformat(),
+                signal_price=100,
+                action="模拟买入0.25成",
+                reason="测试待执行仓位预留",
+            )
+
+        decision = intraday_session_module._candidate_sizing_decision(
+            shadow,
+            symbol="600001",
+            quote_price=100,
+            opportunity_tier="exceptional",
+            market_costs={"entry_fee_bps": 0, "entry_slippage_bps": 0},
+        )
+
+        self.assertIsNone(decision.action)
+        self.assertEqual(decision.reason, "single_position_limit")
+        self.assertAlmostEqual(decision.current_position_ratio, 0.0)
+        self.assertGreater(decision.projected_position_ratio, 0.50)
+
     def test_signal_time_is_not_before_provider_quote_time(self):
         now = datetime(2026, 8, 10, 10, 0, tzinfo=TZ)
         quote_time = now + timedelta(seconds=3)
@@ -2966,6 +3226,75 @@ class SessionLoopTests(unittest.TestCase):
             candidates = load_candidate_plans(path, now=start)
 
         self.assertEqual(candidates, [])
+
+    def test_only_trusted_scan_artifact_can_activate_nonstandard_position_tier(self):
+        start = datetime(2026, 7, 28, 10, 0, tzinfo=TZ)
+        candidate = {
+            "code": "600001",
+            "scope": "simulation",
+            "name": "甲公司",
+            "action": "conditional_buy",
+            "research_status": "actionable",
+            "review_complete": True,
+            "eligible_for_intraday_review": True,
+            "hard_risk_veto": False,
+            "model_disagreement": False,
+            "opportunity_tier": "exceptional",
+            "confidence": 0.95,
+            "data_quality": "high",
+            "expected_holding_days": 20,
+            "market_costs": {
+                "entry_fee_bps": 3,
+                "exit_fee_bps": 3,
+                "entry_slippage_bps": 7,
+                "exit_slippage_bps": 7,
+            },
+            "plan": {
+                "entry_low": 99,
+                "entry_high": 101,
+                "entry_mid": 100,
+                "stop_loss": 95,
+                "take_profit_1": 120,
+            },
+        }
+        current_quote = quote("600001", 100, 0.5, start)
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            bare_path = root / "bare.json"
+            bare_path.write_text(json.dumps([candidate]), encoding="utf-8")
+            bare_plan = load_candidate_plans(bare_path, now=start)[0]
+            bare_payload = intraday_session_module._candidate_plan_payload(
+                bare_plan, current_quote
+            )
+
+            trusted_path = root / "trusted.json"
+            trusted_path.write_text(
+                json.dumps(
+                    {
+                        "generated_at": start.isoformat(),
+                        "simulation_only": True,
+                        "auto_order_enabled": False,
+                        "human_confirmation_required": True,
+                        "safe_to_push": True,
+                        "review_complete": True,
+                        "candidates": [candidate],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            trusted_plan = load_candidate_plans(trusted_path, now=start)[0]
+            trusted_payload = intraday_session_module._candidate_plan_payload(
+                trusted_plan, current_quote
+            )
+
+        self.assertIsNotNone(bare_payload)
+        self.assertEqual(bare_payload["opportunity_tier"], "standard")
+        self.assertEqual(bare_payload["initial_position_fraction"], 0.025)
+        self.assertIsNotNone(trusted_payload)
+        self.assertEqual(trusted_payload["opportunity_tier"], "exceptional")
+        self.assertEqual(trusted_payload["initial_position_fraction"], 0.10)
+        self.assertEqual(trusted_payload["max_single_position_ratio"], 0.50)
+        self.assertEqual(trusted_payload["_scan_generated_at"], start.isoformat())
 
     def test_untrusted_scan_scope_cannot_bypass_root_contract(self):
         start = datetime(2026, 7, 28, 10, 0, tzinfo=TZ)

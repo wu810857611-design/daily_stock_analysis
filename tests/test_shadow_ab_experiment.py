@@ -22,6 +22,7 @@ from scripts.shadow_ab_experiment import (
     save_state,
     strategy_cash,
     strategy_cash_cny,
+    strategy_nav,
     strategy_quantity,
     update_latest_quotes,
 )
@@ -326,6 +327,39 @@ class ShadowAbExperimentTests(unittest.TestCase):
             - trade["gross_amount_cny"]
             - trade["transaction_cost_cny"],
         )
+        self.assertGreaterEqual(strategy_cash_cny(state), 0)
+
+    def test_exceptional_initial_signal_sizes_ten_percent_of_strategy_nav(self):
+        state = initialize_state(private_portfolio())
+        added_cash = float(state["initial_nav"]) * 0.20
+        state["strategy_shadow_portfolio"]["cash_cny"] = added_cash
+        state["strategy_shadow_portfolio"]["cash_by_currency"] = {
+            "CNY": added_cash,
+            "HKD": 0.0,
+        }
+        nav = strategy_nav(state)
+
+        signal = record_signal(
+            state,
+            event_id="exceptional-ten-percent-entry",
+            symbol="600001",
+            signal_time="2026-08-10T10:00:05+08:00",
+            quote_time="2026-08-10T10:00:00+08:00",
+            signal_price=100,
+            action="buy_1_0",
+            reason="extreme opportunity tier initial tranche",
+        )
+
+        self.assertEqual(signal["action"], "buy_1.0_cheng")
+        self.assertAlmostEqual(signal["requested_notional"], nav * 0.10)
+        self.assertEqual(signal["position_delta"]["fraction"], 0.10)
+        outcomes = execute_pending(
+            state,
+            {"600001": quote("600001", 100, "2026-08-10T10:01:00+08:00")},
+            now=datetime(2026, 8, 10, 10, 1, 5, tzinfo=TZ),
+        )
+        self.assertEqual(outcomes[0]["status"], "executed")
+        self.assertGreater(strategy_quantity(state, "600001"), 0)
         self.assertGreaterEqual(strategy_cash_cny(state), 0)
 
     def test_h_share_sale_can_fund_a_share_buy_in_100_share_lots(self):

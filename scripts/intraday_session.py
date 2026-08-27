@@ -67,9 +67,17 @@ from scripts.generate_longbridge_oauth_token import (  # noqa: E402
     _package_rows,
 )
 from scripts.normalize_stock_list import canonical_symbol, normalize_stock_list  # noqa: E402
+from src.services.position_sizing_policy import (  # noqa: E402
+    DEFAULT_OPPORTUNITY_TIER,
+    POSITION_STEP_FRACTION,
+    SUPPORTED_TRANCHE_FRACTIONS,
+    OpportunityPolicy,
+    opportunity_policy,
+)
 from scripts.shadow_ab_experiment import (  # noqa: E402
     BASELINE_DATE as SHADOW_BASELINE_DATE,
     DEFAULT_COSTS as SHADOW_DEFAULT_COSTS,
+    HKD_CNY_BASELINE_FX as SHADOW_HKD_CNY_BASELINE_FX,
     ExperimentInputError as ShadowExperimentError,
     execute_pending as execute_shadow_pending,
     initial_symbols as shadow_initial_symbols,
@@ -165,6 +173,17 @@ class SessionResult:
     report_path: Path
 
 
+@dataclass(frozen=True)
+class CandidateSizingDecision:
+    action: Optional[str]
+    reason: str
+    policy: OpportunityPolicy
+    current_position_ratio: float
+    projected_position_ratio: float
+    projected_cash_ratio: float
+    tranche_fraction: float
+
+
 def _finite_float(value: Any) -> Optional[float]:
     if value is None or isinstance(value, bool):
         return None
@@ -183,6 +202,10 @@ def _positive_float(value: Any) -> Optional[float]:
 def _nonnegative_float(value: Any) -> Optional[float]:
     number = _finite_float(value)
     return number if number is not None and number >= 0 else None
+
+
+def _percentage_text(value: float) -> str:
+    return f"{value * 100:g}%"
 
 
 def _iso(value: datetime) -> str:
@@ -1679,6 +1702,9 @@ def load_candidate_plans(
             and candidate.get("hard_risk_veto") is not True
             and candidate.get("model_disagreement") is not True
         )
+        if trusted_candidate:
+            candidate["_trusted_opportunity_policy"] = True
+            candidate["_scan_generated_at"] = _iso(generated_at)
         if not candidate.get("scope") and trusted_candidate:
             # A scanner artifact satisfying the simulation/human-review
             # contract, plus an explicit per-candidate eligibility gate, is
@@ -1921,6 +1947,11 @@ def _candidate_plan_payload(
         if raw_confidence is not None
         else None
     )
+    candidate_policy = opportunity_policy(
+        candidate.get("opportunity_tier")
+        if candidate.get("_trusted_opportunity_policy") is True
+        else DEFAULT_OPPORTUNITY_TIER
+    )
     payload = {
         "symbol": symbol,
         # Scanner markets use A/HK_CONNECT; the deterministic policy contract
@@ -1944,6 +1975,11 @@ def _candidate_plan_payload(
         "incumbent_annualized_utility": candidate.get(
             "incumbent_annualized_utility", 0.0
         ),
+        "opportunity_tier": candidate_policy.tier,
+        "cash_floor_ratio": candidate_policy.cash_floor_ratio,
+        "max_single_position_ratio": candidate_policy.max_single_position_ratio,
+        "initial_position_fraction": candidate_policy.initial_position_fraction,
+        "add_position_fraction": candidate_policy.add_position_fraction,
     }
     # Do not call the underlying policy's emergency incomplete-plan path.
     # Every monitor-generated manual-review event must start from a complete
@@ -1971,6 +2007,9 @@ def _candidate_plan_payload(
     payload["_entry_high"] = entry_high
     payload["_raw_confidence"] = raw_confidence
     payload["_confidence_multiplier"] = multiplier
+    payload["_scan_generated_at"] = str(
+        candidate.get("_scan_generated_at") or ""
+    )
     if entry_low is None or entry_high is None or entry_low > entry_high:
         return None
     return payload
@@ -2109,6 +2148,12 @@ def enqueue_adaptive_plan_reviews(
                 "_entry_high",
                 "_scope",
                 "_holding_state",
+                "_scan_generated_at",
+                "opportunity_tier",
+                "cash_floor_ratio",
+                "max_single_position_ratio",
+                "initial_position_fraction",
+                "add_position_fraction",
             )
         }
         fingerprint = hashlib.sha256(
@@ -2262,6 +2307,18 @@ def enqueue_adaptive_plan_reviews(
                 "market_costs": payload.get("market_costs"),
                 "plan_fingerprint": fingerprint,
                 "scope": payload.get("_scope"),
+                "scan_generated_at": payload.get("_scan_generated_at"),
+                "opportunity_tier": payload.get("opportunity_tier"),
+                "cash_floor_ratio": payload.get("cash_floor_ratio"),
+                "max_single_position_ratio": payload.get(
+                    "max_single_position_ratio"
+                ),
+                "initial_position_fraction": payload.get(
+                    "initial_position_fraction"
+                ),
+                "add_position_fraction": payload.get(
+                    "add_position_fraction"
+                ),
             },
         )
         reviews[condition] = {
@@ -2361,8 +2418,10 @@ def clear_removed_adaptive_plan_reviews(
 _TRADE_ACTION_LABELS = {
     "buy_0_25": "建议买入0.25成",
     "buy_0_5": "建议买入0.5成",
+    "buy_1_0": "建议买入1成",
     "add_0_25": "建议加仓0.25成",
     "add_0_5": "建议加仓0.5成",
+    "add_1_0": "建议加仓1成",
     "reduce_1_4": "建议减仓1/4",
     "reduce_1_3": "建议减仓1/3",
     "reduce_1_2": "建议减仓1/2",
@@ -2461,40 +2520,182 @@ def _shadow_pending_buy_reservation(
     return reserved
 
 
-def _affordable_candidate_action(
+def _shadow_pending_symbol_notional(
+    shadow_state: Optional[Mapping[str, Any]], symbol: str
+) -> float:
+    """Return pending simulated buy/add notional for one symbol in CNY."""
+
+    if not shadow_state:
+        return 0.0
+    pending_ids = {
+        str(item)
+        for item in (shadow_state.get("pending_signal_ids") or [])
+        if str(item)
+    }
+    reserved = 0.0
+    for signal in shadow_state.get("signal_ledger") or []:
+        if not isinstance(signal, Mapping):
+            continue
+        if str(signal.get("signal_id") or "") not in pending_ids:
+            continue
+        if str(signal.get("symbol") or "") != symbol:
+            continue
+        if not str(signal.get("action") or "").startswith(("buy_", "add_")):
+            continue
+        reserved += _nonnegative_float(signal.get("requested_notional")) or 0.0
+    return reserved
+
+
+def _shadow_plan_already_sized(
     shadow_state: Optional[Mapping[str, Any]],
     *,
     symbol: str,
-    confidence: float,
-    market_costs: Optional[Mapping[str, Any]],
-) -> Optional[str]:
-    """Choose a buy size that preserves cash reserve after costs and pending buys."""
+    plan_fingerprint: Any,
+) -> bool:
+    fingerprint = str(plan_fingerprint or "").strip()
+    if not shadow_state or not fingerprint:
+        return False
+    return any(
+        isinstance(signal, Mapping)
+        and str(signal.get("symbol") or "") == symbol
+        and str(signal.get("plan_fingerprint") or "") == fingerprint
+        and str(signal.get("action") or "").startswith(("buy_", "add_"))
+        for signal in (shadow_state.get("signal_ledger") or [])
+    )
 
+
+def _shadow_position_basis_price(
+    shadow_state: Optional[Mapping[str, Any]], symbol: str
+) -> Optional[float]:
     if not shadow_state:
         return None
+    positions = (
+        (shadow_state.get("strategy_shadow_portfolio") or {}).get("positions")
+        or {}
+    )
+    position = positions.get(symbol) if isinstance(positions, Mapping) else None
+    if not isinstance(position, Mapping):
+        return None
+    return _positive_float(position.get("experiment_basis_price"))
+
+
+def _candidate_sizing_decision(
+    shadow_state: Optional[Mapping[str, Any]],
+    *,
+    symbol: str,
+    quote_price: float,
+    opportunity_tier: Any,
+    market_costs: Optional[Mapping[str, Any]],
+) -> CandidateSizingDecision:
+    """Choose one staged tranche under tiered cash and concentration limits."""
+
+    policy = opportunity_policy(opportunity_tier)
+    if not shadow_state:
+        return CandidateSizingDecision(
+            None, "shadow_unavailable", policy, 0.0, 0.0, 0.0, 0.0
+        )
     cash = _shadow_strategy_cash(shadow_state, symbol)
     try:
         nav = float(shadow_strategy_nav(shadow_state))
     except (KeyError, ShadowExperimentError, TypeError, ValueError):
-        return None
+        return CandidateSizingDecision(
+            None, "nav_unavailable", policy, 0.0, 0.0, 0.0, 0.0
+        )
     if cash <= 0 or not math.isfinite(nav) or nav <= 0:
-        return None
+        return CandidateSizingDecision(
+            None, "insufficient_cash", policy, 0.0, 0.0, 0.0, 0.0
+        )
+
+    quantity = _shadow_strategy_quantity(shadow_state, symbol)
+    fx_to_cny = SHADOW_HKD_CNY_BASELINE_FX if symbol.startswith("HK") else 1.0
+    current_position_ratio = max(quantity * quote_price * fx_to_cny / nav, 0.0)
+    pending_symbol_ratio = _shadow_pending_symbol_notional(
+        shadow_state, symbol
+    ) / nav
+    reserved_position_ratio = current_position_ratio + pending_symbol_ratio
+    minimum_projected_position_ratio = (
+        reserved_position_ratio + POSITION_STEP_FRACTION
+    )
+
+    if quantity > 0:
+        basis_price = _shadow_position_basis_price(shadow_state, symbol)
+        if basis_price is None or quote_price + 1e-9 < basis_price:
+            return CandidateSizingDecision(
+                None,
+                "add_requires_right_side_confirmation",
+                policy,
+                current_position_ratio,
+                minimum_projected_position_ratio,
+                cash / nav,
+                0.0,
+            )
+    if minimum_projected_position_ratio > policy.max_single_position_ratio + 1e-9:
+        return CandidateSizingDecision(
+            None,
+            "single_position_limit",
+            policy,
+            current_position_ratio,
+            minimum_projected_position_ratio,
+            cash / nav,
+            0.0,
+        )
+
     unreserved_cash = max(cash - _shadow_pending_buy_reservation(shadow_state), 0.0)
-    minimum_cash_reserve = nav * DEFAULT_TARGET_CASH_MIN_RATIO
+    minimum_cash_reserve = nav * policy.cash_floor_ratio
     costs = market_costs or {}
     fee_bps = _nonnegative_float(costs.get("entry_fee_bps")) or 0.0
     slippage_bps = _nonnegative_float(costs.get("entry_slippage_bps")) or 0.0
     cost_multiplier = 1.0 + (fee_bps + slippage_bps) / 10_000.0
-    del confidence
-    choices = [("buy_0_25", 0.025)]
-    for action, fraction in choices:
+    preferred_fraction = (
+        policy.add_position_fraction
+        if quantity > 0
+        else policy.initial_position_fraction
+    )
+    choices = tuple(
+        fraction
+        for fraction in SUPPORTED_TRANCHE_FRACTIONS
+        if fraction <= preferred_fraction + 1e-9
+    )
+    suffix_by_fraction = {0.10: "1_0", 0.05: "0_5", 0.025: "0_25"}
+    for fraction in choices:
+        projected_position_ratio = reserved_position_ratio + fraction
+        if projected_position_ratio > policy.max_single_position_ratio + 1e-9:
+            continue
         required_cash = nav * fraction * cost_multiplier
-        if (
-            unreserved_cash + 1e-9 >= required_cash
-            and unreserved_cash - required_cash + 1e-9 >= minimum_cash_reserve
-        ):
-            return action
-    return None
+        projected_cash_ratio = (unreserved_cash - required_cash) / nav
+        if unreserved_cash + 1e-9 < required_cash:
+            continue
+        if unreserved_cash - required_cash + 1e-9 < minimum_cash_reserve:
+            continue
+        prefix = "add" if quantity > 0 else "buy"
+        return CandidateSizingDecision(
+            f"{prefix}_{suffix_by_fraction[fraction]}",
+            "approved",
+            policy,
+            current_position_ratio,
+            projected_position_ratio,
+            projected_cash_ratio,
+            fraction,
+        )
+
+    minimum_required_cash = nav * POSITION_STEP_FRACTION * cost_multiplier
+    minimum_projected_cash_ratio = (
+        unreserved_cash - minimum_required_cash
+    ) / nav
+    reason = (
+        "insufficient_cash"
+        if unreserved_cash + 1e-9 < minimum_required_cash
+        else "cash_floor"
+    )
+    return CandidateSizingDecision(
+        None,
+        reason,
+        policy,
+        current_position_ratio,
+        minimum_projected_position_ratio,
+        minimum_projected_cash_ratio,
+        0.0,
+    )
 
 
 def _mark_raw_decision(
@@ -2566,13 +2767,6 @@ def enqueue_cash_available_candidate_rechecks(
             .get("adaptive_entry_review", {})
         )
         source_payload = decision_state.get("source_payload") or {}
-        if _affordable_candidate_action(
-            shadow_state,
-            symbol=symbol,
-            confidence=_finite_float(source_payload.get("confidence")) or 0.0,
-            market_costs=(source_payload.get("market_costs") or {}),
-        ) is None:
-            continue
         if (
             review.get("status") != "active"
             or review.get("fingerprint") != source_payload.get("plan_fingerprint")
@@ -2591,6 +2785,15 @@ def enqueue_cash_available_candidate_rechecks(
             or not (low <= quote.price <= high)
             or not (stop < quote.price < target)
         ):
+            continue
+        sizing = _candidate_sizing_decision(
+            shadow_state,
+            symbol=symbol,
+            quote_price=quote.price,
+            opportunity_tier=source_payload.get("opportunity_tier"),
+            market_costs=(source_payload.get("market_costs") or {}),
+        )
+        if sizing.action is None:
             continue
         payload = {
             **dict(source_payload),
@@ -2693,6 +2896,7 @@ def process_actionable_decisions(
         invalidation = "出现更新且可靠的关键位或研究计划后重新评估。"
         severity = str(raw_event.get("severity") or "info")
         cash_ratio: Optional[float] = None
+        sizing: Optional[CandidateSizingDecision] = None
 
         if price is None or data_quality not in {"fresh_l1", "high", "medium"}:
             _mark_raw_decision(raw_event, result="no_operation_unreliable_data")
@@ -2767,25 +2971,34 @@ def process_actionable_decisions(
             entry_high = _positive_float(raw_payload.get("entry_high"))
             stop_loss = _positive_float(raw_payload.get("stop_loss"))
             target = _positive_float(raw_payload.get("target_price"))
-            confidence = _finite_float(raw_payload.get("confidence")) or 0.0
             if not all((key_level, entry_high, stop_loss, target)):
                 _mark_raw_decision(raw_event, result="no_operation_incomplete_plan")
                 continue
-            if quantity > 0:
-                _mark_raw_decision(raw_event, result="no_operation_already_held")
-                continue
-            affordable_action = _affordable_candidate_action(
+            if _shadow_plan_already_sized(
                 shadow_state,
                 symbol=symbol,
-                confidence=confidence,
+                plan_fingerprint=raw_payload.get("plan_fingerprint"),
+            ):
+                _mark_raw_decision(
+                    raw_event,
+                    result="no_operation_scan_already_sized",
+                )
+                continue
+            sizing = _candidate_sizing_decision(
+                shadow_state,
+                symbol=symbol,
+                quote_price=price,
+                opportunity_tier=raw_payload.get("opportunity_tier"),
                 market_costs=(raw_payload.get("market_costs") or {}),
             )
-            if affordable_action is None:
+            if sizing.action is None:
                 observe_fingerprint = hashlib.sha256(
                     json.dumps(
                         {
                             "condition": condition,
                             "action": "observe",
+                            "reason": sizing.reason,
+                            "opportunity_tier": sizing.policy.tier,
                             "plan_fingerprint": raw_payload.get(
                                 "plan_fingerprint"
                             ),
@@ -2810,14 +3023,34 @@ def process_actionable_decisions(
                 )
                 _mark_raw_decision(
                     raw_event,
-                    result="no_operation_insufficient_cash_for_explicit_buy",
+                    result=(
+                        "no_operation_insufficient_cash_for_explicit_buy"
+                        if sizing.reason
+                        in {"cash_floor", "insufficient_cash", "nav_unavailable"}
+                        else f"no_operation_{sizing.reason}"
+                    ),
                 )
                 continue
             else:
-                action = affordable_action
+                action = sizing.action
                 conclusion = _TRADE_ACTION_LABELS[action]
-                position_change = "+5% NAV" if action == "buy_0_5" else "+2.5% NAV"
-                basis = "候选已进入可信计划区，并通过交易成本、数据质量和风险收益门槛。"
+                position_change = f"+{_percentage_text(sizing.tranche_fraction)} NAV"
+                cash_ratio = _shadow_strategy_cash_ratio(shadow_state, symbol)
+                if action.startswith("add_"):
+                    basis = (
+                        f"新一轮独立扫描与双模型复核仍判定为{sizing.policy.label}，"
+                        "价格未跌破实验基准；"
+                        f"本次逐级加仓{_percentage_text(sizing.tranche_fraction)}，"
+                        f"预计单股仓位约 {sizing.projected_position_ratio:.1%}，"
+                        f"不超过本档上限 {sizing.policy.max_single_position_ratio:.0%}。"
+                    )
+                else:
+                    basis = (
+                        f"候选被判定为{sizing.policy.label}并进入可信计划区；"
+                        f"本次分级建仓{_percentage_text(sizing.tranche_fraction)}，"
+                        "后续必须经新的"
+                        "独立扫描确认才可逐级增加。"
+                    )
             invalidation = (
                 f"价格跌破 {stop_loss:.3f}、离开 {key_level:.3f}–{entry_high:.3f} "
                 f"买入区或超过 {target:.3f} 后，本建议失效。"
@@ -2859,6 +3092,12 @@ def process_actionable_decisions(
                 if cash_ratio is not None
                 and cash_ratio >= DEFAULT_TARGET_CASH_MAX_RATIO
                 else "below_max"
+            ),
+            "opportunity_tier": (
+                sizing.policy.tier if sizing is not None else None
+            ),
+            "projected_position_ratio": (
+                sizing.projected_position_ratio if sizing is not None else None
             ),
         }
         fingerprint = hashlib.sha256(
@@ -2911,6 +3150,14 @@ def process_actionable_decisions(
                     else "new_candidate_selection"
                 ),
                 "market_costs": raw_payload.get("market_costs"),
+                "plan_fingerprint": raw_payload.get("plan_fingerprint"),
+                "scan_generated_at": raw_payload.get("scan_generated_at"),
+                "opportunity_tier": (
+                    sizing.policy.tier if sizing is not None else None
+                ),
+                "tranche_fraction": (
+                    sizing.tranche_fraction if sizing is not None else None
+                ),
             }
             try:
                 saved_signal = signal_recorder(shadow_state, signal)
@@ -2971,6 +3218,44 @@ def process_actionable_decisions(
                     DEFAULT_TARGET_CASH_MIN_RATIO,
                     DEFAULT_TARGET_CASH_MAX_RATIO,
                 ],
+                "opportunity_tier": (
+                    sizing.policy.tier if sizing is not None else None
+                ),
+                "opportunity_tier_label": (
+                    sizing.policy.label if sizing is not None else None
+                ),
+                "cash_floor_ratio": (
+                    sizing.policy.cash_floor_ratio if sizing is not None else None
+                ),
+                "projected_cash_ratio": (
+                    sizing.projected_cash_ratio if sizing is not None else None
+                ),
+                "current_position_ratio": (
+                    sizing.current_position_ratio if sizing is not None else None
+                ),
+                "projected_position_ratio": (
+                    sizing.projected_position_ratio if sizing is not None else None
+                ),
+                "max_single_position_ratio": (
+                    sizing.policy.max_single_position_ratio
+                    if sizing is not None
+                    else None
+                ),
+                "initial_position_fraction": (
+                    sizing.policy.initial_position_fraction
+                    if sizing is not None
+                    else None
+                ),
+                "add_position_fraction": (
+                    sizing.policy.add_position_fraction
+                    if sizing is not None
+                    else None
+                ),
+                "tranche_fraction": (
+                    sizing.tranche_fraction
+                    if sizing is not None
+                    else None
+                ),
             },
         )
         decision_state.update(
@@ -3305,6 +3590,8 @@ def _suggested_quantity_text(
         return "策略净值的 2.5%（股数按下一笔新鲜报价计算）"
     if action_code in {"buy_0_5", "add_0_5"}:
         return "策略净值的 5%（股数按下一笔新鲜报价计算）"
+    if action_code in {"buy_1_0", "add_1_0"}:
+        return "策略净值的 10%（股数按下一笔新鲜报价计算）"
     if action_code == "hold_cash_guardrail":
         return "0 股（保留现有持仓）"
     return "0 股"

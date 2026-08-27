@@ -38,6 +38,7 @@ from src.services.market_scan_service import (
     render_market_scan_markdown,
     validate_trade_plan,
 )
+from src.services.position_sizing_policy import classify_opportunity
 
 
 NOW = datetime(2026, 7, 28, 14, 30, tzinfo=ZoneInfo("Asia/Shanghai"))
@@ -96,9 +97,16 @@ def _history(_code: str, _days: int) -> Any:
 
 
 class ReviewRecorder:
-    def __init__(self, verdict: str = "pass", *, hard_risk: bool = False):
+    def __init__(
+        self,
+        verdict: str = "pass",
+        *,
+        hard_risk: bool = False,
+        confidence: float = 0.8,
+    ):
         self.verdict = verdict
         self.hard_risk = hard_risk
+        self.confidence = confidence
         self.calls: list[list[Dict[str, Any]]] = []
 
     def __call__(self, candidates: Sequence[Mapping[str, Any]]) -> Mapping[str, Any]:
@@ -109,7 +117,7 @@ class ReviewRecorder:
                 {
                     "code": candidate["code"],
                     "verdict": self.verdict,
-                    "confidence": 0.8,
+                    "confidence": self.confidence,
                     "hard_risk": self.hard_risk,
                     "thesis": f"{self.verdict} from fake reviewer",
                     "risks": [],
@@ -655,12 +663,92 @@ def test_v4_prompt_and_report_separate_facts_inferences_views_and_mark_l2_unavai
     assert candidate["confidence"] <= candidate["data_quality"]
     assert candidate["simulation_advice"] == "进入买入区后建议首笔建仓2.5%"
     assert candidate["simulated_portfolio_weight"] == pytest.approx(0.025)
+    assert candidate["opportunity_tier"] == "standard"
+    assert candidate["cash_floor_ratio"] == pytest.approx(0.15)
+    assert candidate["max_single_position_ratio"] == pytest.approx(0.15)
+    assert candidate["initial_position_fraction"] == pytest.approx(0.025)
+    assert candidate["add_position_fraction"] == pytest.approx(0.025)
     assert candidate["eligible_for_intraday_review"] is True
     assert "## 买入候选漏斗" in report
     assert "### 已核验事实" in report
     assert "### 规则推断（不是事实）" in report
     assert "### 审慎观点" in report
     assert "Level-2=unavailable" in report
+
+
+def test_high_conviction_scan_emits_exceptional_dynamic_sizing(tmp_path: Path) -> None:
+    result = _service(
+        tmp_path,
+        qwen=ReviewRecorder("pass", confidence=0.92),
+        deepseek=ReviewRecorder("pass", confidence=0.94),
+    ).run()
+
+    candidate = result["candidates"][0]
+    assert candidate["rank"] <= 3
+    assert candidate["plan"]["net_rr"] >= 2.0
+    assert candidate["opportunity_tier"] == "exceptional"
+    assert candidate["cash_floor_ratio"] == pytest.approx(0.0)
+    assert candidate["max_single_position_ratio"] == pytest.approx(0.50)
+    assert candidate["simulated_portfolio_weight"] == pytest.approx(0.10)
+    assert candidate["initial_position_fraction"] == pytest.approx(0.10)
+    assert candidate["add_position_fraction"] == pytest.approx(0.05)
+    assert candidate["opportunity_tier_evidence"] == {
+        "rank": candidate["rank"],
+        "data_quality": candidate["data_quality"],
+        "net_rr": candidate["plan"]["net_rr"],
+        "qwen_confidence": 0.92,
+        "deepseek_confidence": 0.94,
+    }
+
+
+@pytest.mark.parametrize(
+    (
+        "rank",
+        "data_quality",
+        "net_rr",
+        "qwen_confidence",
+        "deepseek_confidence",
+        "expected_tier",
+        "expected_cash_floor",
+        "expected_position_limit",
+        "expected_initial_fraction",
+        "expected_add_fraction",
+    ),
+    [
+        (6, 0.80, 3.5, 0.95, 0.95, "standard", 0.15, 0.15, 0.025, 0.025),
+        (4, 0.80, 2.0, 0.85, 0.88, "strong", 0.05, 0.35, 0.05, 0.05),
+        (3, 0.80, 2.0, 0.90, 0.93, "exceptional", 0.0, 0.50, 0.10, 0.05),
+    ],
+)
+def test_opportunity_tier_controls_soft_cash_floor_and_dynamic_concentration(
+    rank: int,
+    data_quality: float,
+    net_rr: float,
+    qwen_confidence: float,
+    deepseek_confidence: float,
+    expected_tier: str,
+    expected_cash_floor: float,
+    expected_position_limit: float,
+    expected_initial_fraction: float,
+    expected_add_fraction: float,
+) -> None:
+    policy = classify_opportunity(
+        rank=rank,
+        data_quality=data_quality,
+        net_rr=net_rr,
+        qwen_confidence=qwen_confidence,
+        deepseek_confidence=deepseek_confidence,
+    )
+
+    assert policy.tier == expected_tier
+    assert policy.cash_floor_ratio == pytest.approx(expected_cash_floor)
+    assert policy.max_single_position_ratio == pytest.approx(
+        expected_position_limit
+    )
+    assert policy.initial_position_fraction == pytest.approx(
+        expected_initial_fraction
+    )
+    assert policy.add_position_fraction == pytest.approx(expected_add_fraction)
 
 
 def test_push_failure_does_not_lose_report_or_independent_history(tmp_path: Path) -> None:
