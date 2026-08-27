@@ -22,11 +22,19 @@ from scripts.market_scan import (
     build_litellm_reviewer,
     persist_result_and_notify,
 )
+from scripts.intraday_session import (
+    RealtimeQuote,
+    enqueue_adaptive_plan_reviews,
+    load_candidate_plans,
+    load_state_v2,
+)
 from src.services.market_scan_service import (
     MARKET_A,
     MARKET_HK,
     MarketScanConfig,
     MarketScanService,
+    default_a_snapshot_loader,
+    default_hk_all_snapshot_loader,
     render_market_scan_markdown,
     validate_trade_plan,
 )
@@ -135,12 +143,14 @@ def _service(
     history_loader: Any = _history,
     a_loader: Any = _a_snapshot,
     hk_loader: Any = _hk_snapshot,
+    hk_all_loader: Any = None,
     config_overrides: Mapping[str, Any] | None = None,
     clock: Any = None,
 ) -> MarketScanService:
     return MarketScanService(
         a_snapshot_loader=a_loader,
         hk_connect_snapshot_loader=hk_loader,
+        hk_all_snapshot_loader=hk_all_loader,
         history_loader=history_loader,
         qwen_reviewer=qwen,
         deepseek_reviewer=deepseek,
@@ -202,24 +212,89 @@ def test_only_shortlist_loads_history_and_models_review_final_batch_independentl
     assert len(qwen.calls[0]) == len(result["candidates"]) <= 3
     assert qwen.calls[0] is not deepseek.calls[0]
     assert all(
-        {"amount", "turnover_rate", "volume_ratio", "pe", "pb", "data_availability"}
+        {
+            "amount",
+            "turnover_rate",
+            "volume_ratio",
+            "pe",
+            "pb",
+            "data_availability",
+            "review_request",
+        }
         <= set(candidate)
         for candidate in qwen.calls[0]
     )
     assert result["diagnostics"]["llm_calls"] == {"qwen": 1, "deepseek": 1}
-    assert all(candidate["action"] == "watch" for candidate in result["candidates"])
     assert all(
-        candidate["research_status"] == "deep_research_required"
+        (candidate["facts"] or {}).get("snapshot_fetched_at") == NOW.isoformat()
+        and (candidate["facts"] or {}).get("snapshot_source")
+        for candidate in qwen.calls[0]
+    )
+    assert all(
+        candidate["action"] == "conditional_buy"
         for candidate in result["candidates"]
     )
-    assert all(candidate["simulation_advice"] == "等待" for candidate in result["candidates"])
+    assert all(
+        candidate["research_status"] == "actionable"
+        for candidate in result["candidates"]
+    )
+    assert all(
+        candidate["simulation_advice"] == "进入买入区后建议首笔建仓2.5%"
+        for candidate in result["candidates"]
+    )
     assert all(candidate["data_availability"]["level2"] == "unavailable" for candidate in result["candidates"])
     assert all(candidate["position_state"] == "flat" for candidate in result["candidates"])
     assert all(
-        candidate["eligible_for_intraday_review"] is False
+        candidate["eligible_for_intraday_review"] is True
         for candidate in result["candidates"]
     )
+    assert result["diagnostics"]["buy_funnel"]["actionable_count"] == len(
+        result["candidates"]
+    )
     assert result["auto_order_enabled"] is False
+
+
+def test_production_scan_artifact_is_accepted_by_intraday_buy_gate(
+    tmp_path: Path,
+) -> None:
+    result = _service(
+        tmp_path,
+        qwen=ReviewRecorder("pass"),
+        deepseek=ReviewRecorder("pass"),
+    ).run()
+    artifact = tmp_path / "latest.json"
+    artifact.write_text(json.dumps(result, ensure_ascii=False), encoding="utf-8")
+
+    loaded = load_candidate_plans(artifact, now=NOW)
+
+    assert loaded
+    assert {item["code"] for item in loaded} == {
+        item["code"] for item in result["candidates"]
+    }
+    assert all(float(item["data_quality"]) >= 0.70 for item in loaded)
+    assert all(item["position_state"] == "flat" for item in loaded)
+    candidate = loaded[0]
+    plan = candidate["plan"]
+    entry_price = float(plan["entry_mid"])
+    quote = RealtimeQuote(
+        symbol=str(candidate["code"]),
+        name=str(candidate["name"]),
+        price=entry_price,
+        change_pct=0.0,
+        provider_timestamp=NOW.isoformat(),
+        fetched_at=NOW.isoformat(),
+        stale_seconds=0.0,
+        is_stale=False,
+        source="integration_fixture",
+    )
+    state = load_state_v2(tmp_path / "missing_state.json", now=NOW)
+    assert enqueue_adaptive_plan_reviews(
+        state,
+        now=NOW,
+        quotes=[quote],
+        candidates=[candidate],
+    ) == 1
+    assert state["event_ledger"][-1]["condition"] == "adaptive_entry_review"
 
 
 def test_hk_universe_strictly_excludes_non_connect_symbols(tmp_path: Path) -> None:
@@ -236,6 +311,7 @@ def test_hk_universe_strictly_excludes_non_connect_symbols(tmp_path: Path) -> No
     assert result.diagnostics["hk_connect_strict"] is True
     cached = json.loads((tmp_path / "hk_connect.json").read_text(encoding="utf-8"))
     assert cached["is_connect_universe"] is True
+    assert set(cached["membership_codes"]) == {"HK00700", "HK00981"}
     assert {item["code"] for item in cached["records"]} == {"HK00700", "HK00981"}
 
 
@@ -266,6 +342,113 @@ def test_a_snapshot_provider_failure_uses_fresh_cache_without_rewriting_asof(
     assert cached_result.as_of[MARKET_A] == original["as_of"]
     assert cached_result.as_of[MARKET_A] != later.isoformat()
     assert cached_result.diagnostics["a_snapshot_source"].endswith(":last_good_cache")
+
+
+def test_default_full_market_loaders_use_independent_fallbacks(monkeypatch: Any) -> None:
+    a_calls: list[str] = []
+    hk_calls: list[str] = []
+
+    def broken_a() -> Any:
+        a_calls.append("eastmoney")
+        raise TimeoutError("eastmoney unavailable")
+
+    def sina_a() -> pd.DataFrame:
+        a_calls.append("sina")
+        return pd.DataFrame(
+            [{"代码": "sh600001", "名称": "甲公司", "最新价": 10, "成交量": 1, "成交额": 1}]
+        )
+
+    def broken_hk() -> Any:
+        hk_calls.append("eastmoney")
+        raise TimeoutError("eastmoney unavailable")
+
+    def sina_hk() -> pd.DataFrame:
+        hk_calls.append("sina")
+        return pd.DataFrame(
+            [{"代码": "00700", "中文名称": "腾讯控股", "最新价": 100, "成交量": 1, "成交额": 1}]
+        )
+
+    monkeypatch.setitem(
+        sys.modules,
+        "akshare",
+        SimpleNamespace(
+            stock_zh_a_spot_em=broken_a,
+            stock_zh_a_spot=sina_a,
+            stock_hk_spot_em=broken_hk,
+            stock_hk_spot=sina_hk,
+        ),
+    )
+
+    a_payload = default_a_snapshot_loader()
+    hk_payload = default_hk_all_snapshot_loader()
+
+    assert a_calls == ["eastmoney", "sina"]
+    assert hk_calls == ["eastmoney", "sina"]
+    assert a_payload["source"] == "akshare.stock_zh_a_spot"
+    assert hk_payload["source"] == "akshare.stock_hk_spot"
+    assert a_payload["provider_errors"]
+    assert hk_payload["provider_errors"]
+
+
+def test_hk_quote_fallback_filters_fresh_all_market_quotes_by_cached_membership(
+    tmp_path: Path,
+) -> None:
+    _service(
+        tmp_path,
+        qwen=ReviewRecorder(),
+        deepseek=ReviewRecorder(),
+    ).run_l1()
+
+    def broken_connect_loader() -> Any:
+        raise TimeoutError("connect endpoint unavailable")
+
+    def all_hk_loader() -> Mapping[str, Any]:
+        return {
+            "source": "fake_all_hk",
+            "as_of": (NOW + timedelta(hours=1)).isoformat(),
+            "is_full_hk_universe": True,
+            "records": [
+                {
+                    "代码": "00700",
+                    "中文名称": "腾讯控股",
+                    "最新价": 101,
+                    "涨跌幅": 1,
+                    "成交量": 1_000,
+                    "成交额": 1_000,
+                },
+                {
+                    "代码": "09999",
+                    "中文名称": "非港股通",
+                    "最新价": 103,
+                    "涨跌幅": 1,
+                    "成交量": 1_000,
+                    "成交额": 1_000,
+                },
+            ],
+        }
+
+    result = _service(
+        tmp_path,
+        qwen=ReviewRecorder(),
+        deepseek=ReviewRecorder(),
+        hk_loader=broken_connect_loader,
+        hk_all_loader=all_hk_loader,
+        clock=lambda: NOW + timedelta(hours=1),
+        config_overrides={
+            "hk_cache_max_age_hours": 0.1,
+            "top_hk_history": 2,
+        },
+    ).run_l1()
+
+    assert result.hk_safe_halt is False
+    assert {item["code"] for item in result.hk_candidates} == {"HK00700"}
+    assert result.diagnostics["hk_snapshot_source"].endswith(
+        ":cached_connect_membership"
+    )
+    cached = json.loads((tmp_path / "hk_connect.json").read_text(encoding="utf-8"))
+    assert {item["code"] for item in cached["records"]} == {"HK00700"}
+    assert set(cached["membership_codes"]) == {"HK00700", "HK00981"}
+    assert cached["membership_fetched_at"] == NOW.isoformat()
 
 
 def test_fetch_time_is_not_fabricated_as_provider_market_timestamp(tmp_path: Path) -> None:
@@ -322,7 +505,12 @@ def test_a_snapshot_stale_cache_safely_blocks_push(tmp_path: Path) -> None:
     ).run()
 
     assert result["safe_to_push"] is False
+    assert result["operational_status"] == "failed"
+    assert "a_share_full_market_snapshot_unavailable" in result[
+        "operational_failures"
+    ]
     assert result["diagnostics"]["a_full_market_strict"] is False
+    assert all(item["action"] == "watch" for item in result["candidates"])
     assert any("A股全市场快照不可用" in reason for reason in result["push_block_reasons"])
 
 
@@ -362,6 +550,46 @@ def test_expired_hk_cache_safely_blocks_push_when_provider_fails(tmp_path: Path)
     assert any("港股通成分数据不可用" in reason for reason in result["push_block_reasons"])
 
 
+def test_fresh_hk_quotes_cannot_extend_expired_connect_membership(
+    tmp_path: Path,
+) -> None:
+    cache_path = tmp_path / "hk_connect.json"
+    cache_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "saved_at": (NOW - timedelta(minutes=30)).isoformat(),
+                "as_of": (NOW - timedelta(minutes=30)).isoformat(),
+                "membership_fetched_at": (NOW - timedelta(days=36)).isoformat(),
+                "source": "fresh_quotes_with_expired_membership",
+                "is_connect_universe": True,
+                "membership_codes": ["HK00700", "HK00981"],
+                "records": _hk_snapshot(include_non_connect=False)["records"],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    def broken_hk_loader() -> Any:
+        raise TimeoutError("provider timeout")
+
+    result = _service(
+        tmp_path,
+        qwen=ReviewRecorder(),
+        deepseek=ReviewRecorder(),
+        hk_loader=broken_hk_loader,
+        config_overrides={
+            "hk_cache_max_age_hours": 6.0,
+            "hk_membership_cache_max_age_hours": 24.0 * 35.0,
+        },
+    ).run()
+
+    assert result["operational_status"] == "failed"
+    assert result["diagnostics"]["hk_connect_strict"] is False
+    assert "hk_connect_snapshot_unavailable" in result["operational_failures"]
+
+
 def test_trade_plan_rr_boundary_is_inclusive() -> None:
     base = {
         "entry_low": 99.0,
@@ -378,6 +606,11 @@ def test_trade_plan_rr_boundary_is_inclusive() -> None:
     assert accepted.valid is True
     assert rejected.valid is False
     assert rejected.reasons == ("net_rr_below_minimum",)
+
+
+def test_actionable_quality_cannot_be_configured_below_intraday_gate() -> None:
+    with pytest.raises(ValueError, match="between 0.70 and 1"):
+        MarketScanConfig(min_actionable_data_quality=0.69)
 
 
 def test_model_conflict_or_hard_risk_downgrades_to_watch(tmp_path: Path) -> None:
@@ -420,7 +653,10 @@ def test_v4_prompt_and_report_separate_facts_inferences_views_and_mark_l2_unavai
     assert candidate["scope"] == "simulation"
     assert candidate["policy_market"] in {"cn", "hk"}
     assert candidate["confidence"] <= candidate["data_quality"]
-    assert candidate["simulation_advice"] == "等待"
+    assert candidate["simulation_advice"] == "进入买入区后建议首笔建仓2.5%"
+    assert candidate["simulated_portfolio_weight"] == pytest.approx(0.025)
+    assert candidate["eligible_for_intraday_review"] is True
+    assert "## 买入候选漏斗" in report
     assert "### 已核验事实" in report
     assert "### 规则推断（不是事实）" in report
     assert "### 审慎观点" in report
@@ -555,6 +791,85 @@ def test_false_notification_result_stays_pending_and_retries_next_run(tmp_path: 
     assert second["notification_sent"] is True
 
 
+def test_operational_failure_alert_is_deduped_and_recovery_is_sent_once(
+    tmp_path: Path,
+) -> None:
+    failure = {
+        "generated_at": NOW.isoformat(),
+        "as_of": {MARKET_A: "", MARKET_HK: ""},
+        "safe_to_push": False,
+        "push_block_reasons": ["全市场快照不可用"],
+        "operational_status": "failed",
+        "operational_failures": ["a_share_full_market_snapshot_unavailable"],
+        "diagnostics": {"buy_funnel": {"snapshot_input_count": 0}},
+        "candidates": [],
+        "disclaimer": "simulation only",
+    }
+    calls: list[tuple[str, str]] = []
+
+    first = persist_result_and_notify(
+        failure,
+        report_path=tmp_path / "scan.md",
+        result_path=tmp_path / "scan.json",
+        state_dir=tmp_path / "state",
+        notify=True,
+        notifier=lambda title, content: calls.append((title, content)) or True,
+    )
+    assert first["notification_kind"] == "failure"
+    assert first["notification_sent"] is True
+    assert calls[0][0] == "全市场买入链路故障"
+    assert "硬止损风险提醒继续有效" in calls[0][1]
+
+    changed_failure = {
+        **failure,
+        "safe_to_push": True,
+        "candidates": [{"code": "600001", "action": "conditional_buy", "plan": {}}],
+    }
+    second = persist_result_and_notify(
+        changed_failure,
+        report_path=tmp_path / "scan.md",
+        result_path=tmp_path / "scan.json",
+        state_dir=tmp_path / "state",
+        notify=True,
+        notifier=lambda _title, _content: (_ for _ in ()).throw(
+            AssertionError("unhealthy candidate changes must not bypass health deduplication")
+        ),
+    )
+    assert second["notification_attempted"] is False
+
+    recovery = {
+        **failure,
+        "generated_at": (NOW + timedelta(hours=1)).isoformat(),
+        "safe_to_push": True,
+        "push_block_reasons": [],
+        "operational_status": "healthy",
+        "operational_failures": [],
+        "candidates": [{"code": "600001", "action": "watch", "plan": {}}],
+    }
+    recovered = persist_result_and_notify(
+        recovery,
+        report_path=tmp_path / "scan.md",
+        result_path=tmp_path / "scan.json",
+        state_dir=tmp_path / "state",
+        notify=True,
+        notifier=lambda title, content: calls.append((title, content)) or True,
+    )
+    assert recovered["notification_kind"] == "recovery"
+    assert calls[-1][0] == "全市场买入链路已恢复"
+
+    stable = persist_result_and_notify(
+        recovery,
+        report_path=tmp_path / "scan.md",
+        result_path=tmp_path / "scan.json",
+        state_dir=tmp_path / "state",
+        notify=True,
+        notifier=lambda _title, _content: (_ for _ in ()).throw(
+            AssertionError("same recovery must be deduplicated")
+        ),
+    )
+    assert stable["notification_attempted"] is False
+
+
 def test_market_scan_workflow_is_independent_simulation_with_fixed_state_artifact() -> None:
     path = ROOT_DIR / ".github" / "workflows" / "02-market-scan.yml"
     text = path.read_text(encoding="utf-8")
@@ -583,6 +898,8 @@ def test_market_scan_workflow_is_independent_simulation_with_fixed_state_artifac
     assert "actions/artifacts?name=market-scan-state" in text
     assert "unsafe market-scan entry" in text
     assert "scripts/market_scan.py" in text
+    assert "严格确认买入链路健康" in text
+    assert "SCAN_EXIT_CODE" in text
     assert "00-daily-analysis.yml" not in text
     assert "01-adaptive-market-monitor.yml" not in text
     assert "broker" not in text.lower()

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -22,6 +23,7 @@ from src.services.market_scan_service import (  # noqa: E402
     MarketScanService,
     default_a_snapshot_loader,
     default_history_loader,
+    default_hk_all_snapshot_loader,
     default_hk_connect_snapshot_loader,
     render_market_scan_markdown,
 )
@@ -55,6 +57,12 @@ MARKET_SCAN_REVIEW_SYSTEM_PROMPT = """
 重大数据质量问题或流动性无法执行时 hard_risk=true。缺少可靠Level-2时，不得把
 “主力抢筹、洗盘、诱多”写成事实。做T必须有分时、盘口、波动、胜率及扣费后正期望，
 否则只能判 watch。模型不是fallback，意见将与另一个模型独立比对。
+
+本任务的 verdict 不是立即买卖指令：若程序给出的完整买入区、止损、目标、数据质量
+和扣费后风险回报可支持“进入盘中新鲜价格区复核”，且没有硬风险，可判 pass；
+缺少 Level-2 本身不等于 reject，但必须降低相应推断置信度。pass 后程序最多生成
+首笔 2.5% 模拟净值、仍需人工确认的条件建仓建议；当前价未进入买入区的标的仍不会
+触发买入提醒。
 
 输出严格 JSON，必须为每个输入代码且仅输出一条 review；`facts`、`inferences`、
 `risks`、`invalidators` 各最多两条，`thesis` 和 `view` 各最多 120 个汉字：
@@ -312,6 +320,41 @@ def _notification_succeeded(value: Any) -> bool:
     return False
 
 
+def _failure_fingerprint(result: Mapping[str, Any]) -> str:
+    material = {
+        "status": result.get("operational_status"),
+        "failures": sorted(str(item) for item in (result.get("operational_failures") or [])),
+    }
+    return hashlib.sha256(
+        json.dumps(material, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    ).hexdigest()[:20]
+
+
+def _health_notification_content(
+    result: Mapping[str, Any], report: str, *, recovered: bool
+) -> str:
+    if recovered:
+        heading = "# 全市场买入链路已恢复"
+        summary = "全市场输入与双模型买入候选链路已恢复正常，可继续按模拟规则筛选。"
+    else:
+        heading = "# 全市场买入链路故障"
+        failures = "、".join(
+            str(item) for item in (result.get("operational_failures") or [])
+        ) or "unknown"
+        summary = f"故障项：{failures}。本轮不会向盘中链路启用新的建仓候选。"
+    return "\n".join(
+        [
+            heading,
+            "",
+            summary,
+            "",
+            "> 硬止损风险提醒继续有效；买入链路恢复前，常规止盈减仓不能被视为完整的组合再平衡。",
+            "",
+            report,
+        ]
+    )
+
+
 def persist_result_and_notify(
     result: Mapping[str, Any],
     *,
@@ -327,9 +370,11 @@ def persist_result_and_notify(
     state_dir.mkdir(parents=True, exist_ok=True)
     latest_path = state_dir / "latest.json"
     last_notified_path = state_dir / "last_notified.json"
+    health_path = state_dir / "operational_health.json"
     outbox_path = state_dir / "notification_outbox.json"
     history_path = state_dir / "history.jsonl"
     previous_notified = _read_previous(last_notified_path)
+    previous_health = _read_previous(health_path) or {}
     report = render_market_scan_markdown(result)
     serialised = json.dumps(result, ensure_ascii=False, indent=2)
 
@@ -341,7 +386,38 @@ def persist_result_and_notify(
         handle.flush()
         os.fsync(handle.fileno())
 
-    obvious_change = has_obvious_change(previous_notified, result)
+    candidate_change = has_obvious_change(previous_notified, result)
+    operational_failed = bool(
+        result.get("operational_status") == "failed"
+        or result.get("operational_failures")
+    )
+    failure_fingerprint = _failure_fingerprint(result) if operational_failed else ""
+    previous_alert_active = bool(previous_health.get("failure_alert_active"))
+    health_kind = ""
+    if operational_failed and (
+        not previous_alert_active
+        or previous_health.get("last_alerted_fingerprint") != failure_fingerprint
+    ):
+        health_kind = "failure"
+    elif not operational_failed and previous_alert_active:
+        health_kind = "recovery"
+    notification_kind = health_kind or (
+        "candidate_change" if candidate_change and not operational_failed else ""
+    )
+    obvious_change = bool(notification_kind)
+    health_state = {
+        **dict(previous_health),
+        "schema_version": 1,
+        "updated_at": result.get("generated_at"),
+        "current_status": "failed" if operational_failed else "healthy",
+        "current_failure_fingerprint": failure_fingerprint,
+        "current_failures": list(result.get("operational_failures") or []),
+        "failure_alert_active": previous_alert_active,
+    }
+    _atomic_write_text(
+        health_path,
+        json.dumps(health_state, ensure_ascii=False, indent=2) + "\n",
+    )
     outcome = {
         "persisted": True,
         "obvious_change": obvious_change,
@@ -349,15 +425,25 @@ def persist_result_and_notify(
         "notification_sent": False,
         "notification_error": "",
         "outbox_pending": False,
+        "notification_kind": notification_kind,
     }
     if not notify or not obvious_change:
         return outcome
+
+    selected_title = title
+    selected_content = report
+    if health_kind == "failure":
+        selected_title = "全市场买入链路故障"
+        selected_content = _health_notification_content(result, report, recovered=False)
+    elif health_kind == "recovery":
+        selected_title = "全市场买入链路已恢复"
+        selected_content = _health_notification_content(result, report, recovered=True)
 
     def save_outbox(error: str) -> None:
         payload = {
             "schema_version": 1,
             "created_at": result.get("generated_at"),
-            "title": title,
+            "title": selected_title,
             "error": error,
             "result": result,
         }
@@ -386,7 +472,7 @@ def persist_result_and_notify(
 
     outcome["notification_attempted"] = True
     try:
-        notification_result = send(title, report)
+        notification_result = send(selected_title, selected_content)
     except Exception as exc:  # noqa: BLE001 - state and report are already durable.
         save_outbox(f"{type(exc).__name__}: {exc}")
         return outcome
@@ -394,7 +480,28 @@ def persist_result_and_notify(
         save_outbox("notification provider did not return explicit success")
         return outcome
     outcome["notification_sent"] = True
-    _atomic_write_text(last_notified_path, serialised + "\n")
+    if health_kind == "failure":
+        health_state.update(
+            {
+                "failure_alert_active": True,
+                "last_alerted_fingerprint": failure_fingerprint,
+                "last_alerted_at": result.get("generated_at"),
+            }
+        )
+    elif health_kind == "recovery":
+        health_state.update(
+            {
+                "failure_alert_active": False,
+                "last_recovered_at": result.get("generated_at"),
+            }
+        )
+        _atomic_write_text(last_notified_path, serialised + "\n")
+    else:
+        _atomic_write_text(last_notified_path, serialised + "\n")
+    _atomic_write_text(
+        health_path,
+        json.dumps(health_state, ensure_ascii=False, indent=2) + "\n",
+    )
     try:
         outbox_path.unlink()
     except FileNotFoundError:
@@ -414,6 +521,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--min-net-rr", type=float, default=1.8)
     parser.add_argument("--a-cache-max-age-hours", type=float, default=6.0)
     parser.add_argument("--hk-cache-max-age-hours", type=float, default=6.0)
+    parser.add_argument("--hk-membership-cache-max-age-hours", type=float, default=840.0)
+    parser.add_argument("--min-actionable-data-quality", type=float, default=0.70)
     return parser
 
 
@@ -426,12 +535,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         min_net_rr=args.min_net_rr,
         a_cache_max_age_hours=args.a_cache_max_age_hours,
         hk_cache_max_age_hours=args.hk_cache_max_age_hours,
+        hk_membership_cache_max_age_hours=args.hk_membership_cache_max_age_hours,
+        min_actionable_data_quality=args.min_actionable_data_quality,
         a_cache_path=args.state_dir / "a_share_snapshot.json",
         hk_cache_path=args.state_dir / "hk_connect_snapshot.json",
     )
     service = MarketScanService(
         a_snapshot_loader=default_a_snapshot_loader,
         hk_connect_snapshot_loader=default_hk_connect_snapshot_loader,
+        hk_all_snapshot_loader=default_hk_all_snapshot_loader,
         history_loader=default_history_loader,
         qwen_reviewer=build_litellm_reviewer("qwen"),
         deepseek_reviewer=build_litellm_reviewer("deepseek"),
@@ -455,7 +567,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             ensure_ascii=False,
         )
     )
-    return 0
+    return 2 if result.get("operational_status") == "failed" else 0
 
 
 if __name__ == "__main__":

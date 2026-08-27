@@ -103,6 +103,8 @@ DEFAULT_LOW_COVERAGE_LIMIT = 3
 DEFAULT_REFERENCE_SIGNAL_MAX_AGE_DAYS = 7
 DEFAULT_CANDIDATE_PLAN_MAX_AGE_DAYS = 1
 DEFAULT_EXPECTED_HOLDING_DAYS = 20.0
+DEFAULT_TARGET_CASH_MIN_RATIO = 0.15
+DEFAULT_TARGET_CASH_MAX_RATIO = 0.25
 MAX_EXTRA_CANDIDATE_SYMBOLS = 12
 TENCENT_BATCH_ENDPOINT = "https://qt.gtimg.cn/q="
 _TENCENT_RECORD = re.compile(r'v_([A-Za-z0-9]+)="([^"]*)"')
@@ -220,7 +222,6 @@ def _signal_time_at_or_after_quote(now: datetime, quote_time: Any) -> datetime:
 
 
 def _is_user_push_allowed(event: Mapping[str, Any]) -> bool:
-    payload = event.get("payload") or {}
     return bool(
         _is_actionable_trade_decision(event)
         or (
@@ -234,7 +235,7 @@ def _is_actionable_trade_decision(event: Mapping[str, Any]) -> bool:
     payload = event.get("payload") or {}
     return bool(
         payload.get("kind") == "trade_decision"
-        and str(payload.get("action_code") or "") in _TRADE_ACTION_LABELS
+        and str(payload.get("action_code") or "") in _DECISION_ACTION_LABELS
     )
 
 
@@ -2368,6 +2369,11 @@ _TRADE_ACTION_LABELS = {
     "clear": "建议清仓",
 }
 
+_DECISION_ACTION_LABELS = {
+    **_TRADE_ACTION_LABELS,
+    "hold_cash_guardrail": "建议不减仓，继续持有",
+}
+
 _SELL_ACTION_FRACTIONS = {
     "reduce_1_4": 0.25,
     "reduce_1_3": 1.0 / 3.0,
@@ -2408,6 +2414,53 @@ def _shadow_strategy_cash(
         return 0.0
 
 
+def _shadow_strategy_cash_ratio(
+    shadow_state: Optional[Mapping[str, Any]], symbol: str
+) -> Optional[float]:
+    if not shadow_state:
+        return None
+    cash = _shadow_strategy_cash(shadow_state, symbol)
+    try:
+        nav = float(shadow_strategy_nav(shadow_state))
+    except (KeyError, ShadowExperimentError, TypeError, ValueError):
+        return None
+    if not math.isfinite(cash) or not math.isfinite(nav) or nav <= 0:
+        return None
+    return min(max(cash / nav, 0.0), 1.0)
+
+
+def _shadow_pending_buy_reservation(
+    shadow_state: Optional[Mapping[str, Any]],
+) -> float:
+    """Return CNY cash reserved by not-yet-executed simulated buy signals."""
+
+    if not shadow_state:
+        return 0.0
+    pending_ids = {
+        str(item)
+        for item in (shadow_state.get("pending_signal_ids") or [])
+        if str(item)
+    }
+    if not pending_ids:
+        return 0.0
+    reserved = 0.0
+    for signal in shadow_state.get("signal_ledger") or []:
+        if not isinstance(signal, Mapping):
+            continue
+        if str(signal.get("signal_id") or "") not in pending_ids:
+            continue
+        if not str(signal.get("action") or "").startswith(("buy_", "add_")):
+            continue
+        notional = _nonnegative_float(signal.get("requested_notional"))
+        if notional is None:
+            continue
+        costs = signal.get("market_costs") or {}
+        fee_bps = _nonnegative_float(costs.get("entry_fee_bps")) or 0.0
+        slippage_bps = _nonnegative_float(costs.get("entry_slippage_bps")) or 0.0
+        reserved += notional * (1.0 + (fee_bps + slippage_bps) / 10_000.0)
+    return reserved
+
+
 def _affordable_candidate_action(
     shadow_state: Optional[Mapping[str, Any]],
     *,
@@ -2415,7 +2468,7 @@ def _affordable_candidate_action(
     confidence: float,
     market_costs: Optional[Mapping[str, Any]],
 ) -> Optional[str]:
-    """Choose only a size coverable by same-currency cash after costs."""
+    """Choose a buy size that preserves cash reserve after costs and pending buys."""
 
     if not shadow_state:
         return None
@@ -2426,15 +2479,20 @@ def _affordable_candidate_action(
         return None
     if cash <= 0 or not math.isfinite(nav) or nav <= 0:
         return None
+    unreserved_cash = max(cash - _shadow_pending_buy_reservation(shadow_state), 0.0)
+    minimum_cash_reserve = nav * DEFAULT_TARGET_CASH_MIN_RATIO
     costs = market_costs or {}
     fee_bps = _nonnegative_float(costs.get("entry_fee_bps")) or 0.0
     slippage_bps = _nonnegative_float(costs.get("entry_slippage_bps")) or 0.0
     cost_multiplier = 1.0 + (fee_bps + slippage_bps) / 10_000.0
-    choices = [("buy_0_5", 0.05), ("buy_0_25", 0.025)]
-    if confidence < 0.8:
-        choices = choices[1:]
+    del confidence
+    choices = [("buy_0_25", 0.025)]
     for action, fraction in choices:
-        if cash + 1e-9 >= nav * fraction * cost_multiplier:
+        required_cash = nav * fraction * cost_multiplier
+        if (
+            unreserved_cash + 1e-9 >= required_cash
+            and unreserved_cash - required_cash + 1e-9 >= minimum_cash_reserve
+        ):
             return action
     return None
 
@@ -2634,6 +2692,7 @@ def process_actionable_decisions(
         basis = "当前证据不足以改变模拟仓位。"
         invalidation = "出现更新且可靠的关键位或研究计划后重新评估。"
         severity = str(raw_event.get("severity") or "info")
+        cash_ratio: Optional[float] = None
 
         if price is None or data_quality not in {"fresh_l1", "high", "medium"}:
             _mark_raw_decision(raw_event, result="no_operation_unreliable_data")
@@ -2670,7 +2729,23 @@ def process_actionable_decisions(
             if quantity <= 0 or key_level is None:
                 _mark_raw_decision(raw_event, result="no_operation_no_shadow_holding_or_level")
                 continue
-            if price >= key_level * 1.05:
+            cash_ratio = _shadow_strategy_cash_ratio(shadow_state, symbol)
+            if (
+                cash_ratio is not None
+                and cash_ratio >= DEFAULT_TARGET_CASH_MAX_RATIO
+            ):
+                action = "hold_cash_guardrail"
+                conclusion = "建议不减仓，继续持有"
+                position_change = "0"
+                basis = (
+                    f"价格已到目标参考位，但模拟组合现金占比约 {cash_ratio:.1%}，"
+                    "已达到15%–25%目标现金带上沿；继续常规止盈会使组合进一步退出市场。"
+                )
+                invalidation = (
+                    "现金占比重新低于25%、出现更优的完整换仓计划，或硬止损/风险门触发后重新评估。"
+                )
+                next_trigger = "硬止损不受本护栏影响；若现金回落到目标带内，再按目标位复核止盈。"
+            elif price >= key_level * 1.05:
                 action = "reduce_1_2"
                 conclusion = "建议止盈减仓1/2"
                 position_change = "-1/2"
@@ -2678,14 +2753,15 @@ def process_actionable_decisions(
                 action = "reduce_1_4"
                 conclusion = "建议止盈减仓1/4"
                 position_change = "-1/4"
-            basis = "价格有效到达系统已有可靠目标参考位，按既定计划锁定部分收益。"
-            invalidation = (
-                f"价格回落至 {key_level * 0.995:.3f} 下方后撤销本止盈建议。"
-            )
-            next_trigger = (
-                f"若继续有效突破 {key_level * 1.05:.3f} 则升级为建议减仓1/2；"
-                f"{invalidation}"
-            )
+            if action != "hold_cash_guardrail":
+                basis = "价格有效到达系统已有可靠目标参考位，按既定计划锁定部分收益。"
+                invalidation = (
+                    f"价格回落至 {key_level * 0.995:.3f} 下方后撤销本止盈建议。"
+                )
+                next_trigger = (
+                    f"若继续有效突破 {key_level * 1.05:.3f} 则升级为建议减仓1/2；"
+                    f"{invalidation}"
+                )
         elif condition == "adaptive_entry_review":
             key_level = _positive_float(raw_payload.get("entry_low"))
             entry_high = _positive_float(raw_payload.get("entry_high"))
@@ -2778,6 +2854,12 @@ def process_actionable_decisions(
             "severity": severity,
             "key_level": key_level,
             "plan_fingerprint": raw_payload.get("plan_fingerprint"),
+            "cash_guardrail_band": (
+                "at_or_above_max"
+                if cash_ratio is not None
+                and cash_ratio >= DEFAULT_TARGET_CASH_MAX_RATIO
+                else "below_max"
+            ),
         }
         fingerprint = hashlib.sha256(
             json.dumps(fingerprint_material, sort_keys=True).encode("utf-8")
@@ -2868,7 +2950,7 @@ def process_actionable_decisions(
             payload={
                 "kind": "trade_decision",
                 "conclusion": conclusion,
-                "action": _TRADE_ACTION_LABELS.get(action, "不操作 / 等待条件"),
+                "action": _DECISION_ACTION_LABELS.get(action, "不操作 / 等待条件"),
                 "action_code": action,
                 "position_change": position_change,
                 "basis": basis,
@@ -2884,6 +2966,11 @@ def process_actionable_decisions(
                 "source_event_id": raw_event.get("event_id"),
                 "simulation_only": True,
                 "human_review_required": True,
+                "portfolio_cash_ratio": cash_ratio,
+                "target_cash_band": [
+                    DEFAULT_TARGET_CASH_MIN_RATIO,
+                    DEFAULT_TARGET_CASH_MAX_RATIO,
+                ],
             },
         )
         decision_state.update(
@@ -3218,6 +3305,8 @@ def _suggested_quantity_text(
         return "策略净值的 2.5%（股数按下一笔新鲜报价计算）"
     if action_code in {"buy_0_5", "add_0_5"}:
         return "策略净值的 5%（股数按下一笔新鲜报价计算）"
+    if action_code == "hold_cash_guardrail":
+        return "0 股（保留现有持仓）"
     return "0 股"
 
 

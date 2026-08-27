@@ -34,6 +34,7 @@ SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
 SCHEMA_VERSION = 1
 MARKET_A = "A"
 MARKET_HK = "HK_CONNECT"
+INITIAL_POSITION_FRACTION = 0.025
 
 SnapshotLoader = Callable[[], Any]
 HistoryLoader = Callable[[str, int], Any]
@@ -68,6 +69,8 @@ class MarketScanConfig:
     hk_round_trip_cost_bps: float = 50.0
     a_cache_max_age_hours: float = 6.0
     hk_cache_max_age_hours: float = 6.0
+    hk_membership_cache_max_age_hours: float = 24.0 * 35.0
+    min_actionable_data_quality: float = 0.70
     snapshot_retries: int = 2
     a_cache_path: Path = Path("data/market_scan/a_share_snapshot.json")
     hk_cache_path: Path = Path("data/market_scan/hk_connect_snapshot.json")
@@ -83,6 +86,12 @@ class MarketScanConfig:
             raise ValueError("min_net_rr must be positive")
         if self.snapshot_retries < 1 or self.snapshot_retries > 5:
             raise ValueError("snapshot_retries must be between 1 and 5")
+        if self.hk_membership_cache_max_age_hours <= 0:
+            raise ValueError("hk_membership_cache_max_age_hours must be positive")
+        if not 0.70 <= self.min_actionable_data_quality <= 1:
+            raise ValueError(
+                "min_actionable_data_quality must be between 0.70 and 1"
+            )
 
 
 @dataclass
@@ -236,7 +245,7 @@ def _coerce_snapshot_payload(
 
 SNAPSHOT_ALIASES: Dict[str, Tuple[str, ...]] = {
     "code": ("code", "symbol", "stock_code", "代码", "股票代码", "证券代码"),
-    "name": ("name", "stock_name", "名称", "股票名称", "证券简称"),
+    "name": ("name", "stock_name", "名称", "股票名称", "证券简称", "中文名称"),
     "price": ("price", "latest", "last", "最新价", "现价", "收盘"),
     "change_pct": ("change_pct", "pct_chg", "涨跌幅", "涨幅"),
     "volume": ("volume", "vol", "成交量"),
@@ -732,6 +741,8 @@ def _build_v4_evidence_contract(
     candidate: Mapping[str, Any],
     *,
     as_of: str,
+    snapshot_fetched_at: str = "",
+    snapshot_source: str = "",
 ) -> Dict[str, Any]:
     """Separate verified facts, deterministic inferences, and cautious views."""
 
@@ -756,8 +767,8 @@ def _build_v4_evidence_contract(
         "level2": "unavailable",
     }
     data_quality = (
-        (0.25 if quote_available else 0.10)
-        + (0.35 if ohlcv_available else 0.10)
+        (0.30 if quote_available else 0.10)
+        + (0.40 if ohlcv_available else 0.10)
         + (0.10 if valuation_available else 0.0)
     )
     if candidate.get("market") == MARKET_A:
@@ -778,6 +789,8 @@ def _build_v4_evidence_contract(
         policy_market = "hk"
     facts = {
         "as_of": as_of,
+        "snapshot_fetched_at": snapshot_fetched_at,
+        "snapshot_source": snapshot_source,
         "price": candidate.get("price"),
         "change_pct": candidate.get("change_pct"),
         "amount": candidate.get("amount"),
@@ -859,11 +872,13 @@ class MarketScanService:
         history_loader: HistoryLoader,
         qwen_reviewer: Optional[Reviewer],
         deepseek_reviewer: Optional[Reviewer],
+        hk_all_snapshot_loader: Optional[SnapshotLoader] = None,
         config: Optional[MarketScanConfig] = None,
         clock: Clock = _now_shanghai,
     ):
         self.a_snapshot_loader = a_snapshot_loader
         self.hk_connect_snapshot_loader = hk_connect_snapshot_loader
+        self.hk_all_snapshot_loader = hk_all_snapshot_loader
         self.history_loader = history_loader
         self.qwen_reviewer = qwen_reviewer
         self.deepseek_reviewer = deepseek_reviewer
@@ -923,6 +938,10 @@ class MarketScanService:
                 "hk_snapshot_source": hk_metadata.get("source") or "",
                 "a_snapshot_fetched_at": a_metadata.get("fetched_at") or "",
                 "hk_snapshot_fetched_at": hk_metadata.get("fetched_at") or "",
+                "a_snapshot_provider_errors": a_metadata.get("provider_errors") or [],
+                "hk_snapshot_provider_errors": hk_metadata.get("provider_errors") or [],
+                "hk_membership_age_hours": hk_metadata.get("membership_age_hours"),
+                "hk_membership_source": hk_metadata.get("membership_source") or "",
                 "a_full_market_strict": not a_safe_halt,
                 "hk_connect_strict": not hk_safe_halt,
             },
@@ -951,6 +970,7 @@ class MarketScanService:
                     "as_of": metadata["as_of"],
                     "fetched_at": metadata["fetched_at"],
                     "source": str(metadata.get("source") or "a_share_provider"),
+                    "provider_errors": list(metadata.get("provider_errors") or []),
                     "is_full_a_universe": True,
                     "records": frame.to_dict(orient="records"),
                 }
@@ -971,12 +991,18 @@ class MarketScanService:
             frame, metadata = cached
             metadata["source"] = f"{metadata.get('source') or 'unknown'}:last_good_cache"
             metadata["provider_error"] = provider_error
+            metadata["provider_errors"] = [provider_error] if provider_error else []
             return frame, metadata, False, ""
 
         reason = "A股全市场快照不可用或缓存过期，已安全停止本轮主动推送"
         return (
             pd.DataFrame(columns=("code", "name", "market")),
-            {"as_of": "", "source": "unavailable", "provider_error": provider_error},
+            {
+                "as_of": "",
+                "source": "unavailable",
+                "provider_error": provider_error,
+                "provider_errors": [provider_error] if provider_error else [],
+            },
             True,
             reason,
         )
@@ -985,7 +1011,7 @@ class MarketScanService:
         self,
         now: datetime,
     ) -> Tuple[pd.DataFrame, Dict[str, Any], bool, str]:
-        provider_error = ""
+        provider_errors: List[str] = []
         for _attempt in range(self.config.snapshot_retries):
             try:
                 raw = self.hk_connect_snapshot_loader()
@@ -1002,15 +1028,83 @@ class MarketScanService:
                     "saved_at": _iso_datetime(now),
                     "as_of": metadata["as_of"],
                     "fetched_at": metadata["fetched_at"],
+                    "membership_fetched_at": _iso_datetime(
+                        metadata.get("membership_fetched_at"), fallback=now
+                    ),
                     "source": str(metadata.get("source") or "hk_connect_provider"),
+                    "membership_source": str(
+                        metadata.get("source") or "hk_connect_provider"
+                    ),
+                    "provider_errors": list(metadata.get("provider_errors") or []),
                     "is_connect_universe": True,
+                    "membership_codes": sorted(set(frame["code"].astype(str))),
                     "records": frame.to_dict(orient="records"),
                 }
                 _atomic_write_json(self.config.hk_cache_path, cache_payload)
                 metadata["source"] = cache_payload["source"]
+                metadata["provider_errors"] = cache_payload["provider_errors"]
+                metadata["membership_age_hours"] = 0.0
+                metadata["membership_source"] = cache_payload["membership_source"]
                 return frame.reset_index(drop=True), metadata, False, ""
             except Exception as exc:  # noqa: BLE001 - bounded retries precede cache fallback.
-                provider_error = str(exc)
+                provider_errors.append(f"connect:{type(exc).__name__}:{exc}")
+
+        membership = self._read_hk_membership_cache(now)
+        if membership is not None and self.hk_all_snapshot_loader is not None:
+            membership_codes, membership_metadata = membership
+            for _attempt in range(self.config.snapshot_retries):
+                try:
+                    raw = self.hk_all_snapshot_loader()
+                    frame_raw, metadata = _coerce_snapshot_payload(raw, now=now)
+                    if not bool(metadata.get("is_full_hk_universe")):
+                        raise MarketScanError("HK quote fallback did not prove full-market coverage")
+                    frame = _normalise_snapshot(frame_raw, market=MARKET_HK, now=now)
+                    frame = frame[frame["code"].isin(membership_codes)].copy()
+                    if frame.empty:
+                        raise MarketScanError(
+                            "HK quote fallback had no overlap with cached Connect membership"
+                        )
+                    frame["is_connect"] = True
+                    provider_errors.extend(
+                        str(item) for item in (metadata.get("provider_errors") or [])
+                    )
+                    source = (
+                        f"{metadata.get('source') or 'hk_full_market_provider'}"
+                        ":cached_connect_membership"
+                    )
+                    cache_payload = {
+                        "schema_version": SCHEMA_VERSION,
+                        "saved_at": _iso_datetime(now),
+                        "as_of": metadata["as_of"],
+                        "fetched_at": metadata["fetched_at"],
+                        "membership_fetched_at": membership_metadata[
+                            "membership_fetched_at"
+                        ],
+                        "source": source,
+                        "membership_source": membership_metadata[
+                            "membership_source"
+                        ],
+                        "provider_errors": provider_errors,
+                        "is_connect_universe": True,
+                        "membership_codes": sorted(membership_codes),
+                        "records": frame.to_dict(orient="records"),
+                    }
+                    _atomic_write_json(self.config.hk_cache_path, cache_payload)
+                    metadata.update(
+                        {
+                            "source": source,
+                            "provider_errors": provider_errors,
+                            "membership_age_hours": membership_metadata[
+                                "membership_age_hours"
+                            ],
+                            "membership_source": membership_metadata[
+                                "membership_source"
+                            ],
+                        }
+                    )
+                    return frame.reset_index(drop=True), metadata, False, ""
+                except Exception as exc:  # noqa: BLE001 - bounded provider fallback.
+                    provider_errors.append(f"all_hk:{type(exc).__name__}:{exc}")
 
         cached = self._read_snapshot_cache(
             now,
@@ -1018,20 +1112,83 @@ class MarketScanService:
             market=MARKET_HK,
             trust_field="is_connect_universe",
             max_age_hours=self.config.hk_cache_max_age_hours,
+            membership_max_age_hours=self.config.hk_membership_cache_max_age_hours,
         )
         if cached is not None:
             frame, metadata = cached
             metadata["source"] = f"{metadata.get('source') or 'unknown'}:last_good_cache"
-            metadata["provider_error"] = provider_error
+            metadata["provider_error"] = provider_errors[-1] if provider_errors else ""
+            metadata["provider_errors"] = provider_errors
             return frame, metadata, False, ""
 
         reason = "港股通成分数据不可用或缓存过期，已安全停止本轮主动推送"
         return (
             pd.DataFrame(columns=("code", "name", "market")),
-            {"as_of": "", "source": "unavailable", "provider_error": provider_error},
+            {
+                "as_of": "",
+                "source": "unavailable",
+                "provider_error": provider_errors[-1] if provider_errors else "",
+                "provider_errors": provider_errors,
+            },
             True,
             reason,
         )
+
+    def _read_hk_membership_cache(
+        self, now: datetime
+    ) -> Optional[Tuple[set[str], Dict[str, Any]]]:
+        """Read membership independently from quote freshness.
+
+        A fresh all-HK quote can safely refresh prices only when it is filtered
+        through a bounded, previously proven Stock Connect constituent set.
+        Refreshing quotes never extends the constituent-set lifetime.
+        """
+
+        try:
+            payload = json.loads(self.config.hk_cache_path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, OSError, json.JSONDecodeError):
+            return None
+        if not isinstance(payload, Mapping) or not payload.get("is_connect_universe"):
+            return None
+        membership_fetched_at = _parse_datetime(
+            payload.get("membership_fetched_at") or payload.get("saved_at")
+        )
+        if membership_fetched_at is None:
+            return None
+        age_hours = (
+            now.astimezone(timezone.utc) - membership_fetched_at
+        ).total_seconds() / 3600.0
+        if (
+            age_hours < 0
+            or age_hours > self.config.hk_membership_cache_max_age_hours
+        ):
+            return None
+        raw_membership_codes = payload.get("membership_codes")
+        if isinstance(raw_membership_codes, list):
+            codes = {
+                code
+                for code in (
+                    _normalise_symbol(item, MARKET_HK)
+                    for item in raw_membership_codes
+                )
+                if code
+            }
+        else:
+            frame = _normalise_snapshot(
+                pd.DataFrame(payload.get("records") or []),
+                market=MARKET_HK,
+                now=now,
+            )
+            codes = set(frame["code"].astype(str)) if not frame.empty else set()
+        if not codes:
+            return None
+        return codes, {
+            "membership_fetched_at": _iso_datetime(membership_fetched_at),
+            "membership_age_hours": round(age_hours, 4),
+            "membership_source": str(
+                payload.get("membership_source") or payload.get("source") or ""
+            ),
+        }
 
     @staticmethod
     def _read_snapshot_cache(
@@ -1041,6 +1198,7 @@ class MarketScanService:
         market: str,
         trust_field: str,
         max_age_hours: float,
+        membership_max_age_hours: Optional[float] = None,
     ) -> Optional[Tuple[pd.DataFrame, Dict[str, Any]]]:
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
@@ -1055,6 +1213,20 @@ class MarketScanService:
         age_hours = (now_utc - saved_at).total_seconds() / 3600.0
         if age_hours < 0 or age_hours > max_age_hours:
             return None
+        membership_fetched_at = _parse_datetime(
+            payload.get("membership_fetched_at") or payload.get("saved_at")
+        )
+        if membership_max_age_hours is not None:
+            if membership_fetched_at is None:
+                return None
+            membership_age_hours = (
+                now_utc - membership_fetched_at
+            ).total_seconds() / 3600.0
+            if (
+                membership_age_hours < 0
+                or membership_age_hours > membership_max_age_hours
+            ):
+                return None
         frame = _normalise_snapshot(
             pd.DataFrame(payload.get("records") or []),
             market=market,
@@ -1062,13 +1234,22 @@ class MarketScanService:
         )
         if frame.empty:
             return None
-        return frame, {
+        metadata = {
             "as_of": str(payload.get("as_of") or ""),
             "fetched_at": str(payload.get("fetched_at") or payload.get("saved_at") or ""),
             "source": str(payload.get("source") or ""),
             "cache_age_hours": age_hours,
             trust_field: True,
         }
+        if membership_fetched_at is not None:
+            metadata["membership_age_hours"] = round(
+                (now_utc - membership_fetched_at).total_seconds() / 3600.0,
+                4,
+            )
+            metadata["membership_source"] = str(
+                payload.get("membership_source") or ""
+            )
+        return frame, metadata
 
     def run(self) -> Dict[str, Any]:
         """Run all stages and return a JSON-serialisable result."""
@@ -1104,12 +1285,34 @@ class MarketScanService:
         review_payload = []
         for candidate in ranked:
             payload = self._candidate_for_review(candidate)
+            is_a_share = candidate.get("market") == MARKET_A
             payload.update(
                 _build_v4_evidence_contract(
                     candidate,
                     as_of=str(l1.as_of.get(str(candidate.get("market"))) or ""),
+                    snapshot_fetched_at=str(
+                        l1.diagnostics.get(
+                            "a_snapshot_fetched_at"
+                            if is_a_share
+                            else "hk_snapshot_fetched_at"
+                        )
+                        or ""
+                    ),
+                    snapshot_source=str(
+                        l1.diagnostics.get(
+                            "a_snapshot_source" if is_a_share else "hk_snapshot_source"
+                        )
+                        or ""
+                    ),
                 )
             )
+            payload["review_request"] = {
+                "proposed_action": "advance_to_intraday_entry_zone_review",
+                "proposed_initial_position_fraction": INITIAL_POSITION_FRACTION,
+                "immediate_buy": False,
+                "auto_order": False,
+                "human_confirmation_required": True,
+            }
             review_payload.append(payload)
         qwen_reviews, qwen_error = self._call_reviewer(
             "qwen",
@@ -1126,6 +1329,16 @@ class MarketScanService:
         review_complete = not qwen_error and not deepseek_error
 
         candidates: List[Dict[str, Any]] = []
+        candidate_rejection_reasons: Dict[str, int] = {}
+        dual_pass_count = 0
+        actionable_count = 0
+        root_snapshot_complete = not l1.a_safe_halt and not l1.hk_safe_halt
+
+        def count_candidate_rejection(reason: str) -> None:
+            candidate_rejection_reasons[reason] = (
+                candidate_rejection_reasons.get(reason, 0) + 1
+            )
+
         for rank, candidate in enumerate(ranked, start=1):
             code = str(candidate["code"])
             qwen = qwen_reviews.get(code) or _missing_review(qwen_error or "qwen_review_missing")
@@ -1135,7 +1348,8 @@ class MarketScanService:
             disagreement = qwen["verdict"] != deepseek["verdict"]
             hard_risk = bool(qwen["hard_risk"] or deepseek["hard_risk"])
             both_pass = qwen["verdict"] == deepseek["verdict"] == "pass"
-            action = "watch"
+            if both_pass:
+                dual_pass_count += 1
             final_score = (
                 float(candidate.get("technical_score") or 0.0) * 0.70
                 + float(qwen["confidence"]) * 15.0
@@ -1144,6 +1358,22 @@ class MarketScanService:
             evidence_contract = _build_v4_evidence_contract(
                 candidate,
                 as_of=str(l1.as_of.get(str(candidate.get("market"))) or ""),
+                snapshot_fetched_at=str(
+                    l1.diagnostics.get(
+                        "a_snapshot_fetched_at"
+                        if candidate.get("market") == MARKET_A
+                        else "hk_snapshot_fetched_at"
+                    )
+                    or ""
+                ),
+                snapshot_source=str(
+                    l1.diagnostics.get(
+                        "a_snapshot_source"
+                        if candidate.get("market") == MARKET_A
+                        else "hk_snapshot_source"
+                    )
+                    or ""
+                ),
             )
             candidate_output = dict(candidate)
             review_confidence = min(
@@ -1151,6 +1381,43 @@ class MarketScanService:
                 float(evidence_contract["data_quality"]),
             )
             plan = candidate.get("plan") or {}
+            actionable = bool(
+                review_complete
+                and both_pass
+                and not disagreement
+                and not hard_risk
+                and root_snapshot_complete
+                and float(evidence_contract["data_quality"])
+                >= self.config.min_actionable_data_quality
+                and plan
+            )
+            action = "conditional_buy" if actionable else "watch"
+            if actionable:
+                actionable_count += 1
+                evidence_contract.update(
+                    {
+                        "simulated_portfolio_weight": INITIAL_POSITION_FRACTION,
+                        "simulation_advice": "进入买入区后建议首笔建仓2.5%",
+                        "eligible_for_intraday_review": True,
+                    }
+                )
+                evidence_contract["view"] = {
+                    **dict(evidence_contract.get("view") or {}),
+                    "short_term": "双模型与规则门已通过，仅在新鲜价格进入计划区时首笔建仓",
+                    "swing": "以2.5%模拟净值小仓试错，严格执行计划止损与目标位",
+                }
+            elif not root_snapshot_complete:
+                count_candidate_rejection("root_snapshot_incomplete")
+            elif not review_complete:
+                count_candidate_rejection("dual_model_review_incomplete")
+            elif hard_risk:
+                count_candidate_rejection("hard_risk_veto")
+            elif disagreement:
+                count_candidate_rejection("model_disagreement")
+            elif not both_pass:
+                count_candidate_rejection("dual_model_not_both_pass")
+            else:
+                count_candidate_rejection("data_quality_below_actionable_threshold")
             candidate_output.update(
                 {
                     "rank": rank,
@@ -1163,9 +1430,22 @@ class MarketScanService:
                     "final_score": round(final_score, 4),
                     "confidence": round(review_confidence, 4),
                     "research_status": (
-                        "deep_research_required"
-                        if review_complete and both_pass and not hard_risk
-                        else "review_not_passed"
+                        "actionable"
+                        if actionable
+                        else (
+                            "data_quality_not_passed"
+                            if (
+                                root_snapshot_complete
+                                and review_complete
+                                and both_pass
+                                and not hard_risk
+                            )
+                            else (
+                                "snapshot_incomplete"
+                                if not root_snapshot_complete
+                                else "review_not_passed"
+                            )
+                        )
                     ),
                     "entry_low": plan.get("entry_low"),
                     "entry_high": plan.get("entry_high"),
@@ -1177,6 +1457,8 @@ class MarketScanService:
                         disagreement=disagreement,
                         hard_risk=hard_risk,
                         both_pass=both_pass,
+                        actionable=actionable,
+                        root_snapshot_complete=root_snapshot_complete,
                     ),
                     **evidence_contract,
                 }
@@ -1188,6 +1470,40 @@ class MarketScanService:
             push_block_reasons.append("通义或 DeepSeek 独立复核未完成，已停止主动推荐推送")
         if not candidates:
             push_block_reasons.append("没有通过数据、趋势和风险回报护栏的候选")
+
+        operational_failures: List[str] = []
+        if l1.a_safe_halt:
+            operational_failures.append("a_share_full_market_snapshot_unavailable")
+        if l1.hk_safe_halt:
+            operational_failures.append("hk_connect_snapshot_unavailable")
+        if ranked and not review_complete:
+            operational_failures.append("dual_model_review_incomplete")
+
+        history_rejection_counts: Dict[str, int] = {}
+        for reason in history_rejections.values():
+            history_rejection_counts[reason] = history_rejection_counts.get(reason, 0) + 1
+        a_input_count = int(l1.diagnostics.get(MARKET_A, {}).get("input_count") or 0)
+        hk_input_count = int(l1.diagnostics.get(MARKET_HK, {}).get("input_count") or 0)
+        a_eligible_count = int(
+            l1.diagnostics.get(MARKET_A, {}).get("eligible_count") or 0
+        )
+        hk_eligible_count = int(
+            l1.diagnostics.get(MARKET_HK, {}).get("eligible_count") or 0
+        )
+        buy_funnel = {
+            "snapshot_input_count": a_input_count + hk_input_count,
+            "a_snapshot_input_count": a_input_count,
+            "hk_snapshot_input_count": hk_input_count,
+            "l1_eligible_count": a_eligible_count + hk_eligible_count,
+            "l1_shortlist_count": len(l1.a_candidates) + len(l1.hk_candidates),
+            "history_requested_count": len(l1.a_candidates) + len(l1.hk_candidates),
+            "history_and_plan_valid_count": len(history_candidates),
+            "dual_model_reviewed_count": len(ranked) if review_complete else 0,
+            "dual_model_pass_count": dual_pass_count,
+            "actionable_count": actionable_count,
+            "history_rejection_reasons": history_rejection_counts,
+            "candidate_rejection_reasons": candidate_rejection_reasons,
+        }
 
         result = {
             "schema_version": SCHEMA_VERSION,
@@ -1220,6 +1536,8 @@ class MarketScanService:
                 for key, value in {"qwen": qwen_error, "deepseek": deepseek_error}.items()
                 if value
             },
+            "operational_status": "failed" if operational_failures else "healthy",
+            "operational_failures": operational_failures,
             "diagnostics": {
                 **l1.diagnostics,
                 "history_requested_count": len(l1.a_candidates) + len(l1.hk_candidates),
@@ -1230,13 +1548,15 @@ class MarketScanService:
                     "qwen": 1 if ranked and self.qwen_reviewer is not None else 0,
                     "deepseek": 1 if ranked and self.deepseek_reviewer is not None else 0,
                 },
+                "buy_funnel": buy_funnel,
             },
             "candidates": candidates,
             "disclaimer": (
                 "仅用于模拟研究和条件价格计划，不保证收益，不连接券商，也不会自动下单。"
                 "任何计划都需在执行前重新核对实时价格、公告、流动性和个人风险承受能力。"
-                "当前MVP缺少完整基本面、公告、政策、资金和可靠Level-2数据，候选统一为等待深研，"
-                "不得据此直接买卖。"
+                "当前MVP仍缺少完整基本面、公告、政策、资金和可靠Level-2数据；只有规则、"
+                "扣费后风险回报与双模型同时通过的候选，才会以2.5%模拟净值进入盘中价格区复核。"
+                "最终是否执行仍由用户人工决定。"
             ),
         }
         return _json_safe(result)
@@ -1301,30 +1621,48 @@ class MarketScanService:
         disagreement: bool,
         hard_risk: bool,
         both_pass: bool,
+        actionable: bool,
+        root_snapshot_complete: bool,
     ) -> str:
         if not review_complete:
             return "双模型独立复核不完整，降级为观察"
         if hard_risk:
             return "至少一个模型识别到硬风险，否决主动推荐"
+        if not root_snapshot_complete:
+            return "A股或港股通根快照不完整，本轮所有候选均降级为观察"
         if disagreement:
             return "通义与 DeepSeek 意见冲突，降级为观察"
+        if both_pass and actionable:
+            return (
+                "技术规则、扣费后风险回报与双模型复核通过；"
+                "仅在新鲜价格进入计划区后首笔模拟建仓2.5%，并需人工确认"
+            )
         if both_pass:
-            return "技术规则、风险回报护栏与双模型复核通过，但关键深研数据缺失，仅可等待"
+            return "双模型通过，但数据质量未达到当前主动建仓阈值，保持观察"
         return "双模型未同时通过，保持观察"
 
 
 def default_a_snapshot_loader() -> Mapping[str, Any]:
-    """Load one full A-share snapshot through AkShare."""
+    """Load a full A-share snapshot through independent AkShare routes."""
 
     import akshare as ak
 
-    frame = ak.stock_zh_a_spot_em()
-    return {
-        "records": frame,
-        "fetched_at": _iso_datetime(_now_shanghai()),
-        "source": "akshare.stock_zh_a_spot_em",
-        "is_full_a_universe": True,
-    }
+    provider_errors: List[str] = []
+    for provider_name in ("stock_zh_a_spot_em", "stock_zh_a_spot"):
+        try:
+            frame = getattr(ak, provider_name)()
+            if not isinstance(frame, pd.DataFrame) or frame.empty:
+                raise MarketScanError("provider returned an empty full-market snapshot")
+            return {
+                "records": frame,
+                "fetched_at": _iso_datetime(_now_shanghai()),
+                "source": f"akshare.{provider_name}",
+                "provider_errors": provider_errors,
+                "is_full_a_universe": True,
+            }
+        except Exception as exc:  # noqa: BLE001 - explicit independent provider chain.
+            provider_errors.append(f"{provider_name}:{type(exc).__name__}:{exc}")
+    raise MarketScanError("; ".join(provider_errors) or "A-share providers unavailable")
 
 
 def default_hk_connect_snapshot_loader() -> Mapping[str, Any]:
@@ -1339,6 +1677,29 @@ def default_hk_connect_snapshot_loader() -> Mapping[str, Any]:
         "source": "akshare.stock_hk_ggt_components_em",
         "is_connect_universe": True,
     }
+
+
+def default_hk_all_snapshot_loader() -> Mapping[str, Any]:
+    """Load all-HK quotes for filtering through cached Connect membership."""
+
+    import akshare as ak
+
+    provider_errors: List[str] = []
+    for provider_name in ("stock_hk_spot_em", "stock_hk_spot"):
+        try:
+            frame = getattr(ak, provider_name)()
+            if not isinstance(frame, pd.DataFrame) or frame.empty:
+                raise MarketScanError("provider returned an empty full-market snapshot")
+            return {
+                "records": frame,
+                "fetched_at": _iso_datetime(_now_shanghai()),
+                "source": f"akshare.{provider_name}",
+                "provider_errors": provider_errors,
+                "is_full_hk_universe": True,
+            }
+        except Exception as exc:  # noqa: BLE001 - explicit independent provider chain.
+            provider_errors.append(f"{provider_name}:{type(exc).__name__}:{exc}")
+    raise MarketScanError("; ".join(provider_errors) or "HK providers unavailable")
 
 
 def default_history_loader(stock_code: str, lookback_days: int) -> Any:
@@ -1359,6 +1720,7 @@ def render_market_scan_markdown(result: Mapping[str, Any]) -> str:
         f"- A股快照：{(result.get('as_of') or {}).get(MARKET_A) or '不可用'}",
         f"- 港股通快照：{(result.get('as_of') or {}).get(MARKET_HK) or '不可用'}",
         "- 模式：模拟研究；不连接券商；不自动下单",
+        f"- 买入链路：{result.get('operational_status') or 'unknown'}",
         f"- 主动取数：{(result.get('data_policy') or {}).get('description') or '已启用'}",
         "",
     ]
@@ -1368,16 +1730,31 @@ def render_market_scan_markdown(result: Mapping[str, Any]) -> str:
         lines.extend(f"- {reason}" for reason in block_reasons)
         lines.append("")
 
+    funnel = (result.get("diagnostics") or {}).get("buy_funnel") or {}
+    if funnel:
+        lines.extend(
+            [
+                "## 买入候选漏斗",
+                "",
+                f"- 全市场输入：{funnel.get('snapshot_input_count', 0)}",
+                f"- L1合格/短名单：{funnel.get('l1_eligible_count', 0)} / "
+                f"{funnel.get('l1_shortlist_count', 0)}",
+                f"- 历史与交易计划有效：{funnel.get('history_and_plan_valid_count', 0)}",
+                f"- 双模型完成/同时通过：{funnel.get('dual_model_reviewed_count', 0)} / "
+                f"{funnel.get('dual_model_pass_count', 0)}",
+                f"- 可进入盘中买入区复核：{funnel.get('actionable_count', 0)}",
+                f"- 历史/计划淘汰原因：{json.dumps(funnel.get('history_rejection_reasons') or {}, ensure_ascii=False)}",
+                f"- 双模型/质量淘汰原因：{json.dumps(funnel.get('candidate_rejection_reasons') or {}, ensure_ascii=False)}",
+                "",
+            ]
+        )
+
     candidates = result.get("candidates") or []
     if not candidates:
         lines.extend(["## 本轮结果", "", "没有通过全部数据和风险护栏的候选。", ""])
     for candidate in candidates:
         plan = candidate.get("plan") or {}
-        action_label = (
-            "等待深研"
-            if candidate.get("research_status") == "deep_research_required"
-            else "观察"
-        )
+        action_label = "条件建仓" if candidate.get("action") == "conditional_buy" else "观察"
         availability = candidate.get("data_availability") or {}
         facts = candidate.get("facts") or {}
         inferences = candidate.get("inferences") or {}
@@ -1388,7 +1765,7 @@ def render_market_scan_markdown(result: Mapping[str, Any]) -> str:
                 f"({candidate.get('code')}) · {action_label}",
                 "",
                 f"- 唯一模拟建议：{candidate.get('simulation_advice') or '等待'}",
-                f"- 观察买入区（深研通过后才可启用）：{plan.get('entry_low', '-')} – {plan.get('entry_high', '-')}",
+                f"- 条件买入区（须有新鲜行情并人工确认）：{plan.get('entry_low', '-')} – {plan.get('entry_high', '-')}",
                 f"- 计划失效点：{plan.get('stop_loss', '-')}",
                 f"- 观察减仓区：{plan.get('take_profit_1', '-')} / {plan.get('take_profit_2', '-')}",
                 f"- 计入成本后的风险回报比：{plan.get('net_rr', '-')}",
@@ -1398,7 +1775,9 @@ def render_market_scan_markdown(result: Mapping[str, Any]) -> str:
                 "",
                 "### 已核验事实",
                 "",
-                f"- 数据时间：{facts.get('as_of') or '-'}",
+                f"- 提供方行情时间：{facts.get('as_of') or '提供方未返回'}",
+                f"- 本轮抓取时间/来源：{facts.get('snapshot_fetched_at') or '-'} / "
+                f"{facts.get('snapshot_source') or '-'}",
                 f"- 价格/涨跌/成交额：{facts.get('price', '-')} / "
                 f"{facts.get('change_pct', '-')}% / {facts.get('amount', '-')}",
                 f"- PE/PB：{facts.get('pe', '-')} / {facts.get('pb', '-')}",

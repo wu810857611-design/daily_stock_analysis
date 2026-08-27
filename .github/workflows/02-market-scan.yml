@@ -45,6 +45,8 @@ jobs:
       MARKET_SCAN_MIN_NET_RR: ${{ vars.MARKET_SCAN_MIN_NET_RR || '1.8' }}
       MARKET_SCAN_A_CACHE_MAX_AGE_HOURS: ${{ vars.MARKET_SCAN_A_CACHE_MAX_AGE_HOURS || '6' }}
       MARKET_SCAN_HK_CACHE_MAX_AGE_HOURS: ${{ vars.MARKET_SCAN_HK_CACHE_MAX_AGE_HOURS || '6' }}
+      MARKET_SCAN_HK_MEMBERSHIP_CACHE_MAX_AGE_HOURS: ${{ vars.MARKET_SCAN_HK_MEMBERSHIP_CACHE_MAX_AGE_HOURS || '840' }}
+      MARKET_SCAN_MIN_ACTIONABLE_DATA_QUALITY: ${{ vars.MARKET_SCAN_MIN_ACTIONABLE_DATA_QUALITY || '0.70' }}
 
     steps:
       - name: 检出代码
@@ -148,7 +150,10 @@ jobs:
           echo "✅ 已从同分支最新 artifact 恢复扫描与待推送状态"
 
       - name: 执行分层选股（不连接券商）
+        id: market_scan
+        shell: bash
         run: |
+          set +e
           python scripts/market_scan.py \
             --state-dir "$MARKET_SCAN_STATE_DIR" \
             --report reports/market_scan.md \
@@ -159,7 +164,12 @@ jobs:
             --min-net-rr "$MARKET_SCAN_MIN_NET_RR" \
             --a-cache-max-age-hours "$MARKET_SCAN_A_CACHE_MAX_AGE_HOURS" \
             --hk-cache-max-age-hours "$MARKET_SCAN_HK_CACHE_MAX_AGE_HOURS" \
+            --hk-membership-cache-max-age-hours "$MARKET_SCAN_HK_MEMBERSHIP_CACHE_MAX_AGE_HOURS" \
+            --min-actionable-data-quality "$MARKET_SCAN_MIN_ACTIONABLE_DATA_QUALITY" \
             --notify
+          SCAN_EXIT_CODE=$?
+          echo "exit_code=$SCAN_EXIT_CODE" >> "$GITHUB_OUTPUT"
+          exit 0
 
       - name: 保存全市场扫描状态缓存
         uses: actions/cache/save@v4
@@ -190,3 +200,15 @@ jobs:
             reports/market_scan.json
           if-no-files-found: warn
           retention-days: 90
+
+      - name: 严格确认买入链路健康
+        if: always()
+        shell: bash
+        env:
+          SCAN_EXIT_CODE: ${{ steps.market_scan.outputs.exit_code }}
+        run: |
+          if [ "${SCAN_EXIT_CODE:-1}" -ne 0 ]; then
+            echo "❌ 全市场买入链路未通过严格健康检查，报告和状态已保留"
+            exit "${SCAN_EXIT_CODE:-1}"
+          fi
+          echo "✅ 全市场买入链路健康"
