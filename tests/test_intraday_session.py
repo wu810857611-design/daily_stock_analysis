@@ -8,6 +8,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any, Mapping
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
@@ -1594,6 +1595,171 @@ class StateMachineTests(unittest.TestCase):
             "no_operation_price_move_only",
         )
 
+    def test_high_cash_guardrail_holds_routine_profit_take_but_not_hard_stop(self):
+        now = datetime(2026, 8, 10, 10, 0, tzinfo=TZ)
+        shadow = synthetic_shadow_state()
+        added_cash = float(shadow["initial_nav"])
+        shadow["strategy_shadow_portfolio"]["cash_cny"] = added_cash
+        shadow["strategy_shadow_portfolio"]["cash_by_currency"] = {
+            "CNY": added_cash,
+            "HKD": 0.0,
+        }
+        target_state = load_state_v2(Path("/path/that/does/not/exist"), now=now)
+        target_event = {
+            "event_id": "cash-band-target",
+            "symbol": "688333",
+            "name": "铂力特",
+            "condition": "target_reached",
+            "transition": "activated",
+            "severity": "warning",
+            "price": 120,
+            "reference_price": 115,
+            "payload": {
+                "quote_time": now.isoformat(),
+                "data_quality": "fresh_l1",
+            },
+        }
+
+        self.assertEqual(
+            process_actionable_decisions(
+                target_state,
+                now=now,
+                raw_events=[target_event],
+                levels={"688333": ReferenceLevels(target_price=115)},
+                shadow_state=shadow,
+                signal_recorder=record_shadow_signal,
+            ),
+            1,
+        )
+        self.assertEqual(
+            target_state["outbox"][0]["payload"]["action_code"],
+            "hold_cash_guardrail",
+        )
+        self.assertGreaterEqual(
+            target_state["outbox"][0]["payload"]["portfolio_cash_ratio"],
+            0.25,
+        )
+        self.assertEqual(shadow["signal_ledger"], [])
+        sent: list[Mapping[str, Any]] = []
+        self.assertEqual(
+            flush_outbox(
+                target_state,
+                now=now,
+                sender=lambda **payload: sent.append(payload) or True,
+            ),
+            1,
+        )
+        self.assertIn("建议动作：建议不减仓，继续持有", sent[0]["content"])
+        self.assertIn("硬止损不受本护栏影响", sent[0]["content"])
+
+        stop_state = load_state_v2(Path("/path/that/does/not/exist"), now=now)
+        stop_event = {
+            **target_event,
+            "event_id": "cash-band-hard-stop",
+            "condition": "stop_loss",
+            "severity": "critical",
+            "price": 90,
+            "reference_price": 100,
+        }
+        self.assertEqual(
+            process_actionable_decisions(
+                stop_state,
+                now=now,
+                raw_events=[stop_event],
+                levels={"688333": ReferenceLevels(stop_loss=100)},
+                shadow_state=shadow,
+                signal_recorder=record_shadow_signal,
+            ),
+            1,
+        )
+        self.assertEqual(stop_state["outbox"][0]["payload"]["action"], "建议清仓")
+        self.assertEqual(shadow["signal_ledger"][-1]["action"], "clear")
+
+    def test_buy_guardrail_preserves_minimum_cash_and_reserves_pending_buys(self):
+        now = datetime(2026, 8, 10, 10, 0, tzinfo=TZ)
+
+        def entry_event(event_id, symbol):
+            return {
+                "event_id": event_id,
+                "symbol": symbol,
+                "name": symbol,
+                "condition": "adaptive_entry_review",
+                "transition": "manual_review",
+                "severity": "warning",
+                "price": 100,
+                "reference_price": 99,
+                "payload": {
+                    "quote_time": now.isoformat(),
+                    "data_quality": "fresh_l1",
+                    "entry_low": 99,
+                    "entry_high": 101,
+                    "stop_loss": 95,
+                    "target_price": 120,
+                    "confidence": 0.95,
+                    "plan_fingerprint": f"plan-{symbol}",
+                    "market_costs": {
+                        "entry_fee_bps": 3,
+                        "entry_slippage_bps": 7,
+                    },
+                },
+            }
+
+        low_cash_shadow = synthetic_shadow_state()
+        low_cash = float(low_cash_shadow["initial_nav"]) * 0.18
+        low_cash_shadow["strategy_shadow_portfolio"]["cash_cny"] = low_cash
+        low_cash_shadow["strategy_shadow_portfolio"]["cash_by_currency"] = {
+            "CNY": low_cash,
+            "HKD": 0.0,
+        }
+        low_cash_state = load_state_v2(
+            Path("/path/that/does/not/exist"), now=now
+        )
+        low_cash_event = entry_event("reserve-floor", "600001")
+        self.assertEqual(
+            process_actionable_decisions(
+                low_cash_state,
+                now=now,
+                raw_events=[low_cash_event],
+                levels={},
+                shadow_state=low_cash_shadow,
+                signal_recorder=record_shadow_signal,
+            ),
+            0,
+        )
+        self.assertEqual(
+            low_cash_event["decision_result"],
+            "no_operation_insufficient_cash_for_explicit_buy",
+        )
+
+        shadow = synthetic_shadow_state()
+        available_cash = float(shadow["initial_nav"]) * 0.25
+        shadow["strategy_shadow_portfolio"]["cash_cny"] = available_cash
+        shadow["strategy_shadow_portfolio"]["cash_by_currency"] = {
+            "CNY": available_cash,
+            "HKD": 0.0,
+        }
+        state = load_state_v2(Path("/path/that/does/not/exist"), now=now)
+        first = entry_event("pending-reserve-1", "600001")
+        second = entry_event("pending-reserve-2", "600002")
+
+        self.assertEqual(
+            process_actionable_decisions(
+                state,
+                now=now,
+                raw_events=[first, second],
+                levels={},
+                shadow_state=shadow,
+                signal_recorder=record_shadow_signal,
+            ),
+            1,
+        )
+        self.assertEqual(state["outbox"][0]["payload"]["action_code"], "buy_0_25")
+        self.assertEqual(len(shadow["pending_signal_ids"]), 1)
+        self.assertEqual(
+            second["decision_result"],
+            "no_operation_insufficient_cash_for_explicit_buy",
+        )
+
     def test_signal_time_is_not_before_provider_quote_time(self):
         now = datetime(2026, 8, 10, 10, 0, tzinfo=TZ)
         quote_time = now + timedelta(seconds=3)
@@ -1853,7 +2019,7 @@ class StateMachineTests(unittest.TestCase):
             "plan_price": 100,
             "stop_loss": 95,
             "target_price": 120,
-            "confidence": 0.8,
+            "confidence": 0.95,
             "data_quality": "high",
             "expected_holding_days": 20,
             "position_state": "flat",
@@ -1915,7 +2081,7 @@ class StateMachineTests(unittest.TestCase):
         self.assertEqual(len(state["event_ledger"]), start)
 
         shadow["strategy_shadow_portfolio"]["cash_cny"] = (
-            shadow["initial_nav"] * 0.04
+            shadow["initial_nav"] * 0.25
         )
         shadow["strategy_shadow_portfolio"]["cash_by_currency"] = {
             "CNY": shadow["strategy_shadow_portfolio"]["cash_cny"],
