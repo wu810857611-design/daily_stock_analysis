@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 > For user-friendly release highlights, see the [GitHub Releases](https://github.com/ZhuLinsen/daily_stock_analysis/releases) page.
 
 ## [Unreleased]
+- [修复] 为全市场买入链路增加时段漏跑 watchdog、成功时段幂等账本和迟到拦截；A 股与港股通快照改为有界重试、独立成员缓存和跨市场隔离，单一市场故障只封锁该市场并准确标记部分降级。盘中 Longbridge `SessionError` 会自动重建 QuoteContext，PRIMARY 腾讯行情增加备用入口与覆盖诊断；故障/恢复 PushPlus 去重、报告来源与可用性语义同步修正，所有行情时间戳、新鲜度和 fail-closed 安全门保持不变。
 - [改进] PRIMARY 买入侧把15%现金从绝对底线改为机会分级软护栏：普通/强/极强机会的现金底线分别为15%/5%/0%，单股动态上限分别为15%/35%/50%；首笔仓位分别为2.5%/5%/10%，后续加仓分别为2.5%/5%/5%，受现金或单股上限约束时可自动降至较小档位。加仓要求新一轮可信双模型复核和不低于实验基准价的右侧确认，并计入待执行预留与成本且禁止负现金，硬止损保持最高优先级。
 - [修复] 打通“全市场双源行情→历史与交易计划→千问/DeepSeek一致复核→盘中新鲜买入区→2.5%模拟建仓建议”闭环，新增逐层候选漏斗、零输入/模型链路红灯与去重恢复告警；PRIMARY 现金达到25%后抑制常规止盈减仓但保留硬止损，买入侧计入待执行预留与成本，避免策略单向现金化或反向耗尽现金。
 - [修复] 分钟盘中监控把 Longbridge 已授权实时快照与“最新成交时间”拆分验收：实时权限、成功拉取和逐只提供方时间戳用于证明港股链路健康，超过交易新鲜度阈值的无近期成交快照仍禁止触发买卖建议但不再误报行情源/PRIMARY 降级；同时修复提供方时间略晚于循环起点导致的影子信号落盘失败，并让每次未取消的盘中 Actions 都强制执行行情、降级与 PushPlus 严格验收。

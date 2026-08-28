@@ -61,7 +61,7 @@ MARKET_SCAN_REVIEW_SYSTEM_PROMPT = """
 本任务的 verdict 不是立即买卖指令：若程序给出的完整买入区、止损、目标、数据质量
 和扣费后风险回报可支持“进入盘中新鲜价格区复核”，且没有硬风险，可判 pass；
 缺少 Level-2 本身不等于 reject，但必须降低相应推断置信度。pass 后程序最多生成
-首笔 2.5% 模拟净值、仍需人工确认的条件建仓建议；当前价未进入买入区的标的仍不会
+首笔 2.5%–10% 模拟净值动态仓位、仍需人工确认的条件建仓建议；当前价未进入买入区的标的仍不会
 触发买入提醒。
 
 输出严格 JSON，必须为每个输入代码且仅输出一条 review；`facts`、`inferences`、
@@ -337,11 +337,21 @@ def _health_notification_content(
         heading = "# 全市场买入链路已恢复"
         summary = "全市场输入与双模型买入候选链路已恢复正常，可继续按模拟规则筛选。"
     else:
-        heading = "# 全市场买入链路故障"
+        degraded = result.get("operational_status") == "degraded"
+        heading = (
+            "# 全市场买入链路部分降级"
+            if degraded
+            else "# 全市场买入链路故障"
+        )
         failures = "、".join(
             str(item) for item in (result.get("operational_failures") or [])
         ) or "unknown"
-        summary = f"故障项：{failures}。本轮不会向盘中链路启用新的建仓候选。"
+        summary = (
+            f"故障项：{failures}。故障市场停止启用新候选；"
+            "快照完整的另一市场仍可按原安全门继续筛选。"
+            if degraded
+            else f"故障项：{failures}。本轮不会向盘中链路启用新的建仓候选。"
+        )
     return "\n".join(
         [
             heading,
@@ -388,7 +398,7 @@ def persist_result_and_notify(
 
     candidate_change = has_obvious_change(previous_notified, result)
     operational_failed = bool(
-        result.get("operational_status") == "failed"
+        result.get("operational_status") in {"degraded", "failed"}
         or result.get("operational_failures")
     )
     failure_fingerprint = _failure_fingerprint(result) if operational_failed else ""
@@ -401,15 +411,20 @@ def persist_result_and_notify(
         health_kind = "failure"
     elif not operational_failed and previous_alert_active:
         health_kind = "recovery"
+    hard_failure = result.get("operational_status") == "failed"
     notification_kind = health_kind or (
-        "candidate_change" if candidate_change and not operational_failed else ""
+        "candidate_change" if candidate_change and not hard_failure else ""
     )
     obvious_change = bool(notification_kind)
     health_state = {
         **dict(previous_health),
         "schema_version": 1,
         "updated_at": result.get("generated_at"),
-        "current_status": "failed" if operational_failed else "healthy",
+        "current_status": (
+            str(result.get("operational_status") or "failed")
+            if operational_failed
+            else "healthy"
+        ),
         "current_failure_fingerprint": failure_fingerprint,
         "current_failures": list(result.get("operational_failures") or []),
         "failure_alert_active": previous_alert_active,
@@ -433,7 +448,11 @@ def persist_result_and_notify(
     selected_title = title
     selected_content = report
     if health_kind == "failure":
-        selected_title = "全市场买入链路故障"
+        selected_title = (
+            "全市场买入链路部分降级"
+            if result.get("operational_status") == "degraded"
+            else "全市场买入链路故障"
+        )
         selected_content = _health_notification_content(result, report, recovered=False)
     elif health_kind == "recovery":
         selected_title = "全市场买入链路已恢复"
@@ -522,7 +541,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--a-cache-max-age-hours", type=float, default=6.0)
     parser.add_argument("--hk-cache-max-age-hours", type=float, default=6.0)
     parser.add_argument("--hk-membership-cache-max-age-hours", type=float, default=840.0)
+    parser.add_argument("--snapshot-retry-backoff-seconds", type=float, default=1.0)
     parser.add_argument("--min-actionable-data-quality", type=float, default=0.70)
+    parser.add_argument("--slot", default="manual")
+    parser.add_argument("--trigger-source", default="manual")
     return parser
 
 
@@ -536,9 +558,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         a_cache_max_age_hours=args.a_cache_max_age_hours,
         hk_cache_max_age_hours=args.hk_cache_max_age_hours,
         hk_membership_cache_max_age_hours=args.hk_membership_cache_max_age_hours,
+        snapshot_retry_backoff_seconds=args.snapshot_retry_backoff_seconds,
         min_actionable_data_quality=args.min_actionable_data_quality,
         a_cache_path=args.state_dir / "a_share_snapshot.json",
         hk_cache_path=args.state_dir / "hk_connect_snapshot.json",
+        hk_membership_cache_path=args.state_dir / "hk_connect_membership.json",
     )
     service = MarketScanService(
         a_snapshot_loader=default_a_snapshot_loader,
@@ -550,6 +574,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         config=config,
     )
     result = service.run()
+    result["scheduler"] = {
+        "slot": str(args.slot or "manual"),
+        "trigger_source": str(args.trigger_source or "manual"),
+    }
     outcome = persist_result_and_notify(
         result,
         report_path=args.report,
@@ -567,7 +595,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             ensure_ascii=False,
         )
     )
-    return 2 if result.get("operational_status") == "failed" else 0
+    return 2 if result.get("operational_status") != "healthy" else 0
 
 
 if __name__ == "__main__":

@@ -24,7 +24,7 @@ concurrency:
 
 permissions:
   contents: read
-  actions: read
+  actions: write
 
 jobs:
   monitor:
@@ -396,6 +396,7 @@ jobs:
           # PRIMARY 账户已经初始化完成；运行时只允许恢复现有加密状态。
           SHADOW_AB_STATE_KEY: ${{ secrets.SHADOW_AB_STATE_KEY }}
           WATCH_ACCOUNTS_PRIVATE_JSON: ${{ secrets.WATCH_ACCOUNTS_PRIVATE_JSON }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           STOCK_LIST="${STOCK_LIST_CONFIG:-${STOCK_LIST:-}}"
@@ -447,6 +448,17 @@ jobs:
             return "$status"
           }
           trap persist_private_shadow_state EXIT
+          WATCHDOG_PID=""
+          if [ "$MAX_CYCLES" = "0" ]; then
+            python3 scripts/market_scan_watchdog.py \
+              --slot "$SESSION" \
+              --repo "$GITHUB_REPOSITORY" \
+              --ref "$GITHUB_REF_NAME" \
+              --output "reports/market_scan_watchdog_${SESSION}.json" &
+            WATCHDOG_PID=$!
+            echo "ℹ️ 已启动 ${SESSION} 时段全市场扫描漏跑兜底"
+          fi
+          set +e
           python3 scripts/intraday_session.py \
             --stocks "$STOCK_LIST" \
             --session "$SESSION" \
@@ -469,6 +481,22 @@ jobs:
             --max-cycles "$MAX_CYCLES" \
             --late-start-policy "$LATE_START_POLICY" \
             "${PLAN_ARGS[@]}"
+          MONITOR_STATUS=$?
+          set -e
+          WATCHDOG_STATUS=0
+          if [ -n "$WATCHDOG_PID" ]; then
+            set +e
+            wait "$WATCHDOG_PID"
+            WATCHDOG_STATUS=$?
+            set -e
+            if [ "$WATCHDOG_STATUS" -ne 0 ]; then
+              echo "::error::全市场扫描漏跑兜底执行失败；盘中监控证据仍保留并继续严格验收"
+            fi
+          fi
+          if [ "$MONITOR_STATUS" -ne 0 ]; then
+            exit "$MONITOR_STATUS"
+          fi
+          exit "$WATCHDOG_STATUS"
 
       - name: 严格验证行情与 PushPlus
         # 定时与手动盘中运行都必须留下同一份严格契约证据；即使前序步骤
@@ -557,6 +585,7 @@ jobs:
           path: |
             reports/intraday_session.md
             reports/intraday_state_missing.md
+            reports/market_scan_watchdog_*.json
             data/intraday/session_state.json
           if-no-files-found: warn
           retention-days: 30

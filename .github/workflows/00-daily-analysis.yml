@@ -918,3 +918,33 @@ jobs:
             echo "📜 最近日志（最后 30 行）:"
             tail -30 logs/stock_analysis_*.log 2>/dev/null || echo "无日志"
           fi
+
+  close-scan-watchdog:
+    if: github.event_name == 'schedule' && github.event.schedule == '0 10 * * 1-5'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      actions: write
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v5
+
+      - name: 兜底检查19:15全市场扫描
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 scripts/market_scan_watchdog.py \
+            --slot close \
+            --repo "$GITHUB_REPOSITORY" \
+            --ref "$GITHUB_REF_NAME" \
+            --output close-scan-watchdog.json
+
+      - name: 上传兜底审计结果
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: close-scan-watchdog-${{ github.run_number }}-${{ github.run_attempt }}
+          path: close-scan-watchdog.json
+          if-no-files-found: warn
+          retention-days: 30

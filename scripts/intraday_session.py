@@ -115,6 +115,7 @@ DEFAULT_TARGET_CASH_MIN_RATIO = 0.15
 DEFAULT_TARGET_CASH_MAX_RATIO = 0.25
 MAX_EXTRA_CANDIDATE_SYMBOLS = 12
 TENCENT_BATCH_ENDPOINT = "https://qt.gtimg.cn/q="
+TENCENT_BATCH_FALLBACK_ENDPOINT = "https://web.sqt.gtimg.cn/q="
 _TENCENT_RECORD = re.compile(r'v_([A-Za-z0-9]+)="([^"]*)"')
 _SEVERITY_RANK = {"info": 0, "warning": 1, "high": 2, "critical": 3}
 _OPEN_PHASES = {"intraday", "closing_auction"}
@@ -127,6 +128,34 @@ _SYSTEM_PUSH_CONDITIONS = {
 
 class SessionError(RuntimeError):
     """Raised for invalid configuration or irrecoverable local state."""
+
+
+def _safe_provider_error(exc: Exception) -> Dict[str, str]:
+    """Return useful provider diagnostics without exposing credentials."""
+
+    raw_message = str(exc or "").strip()
+    message = re.sub(
+        r"(?i)(access[_ -]?token|refresh[_ -]?token|authorization|"
+        r"app[_ -]?secret|api[_ -]?key|cookie)\s*[:=]\s*[^\s,;]+",
+        r"\1=<redacted>",
+        raw_message,
+    )
+    message = re.sub(
+        r"(?i)bearer\s+[A-Za-z0-9._~+\-/=]+",
+        "Bearer <redacted>",
+        message,
+    )
+    code = ""
+    for attribute in ("status_code", "status", "code", "errno"):
+        value = getattr(exc, attribute, None)
+        if value is not None and str(value).strip():
+            code = f"{attribute}={str(value).strip()[:80]}"
+            break
+    return {
+        "error_type": type(exc).__name__,
+        "error_code": code,
+        "message": message[:240],
+    }
 
 
 @dataclass(frozen=True)
@@ -408,6 +437,7 @@ def parse_tencent_batch(
     *,
     fetched_at: datetime,
     freshness_seconds: float = DEFAULT_FRESHNESS_SECONDS,
+    source: str = "tencent_batch",
 ) -> Dict[str, RealtimeQuote]:
     """Parse one Tencent multi-symbol response into basic, freshness-checked quotes."""
 
@@ -442,7 +472,7 @@ def parse_tencent_batch(
             fetched_at=_iso(fetched_at),
             stale_seconds=max(0.0, age_seconds) if age_seconds is not None else None,
             is_stale=not fresh or price is None,
-            source="tencent_batch",
+            source=source,
         )
 
     for symbol in requested:
@@ -452,14 +482,14 @@ def parse_tencent_batch(
                 symbol=symbol,
                 fetched_at=_iso(fetched_at),
                 is_stale=True,
-                source="tencent_batch",
+                source=source,
             ),
         )
     return parsed
 
 
 class TencentBatchQuoteFetcher:
-    """One HTTP request per chunk, returning only basic quote fields."""
+    """Fresh basic quotes with a bounded alternate Tencent route."""
 
     min_interval_seconds = 30.0
 
@@ -467,16 +497,23 @@ class TencentBatchQuoteFetcher:
         self,
         *,
         endpoint: str = TENCENT_BATCH_ENDPOINT,
+        fallback_endpoint: str = TENCENT_BATCH_FALLBACK_ENDPOINT,
         timeout_seconds: float = 8.0,
         chunk_size: int = 50,
         opener: Callable[..., Any] = request.urlopen,
         freshness_seconds: float = DEFAULT_FRESHNESS_SECONDS,
+        retry_backoff_seconds: float = 0.5,
+        sleeper: Callable[[float], None] = time.sleep,
     ):
         self.endpoint = endpoint
+        self.fallback_endpoint = fallback_endpoint
         self.timeout_seconds = timeout_seconds
         self.chunk_size = max(1, int(chunk_size))
         self.opener = opener
         self.freshness_seconds = freshness_seconds
+        self.retry_backoff_seconds = max(0.0, float(retry_backoff_seconds))
+        self.sleeper = sleeper
+        self.last_diagnostics: Dict[str, Any] = {}
 
     def fetch(
         self, symbols: Sequence[str], *, now: Optional[datetime] = None
@@ -484,38 +521,98 @@ class TencentBatchQuoteFetcher:
         fetched_at = now or datetime.now(SHANGHAI_TZ)
         canonical = list(dict.fromkeys(canonical_symbol(symbol) for symbol in symbols))
         results: Dict[str, RealtimeQuote] = {}
+        provider_errors: List[Dict[str, str]] = []
+        fallback_requested = 0
+        fallback_covered = 0
         for offset in range(0, len(canonical), self.chunk_size):
             chunk = canonical[offset : offset + self.chunk_size]
-            query = ",".join(to_tencent_symbol(symbol) for symbol in chunk)
-            outgoing = request.Request(
-                f"{self.endpoint}{query}",
-                headers={
-                    "Referer": "https://finance.qq.com/",
-                    "User-Agent": "daily-stock-analysis/intraday-session",
-                },
-                method="GET",
-            )
-            try:
-                with self.opener(outgoing, timeout=self.timeout_seconds) as response:
-                    body = response.read()
-                payload = body.decode("gbk", errors="replace")
-                results.update(
-                    parse_tencent_batch(
+            unresolved = list(chunk)
+            best_effort: Dict[str, RealtimeQuote] = {}
+            endpoints = [self.endpoint]
+            if self.fallback_endpoint and self.fallback_endpoint != self.endpoint:
+                endpoints.append(self.fallback_endpoint)
+            for route_index, endpoint in enumerate(endpoints):
+                if not unresolved:
+                    break
+                if route_index:
+                    fallback_requested += len(unresolved)
+                    if self.retry_backoff_seconds > 0:
+                        self.sleeper(self.retry_backoff_seconds)
+                query = ",".join(
+                    to_tencent_symbol(symbol) for symbol in unresolved
+                )
+                outgoing = request.Request(
+                    f"{endpoint}{query}",
+                    headers={
+                        "Referer": "https://finance.qq.com/",
+                        "User-Agent": "daily-stock-analysis/intraday-session",
+                    },
+                    method="GET",
+                )
+                try:
+                    with self.opener(
+                        outgoing, timeout=self.timeout_seconds
+                    ) as response:
+                        body = response.read()
+                    payload = body.decode("gbk", errors="replace")
+                    source = (
+                        "tencent_batch"
+                        if route_index == 0
+                        else "tencent_batch_fallback"
+                    )
+                    parsed = parse_tencent_batch(
                         payload,
-                        chunk,
+                        unresolved,
                         fetched_at=fetched_at,
                         freshness_seconds=self.freshness_seconds,
+                        source=source,
                     )
+                except Exception as exc:
+                    diagnostic = {
+                        "route": "primary" if route_index == 0 else "fallback",
+                        **_safe_provider_error(exc),
+                    }
+                    provider_errors.append(diagnostic)
+                    print(
+                        "腾讯批量行情路由失败"
+                        f"（{diagnostic['route']}，{','.join(unresolved)}）："
+                        f"{diagnostic['error_type']} "
+                        f"{diagnostic['error_code']} {diagnostic['message']}",
+                        file=sys.stderr,
+                    )
+                    continue
+                next_unresolved: List[str] = []
+                for symbol in unresolved:
+                    candidate = parsed[symbol]
+                    previous = best_effort.get(symbol)
+                    if candidate.price is not None and (
+                        previous is None or previous.price is None
+                    ):
+                        best_effort[symbol] = candidate
+                    if _quote_has_live_snapshot(candidate):
+                        results[symbol] = candidate
+                        if route_index:
+                            fallback_covered += 1
+                    else:
+                        next_unresolved.append(symbol)
+                unresolved = next_unresolved
+            for symbol in unresolved:
+                results[symbol] = best_effort.get(symbol) or RealtimeQuote(
+                    symbol=symbol,
+                    fetched_at=_iso(fetched_at),
+                    is_stale=True,
+                    source="tencent_batch_error",
                 )
-            except Exception as exc:
-                print(f"腾讯批量行情失败（{','.join(chunk)}）: {exc}", file=sys.stderr)
-                for symbol in chunk:
-                    results[symbol] = RealtimeQuote(
-                        symbol=symbol,
-                        fetched_at=_iso(fetched_at),
-                        is_stale=True,
-                        source="tencent_batch_error",
-                    )
+        self.last_diagnostics = {
+            "requested": len(canonical),
+            "live_covered": sum(
+                1 for symbol in canonical if _quote_has_live_snapshot(results[symbol])
+            ),
+            "fallback_requested": fallback_requested,
+            "fallback_covered": fallback_covered,
+            "fallback_active": fallback_requested > 0,
+            "provider_errors": provider_errors,
+        }
         return results
 
 
@@ -817,6 +914,9 @@ class LongbridgeBatchQuoteFetcher:
         chunk_size: int = DEFAULT_LONGBRIDGE_CHUNK_SIZE,
         context_factory: Callable[[], Any] = _noninteractive_longbridge_context,
         configured: Optional[bool] = None,
+        recovery_attempts: int = 1,
+        retry_backoff_seconds: float = 1.0,
+        sleeper: Callable[[float], None] = time.sleep,
     ):
         self.freshness_seconds = freshness_seconds
         self.chunk_size = min(DEFAULT_LONGBRIDGE_CHUNK_SIZE, max(1, int(chunk_size)))
@@ -826,6 +926,12 @@ class LongbridgeBatchQuoteFetcher:
         )
         self._context: Any = None
         self.realtime_entitled: Optional[bool] = None
+        self.recovery_attempts = max(0, min(int(recovery_attempts), 2))
+        self.retry_backoff_seconds = max(0.0, float(retry_backoff_seconds))
+        self.sleeper = sleeper
+        self.last_error: Dict[str, str] = {}
+        self.last_recovery_attempted = False
+        self.last_recovery_succeeded = False
 
     def fetch(
         self, symbols: Sequence[str], *, now: Optional[datetime] = None
@@ -851,57 +957,72 @@ class LongbridgeBatchQuoteFetcher:
                 )
                 for symbol in canonical
             }
-        try:
-            if self._context is None:
-                self._context = self.context_factory()
-                self.realtime_entitled = _has_hk_realtime_package(
-                    _package_rows(self._context)
-                )
-            results: Dict[str, RealtimeQuote] = {}
-            for offset in range(0, len(canonical), self.chunk_size):
-                chunk = canonical[offset : offset + self.chunk_size]
-                records = self._context.quote(
-                    [to_longbridge_symbol(symbol) for symbol in chunk]
-                )
-                results.update(
-                    parse_longbridge_batch(
-                        records,
-                        chunk,
-                        fetched_at=fetched_at,
-                        freshness_seconds=self.freshness_seconds,
-                        realtime_entitled=bool(self.realtime_entitled),
+        self.last_error = {}
+        self.last_recovery_attempted = False
+        self.last_recovery_succeeded = False
+        for attempt in range(self.recovery_attempts + 1):
+            if attempt:
+                self.last_recovery_attempted = True
+                if self.retry_backoff_seconds > 0:
+                    self.sleeper(
+                        self.retry_backoff_seconds * (2 ** (attempt - 1))
                     )
-                )
-            if not self.realtime_entitled:
-                results = {
-                    symbol: replace(
-                        quote,
-                        provider_snapshot_fresh=False,
-                        is_stale=True,
-                        source="longbridge_realtime_permission_missing",
+            try:
+                if self._context is None:
+                    self._context = self.context_factory()
+                    self.realtime_entitled = _has_hk_realtime_package(
+                        _package_rows(self._context)
                     )
-                    for symbol, quote in results.items()
-                }
-            return results
-        except Exception as exc:
-            # Keep the Tencent fallback available, but do not treat its delayed
-            # HK quote as a tradeable price.  Do not log credential values.
-            print(
-                "Longbridge 港股批量行情失败，保留严格降级："
-                f"{type(exc).__name__}",
-                file=sys.stderr,
+                results: Dict[str, RealtimeQuote] = {}
+                for offset in range(0, len(canonical), self.chunk_size):
+                    chunk = canonical[offset : offset + self.chunk_size]
+                    records = self._context.quote(
+                        [to_longbridge_symbol(symbol) for symbol in chunk]
+                    )
+                    results.update(
+                        parse_longbridge_batch(
+                            records,
+                            chunk,
+                            fetched_at=fetched_at,
+                            freshness_seconds=self.freshness_seconds,
+                            realtime_entitled=bool(self.realtime_entitled),
+                        )
+                    )
+                if not self.realtime_entitled:
+                    results = {
+                        symbol: replace(
+                            quote,
+                            provider_snapshot_fresh=False,
+                            is_stale=True,
+                            source="longbridge_realtime_permission_missing",
+                        )
+                        for symbol, quote in results.items()
+                    }
+                if attempt:
+                    self.last_recovery_succeeded = True
+                self.last_error = {}
+                return results
+            except Exception as exc:
+                self.last_error = _safe_provider_error(exc)
+                print(
+                    "Longbridge 港股批量行情失败，重建会话并保留严格降级："
+                    f"attempt={attempt + 1}/{self.recovery_attempts + 1} "
+                    f"{self.last_error['error_type']} "
+                    f"{self.last_error['error_code']} "
+                    f"{self.last_error['message']}",
+                    file=sys.stderr,
+                )
+                self._context = None
+                self.realtime_entitled = None
+        return {
+            symbol: RealtimeQuote(
+                symbol=symbol,
+                fetched_at=_iso(fetched_at),
+                is_stale=True,
+                source="longbridge_batch_error",
             )
-            self._context = None
-            self.realtime_entitled = None
-            return {
-                symbol: RealtimeQuote(
-                    symbol=symbol,
-                    fetched_at=_iso(fetched_at),
-                    is_stale=True,
-                    source="longbridge_batch_error",
-                )
-                for symbol in canonical
-            }
+            for symbol in canonical
+        }
 
 
 class DecisionQuoteFetcher:
@@ -934,6 +1055,9 @@ class DecisionQuoteFetcher:
         fetched_at = now or datetime.now(SHANGHAI_TZ)
         canonical = list(dict.fromkeys(canonical_symbol(symbol) for symbol in symbols))
         results = self.tencent_fetcher.fetch(canonical, now=fetched_at)
+        baseline_diagnostics = dict(
+            getattr(self.tencent_fetcher, "last_diagnostics", {}) or {}
+        )
         hk_symbols = [symbol for symbol in canonical if symbol.startswith("HK")]
         upgraded = 0
         provider_timestamped = 0
@@ -957,6 +1081,31 @@ class DecisionQuoteFetcher:
                 reason = "longbridge_provider_snapshot_unverified"
             if reason:
                 degradation_reasons[reason] = degradation_reasons.get(reason, 0) + 1
+                baseline = results.get(symbol)
+                if candidate is not None and candidate.price is not None:
+                    blocked = replace(
+                        candidate,
+                        provider_snapshot_fresh=False,
+                        is_stale=True,
+                        source=f"{reason}:strict_hk_block",
+                    )
+                    if baseline is not None and not blocked.name:
+                        blocked = replace(blocked, name=baseline.name)
+                elif baseline is not None:
+                    blocked = replace(
+                        baseline,
+                        provider_snapshot_fresh=False,
+                        is_stale=True,
+                        source=f"{reason}:strict_hk_block",
+                    )
+                else:
+                    blocked = candidate or RealtimeQuote(
+                        symbol=symbol,
+                        fetched_at=_iso(fetched_at),
+                        is_stale=True,
+                        source=f"{reason}:strict_hk_block",
+                    )
+                results[symbol] = blocked
                 continue
             baseline = results.get(symbol)
             if baseline is not None and not candidate.name:
@@ -967,6 +1116,7 @@ class DecisionQuoteFetcher:
                 inactive_price_timestamps += 1
         self.last_diagnostics = {
             "baseline": "tencent_batch",
+            "baseline_diagnostics": baseline_diagnostics,
             "hk_realtime_source": "longbridge_batch",
             "longbridge_configured": bool(self.longbridge_fetcher.configured),
             "hk_realtime_entitled": bool(
@@ -979,6 +1129,23 @@ class DecisionQuoteFetcher:
             "hk_price_timestamp_stale": inactive_price_timestamps,
             "hk_degraded": bool(hk_symbols and upgraded != len(hk_symbols)),
             "hk_degradation_reasons": degradation_reasons,
+            "longbridge_last_error": dict(
+                getattr(self.longbridge_fetcher, "last_error", {}) or {}
+            ),
+            "longbridge_recovery_attempted": bool(
+                getattr(
+                    self.longbridge_fetcher,
+                    "last_recovery_attempted",
+                    False,
+                )
+            ),
+            "longbridge_recovery_succeeded": bool(
+                getattr(
+                    self.longbridge_fetcher,
+                    "last_recovery_succeeded",
+                    False,
+                )
+            ),
             "strict_no_delayed_trade_decisions": True,
         }
         return results
@@ -4020,6 +4187,27 @@ def run_cycle(
             verification["hk_price_timestamp_stale_observations"] = int(
                 verification.get("hk_price_timestamp_stale_observations") or 0
             ) + int(quote_diagnostics.get("hk_price_timestamp_stale") or 0)
+            if quote_diagnostics.get("longbridge_recovery_attempted"):
+                verification["longbridge_recovery_attempts"] = int(
+                    verification.get("longbridge_recovery_attempts") or 0
+                ) + 1
+                outcome_key = (
+                    "longbridge_recovery_successes"
+                    if quote_diagnostics.get("longbridge_recovery_succeeded")
+                    else "longbridge_recovery_failures"
+                )
+                verification[outcome_key] = int(
+                    verification.get(outcome_key) or 0
+                ) + 1
+        if isinstance(verification, MutableMapping):
+            baseline_diagnostics = quote_diagnostics.get("baseline_diagnostics")
+            if isinstance(baseline_diagnostics, Mapping):
+                verification["primary_fallback_requests"] = int(
+                    verification.get("primary_fallback_requests") or 0
+                ) + int(baseline_diagnostics.get("fallback_requested") or 0)
+                verification["primary_fallback_covered"] = int(
+                    verification.get("primary_fallback_covered") or 0
+                ) + int(baseline_diagnostics.get("fallback_covered") or 0)
     primary_valid = [
         quote
         for quote in quotes
@@ -4449,6 +4637,25 @@ def render_session_report(
         elif int(integration_verification.get("hk_cycles_checked") or 0) > 0:
             lines.append("- 港股行情降级：本会话未发生。")
         lines.append(
+            "- Longbridge 会话恢复："
+            f"尝试 {int(integration_verification.get('longbridge_recovery_attempts') or 0)} 次；"
+            f"成功 {int(integration_verification.get('longbridge_recovery_successes') or 0)} 次；"
+            f"失败 {int(integration_verification.get('longbridge_recovery_failures') or 0)} 次。"
+        )
+        longbridge_error = quote_fetcher.get("longbridge_last_error") or {}
+        if isinstance(longbridge_error, Mapping) and longbridge_error:
+            lines.append(
+                "- Longbridge 最近错误："
+                f"{longbridge_error.get('error_type') or 'unknown'}；"
+                f"{longbridge_error.get('error_code') or 'no_code'}；"
+                f"{longbridge_error.get('message') or 'no_message'}。"
+            )
+        lines.append(
+            "- PRIMARY 备用路由："
+            f"请求 {int(integration_verification.get('primary_fallback_requests') or 0)} 个标的次；"
+            f"恢复 {int(integration_verification.get('primary_fallback_covered') or 0)} 个标的次。"
+        )
+        lines.append(
             "- PRIMARY/交易日历降级："
             f"PRIMARY={int(integration_verification.get('primary_degraded_cycles') or 0)} 轮；"
             f"交易日历={int(integration_verification.get('calendar_degraded_cycles') or 0)} 轮。"
@@ -4686,6 +4893,11 @@ def run_session(
             "hk_degraded_cycles": 0,
             "hk_degradation_reasons": {},
             "hk_price_timestamp_stale_observations": 0,
+            "longbridge_recovery_attempts": 0,
+            "longbridge_recovery_successes": 0,
+            "longbridge_recovery_failures": 0,
+            "primary_fallback_requests": 0,
+            "primary_fallback_covered": 0,
             "primary_degraded_cycles": 0,
             "calendar_degraded_cycles": 0,
             "signal_persist_failures": 0,
@@ -4926,6 +5138,11 @@ def run_session(
         "hk_degraded_cycles": 0,
         "hk_degradation_reasons": {},
         "hk_price_timestamp_stale_observations": 0,
+        "longbridge_recovery_attempts": 0,
+        "longbridge_recovery_successes": 0,
+        "longbridge_recovery_failures": 0,
+        "primary_fallback_requests": 0,
+        "primary_fallback_covered": 0,
         "primary_degraded_cycles": 0,
         "calendar_degraded_cycles": 0,
         "signal_persist_failures": 0,

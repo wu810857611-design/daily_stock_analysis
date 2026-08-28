@@ -138,6 +138,7 @@ def _config(tmp_path: Path, **overrides: Any) -> MarketScanConfig:
         "min_history_bars": 60,
         "a_cache_path": tmp_path / "a_share.json",
         "hk_cache_path": tmp_path / "hk_connect.json",
+        "hk_membership_cache_path": tmp_path / "hk_connect_membership.json",
     }
     values.update(overrides)
     return MarketScanConfig(**values)
@@ -318,8 +319,12 @@ def test_hk_universe_strictly_excludes_non_connect_symbols(tmp_path: Path) -> No
     assert {item["code"] for item in result.hk_candidates} == {"HK00700", "HK00981"}
     assert result.diagnostics["hk_connect_strict"] is True
     cached = json.loads((tmp_path / "hk_connect.json").read_text(encoding="utf-8"))
+    membership = json.loads(
+        (tmp_path / "hk_connect_membership.json").read_text(encoding="utf-8")
+    )
     assert cached["is_connect_universe"] is True
     assert set(cached["membership_codes"]) == {"HK00700", "HK00981"}
+    assert set(membership["membership_codes"]) == {"HK00700", "HK00981"}
     assert {item["code"] for item in cached["records"]} == {"HK00700", "HK00981"}
 
 
@@ -398,6 +403,40 @@ def test_default_full_market_loaders_use_independent_fallbacks(monkeypatch: Any)
     assert hk_payload["provider_errors"]
 
 
+def test_snapshot_retry_uses_bounded_backoff_before_recovery(tmp_path: Path) -> None:
+    calls = 0
+    sleeps: list[float] = []
+
+    def flaky_a_loader() -> Mapping[str, Any]:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise TimeoutError("temporary disconnect")
+        return _a_snapshot()
+
+    service = MarketScanService(
+        a_snapshot_loader=flaky_a_loader,
+        hk_connect_snapshot_loader=_hk_snapshot,
+        history_loader=_history,
+        qwen_reviewer=ReviewRecorder(),
+        deepseek_reviewer=ReviewRecorder(),
+        config=_config(
+            tmp_path,
+            snapshot_retries=2,
+            snapshot_retry_backoff_seconds=1.25,
+        ),
+        clock=lambda: NOW,
+        sleeper=sleeps.append,
+    )
+
+    result = service.run_l1()
+
+    assert result.a_safe_halt is False
+    assert calls == 2
+    assert sleeps == [1.25]
+    assert result.diagnostics["a_snapshot_provider_errors"]
+
+
 def test_hk_quote_fallback_filters_fresh_all_market_quotes_by_cached_membership(
     tmp_path: Path,
 ) -> None:
@@ -459,6 +498,55 @@ def test_hk_quote_fallback_filters_fresh_all_market_quotes_by_cached_membership(
     assert cached["membership_fetched_at"] == NOW.isoformat()
 
 
+def test_dedicated_hk_membership_survives_volatile_quote_cache_loss(
+    tmp_path: Path,
+) -> None:
+    _service(
+        tmp_path,
+        qwen=ReviewRecorder(),
+        deepseek=ReviewRecorder(),
+    ).run_l1()
+    (tmp_path / "hk_connect.json").unlink()
+
+    def broken_connect_loader() -> Any:
+        raise TimeoutError("connect endpoint unavailable")
+
+    result = _service(
+        tmp_path,
+        qwen=ReviewRecorder(),
+        deepseek=ReviewRecorder(),
+        hk_loader=broken_connect_loader,
+        hk_all_loader=lambda: {
+            "source": "fake_all_hk",
+            "as_of": (NOW + timedelta(hours=1)).isoformat(),
+            "is_full_hk_universe": True,
+            "records": [
+                {
+                    "代码": "00700",
+                    "中文名称": "腾讯控股",
+                    "最新价": 101,
+                    "涨跌幅": 1,
+                    "成交量": 1_000,
+                    "成交额": 1_000,
+                },
+                {
+                    "代码": "09999",
+                    "中文名称": "非港股通",
+                    "最新价": 103,
+                    "涨跌幅": 1,
+                    "成交量": 1_000,
+                    "成交额": 1_000,
+                },
+            ],
+        },
+        clock=lambda: NOW + timedelta(hours=1),
+        config_overrides={"top_hk_history": 2},
+    ).run_l1()
+
+    assert result.hk_safe_halt is False
+    assert {item["code"] for item in result.hk_candidates} == {"HK00700"}
+
+
 def test_fetch_time_is_not_fabricated_as_provider_market_timestamp(tmp_path: Path) -> None:
     def a_without_provider_time() -> Mapping[str, Any]:
         payload = dict(_a_snapshot())
@@ -482,9 +570,20 @@ def test_fetch_time_is_not_fabricated_as_provider_market_timestamp(tmp_path: Pat
     assert result.as_of[MARKET_HK] == ""
     assert result.diagnostics["a_snapshot_fetched_at"] == NOW.isoformat()
     assert result.diagnostics["hk_snapshot_fetched_at"] == NOW.isoformat()
+    report = render_market_scan_markdown(
+        _service(
+            tmp_path,
+            qwen=ReviewRecorder(),
+            deepseek=ReviewRecorder(),
+            a_loader=a_without_provider_time,
+            hk_loader=hk_without_provider_time,
+        ).run()
+    )
+    assert "A股快照：可用" in report
+    assert "提供方时间=提供方未返回" in report
 
 
-def test_a_snapshot_stale_cache_safely_blocks_push(tmp_path: Path) -> None:
+def test_a_snapshot_stale_cache_blocks_only_a_market(tmp_path: Path) -> None:
     stale_time = NOW - timedelta(hours=10)
     (tmp_path / "a_share.json").write_text(
         json.dumps(
@@ -509,20 +608,26 @@ def test_a_snapshot_stale_cache_safely_blocks_push(tmp_path: Path) -> None:
         qwen=ReviewRecorder(),
         deepseek=ReviewRecorder(),
         a_loader=broken_a_loader,
-        config_overrides={"a_cache_max_age_hours": 1.0},
+        config_overrides={
+            "a_cache_max_age_hours": 1.0,
+            "min_net_rr": 0.1,
+        },
     ).run()
 
-    assert result["safe_to_push"] is False
-    assert result["operational_status"] == "failed"
+    assert result["safe_to_push"] is True
+    assert result["operational_status"] == "degraded"
     assert "a_share_full_market_snapshot_unavailable" in result[
         "operational_failures"
     ]
     assert result["diagnostics"]["a_full_market_strict"] is False
-    assert all(item["action"] == "watch" for item in result["candidates"])
-    assert any("A股全市场快照不可用" in reason for reason in result["push_block_reasons"])
+    assert result["candidates"]
+    assert all(item["market"] == MARKET_HK for item in result["candidates"])
+    assert all(item["action"] == "conditional_buy" for item in result["candidates"])
+    assert result["push_block_reasons"] == []
+    assert result["market_block_reasons"][MARKET_A]
 
 
-def test_expired_hk_cache_safely_blocks_push_when_provider_fails(tmp_path: Path) -> None:
+def test_expired_hk_cache_blocks_only_hk_when_provider_fails(tmp_path: Path) -> None:
     stale_time = NOW - timedelta(hours=10)
     cache_path = tmp_path / "hk_connect.json"
     cache_path.write_text(
@@ -552,10 +657,14 @@ def test_expired_hk_cache_safely_blocks_push_when_provider_fails(tmp_path: Path)
     )
     result = service.run()
 
-    assert result["safe_to_push"] is False
+    assert result["safe_to_push"] is True
+    assert result["operational_status"] == "degraded"
     assert result["diagnostics"]["hk_connect_strict"] is False
     assert result["diagnostics"][MARKET_HK]["input_count"] == 0
-    assert any("港股通成分数据不可用" in reason for reason in result["push_block_reasons"])
+    assert result["push_block_reasons"] == []
+    assert result["market_block_reasons"][MARKET_HK]
+    assert all(item["market"] == MARKET_A for item in result["candidates"])
+    assert all(item["action"] == "conditional_buy" for item in result["candidates"])
 
 
 def test_fresh_hk_quotes_cannot_extend_expired_connect_membership(
@@ -593,9 +702,30 @@ def test_fresh_hk_quotes_cannot_extend_expired_connect_membership(
         },
     ).run()
 
-    assert result["operational_status"] == "failed"
+    assert result["operational_status"] == "degraded"
     assert result["diagnostics"]["hk_connect_strict"] is False
     assert "hk_connect_snapshot_unavailable" in result["operational_failures"]
+
+
+def test_both_market_snapshots_unavailable_still_fail_closed(tmp_path: Path) -> None:
+    def broken_loader() -> Any:
+        raise TimeoutError("all providers unavailable")
+
+    result = _service(
+        tmp_path,
+        qwen=ReviewRecorder(),
+        deepseek=ReviewRecorder(),
+        a_loader=broken_loader,
+        hk_loader=broken_loader,
+    ).run()
+
+    assert result["operational_status"] == "failed"
+    assert result["safe_to_push"] is False
+    assert result["candidates"] == []
+    assert set(result["operational_failures"]) == {
+        "a_share_full_market_snapshot_unavailable",
+        "hk_connect_snapshot_unavailable",
+    }
 
 
 def test_trade_plan_rr_boundary_is_inclusive() -> None:
@@ -956,6 +1086,53 @@ def test_operational_failure_alert_is_deduped_and_recovery_is_sent_once(
         ),
     )
     assert stable["notification_attempted"] is False
+
+
+def test_partial_market_degradation_dedupes_health_but_allows_healthy_market_change(
+    tmp_path: Path,
+) -> None:
+    degraded = {
+        "generated_at": NOW.isoformat(),
+        "as_of": {MARKET_A: NOW.isoformat(), MARKET_HK: ""},
+        "safe_to_push": True,
+        "push_block_reasons": [],
+        "market_block_reasons": {MARKET_A: [], MARKET_HK: ["blocked"]},
+        "operational_status": "degraded",
+        "operational_failures": ["hk_connect_snapshot_unavailable"],
+        "diagnostics": {"buy_funnel": {"snapshot_input_count": 1}},
+        "candidates": [{"code": "600001", "action": "watch", "plan": {}}],
+        "disclaimer": "simulation only",
+    }
+    calls: list[tuple[str, str]] = []
+
+    first = persist_result_and_notify(
+        degraded,
+        report_path=tmp_path / "scan.md",
+        result_path=tmp_path / "scan.json",
+        state_dir=tmp_path / "state",
+        notify=True,
+        notifier=lambda title, content: calls.append((title, content)) or True,
+    )
+    assert first["notification_kind"] == "failure"
+    assert calls[-1][0] == "全市场买入链路部分降级"
+
+    changed = {
+        **degraded,
+        "generated_at": (NOW + timedelta(minutes=30)).isoformat(),
+        "candidates": [
+            {"code": "600001", "action": "conditional_buy", "plan": {}}
+        ],
+    }
+    second = persist_result_and_notify(
+        changed,
+        report_path=tmp_path / "scan.md",
+        result_path=tmp_path / "scan.json",
+        state_dir=tmp_path / "state",
+        notify=True,
+        notifier=lambda title, content: calls.append((title, content)) or True,
+    )
+    assert second["notification_kind"] == "candidate_change"
+    assert len(calls) == 2
 
 
 def test_market_scan_workflow_is_independent_simulation_with_fixed_state_artifact() -> None:

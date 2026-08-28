@@ -899,6 +899,77 @@ class TencentBatchTests(unittest.TestCase):
         self.assertTrue(result.is_stale)
         self.assertEqual(result.source, "longbridge_realtime_permission_missing")
 
+    def test_longbridge_session_error_rebuilds_once_and_recovers(self):
+        now = datetime(2026, 8, 28, 13, 11, tzinfo=TZ)
+        factory_calls = []
+
+        class BrokenContext:
+            def quote_package_details(self):
+                return [SimpleNamespace(key="HK_L1_OpenAPI", name="real-time")]
+
+            def quote(self, _symbols):
+                raise RuntimeError("session disconnected")
+
+        class RecoveredContext:
+            def quote_package_details(self):
+                return [SimpleNamespace(key="HK_L1_OpenAPI", name="real-time")]
+
+            def quote(self, symbols):
+                return [
+                    {
+                        "symbol": symbol,
+                        "last_done": "10.5",
+                        "prev_close": "10",
+                        "timestamp": now,
+                    }
+                    for symbol in symbols
+                ]
+
+        def factory():
+            factory_calls.append(True)
+            return BrokenContext() if len(factory_calls) == 1 else RecoveredContext()
+
+        sleeps = []
+        fetcher = LongbridgeBatchQuoteFetcher(
+            configured=True,
+            context_factory=factory,
+            recovery_attempts=1,
+            retry_backoff_seconds=0.5,
+            sleeper=sleeps.append,
+        )
+
+        result = fetcher.fetch(["HK00981"], now=now)["HK00981"]
+
+        self.assertFalse(result.is_stale)
+        self.assertEqual(len(factory_calls), 2)
+        self.assertEqual(sleeps, [0.5])
+        self.assertTrue(fetcher.last_recovery_attempted)
+        self.assertTrue(fetcher.last_recovery_succeeded)
+        self.assertEqual(fetcher.last_error, {})
+
+    def test_longbridge_failure_diagnostic_redacts_credentials(self):
+        now = datetime(2026, 8, 28, 13, 11, tzinfo=TZ)
+
+        class BrokenContext:
+            def quote_package_details(self):
+                return [SimpleNamespace(key="HK_L1_OpenAPI", name="real-time")]
+
+            def quote(self, _symbols):
+                raise RuntimeError("access_token=super-secret session rejected")
+
+        fetcher = LongbridgeBatchQuoteFetcher(
+            configured=True,
+            context_factory=BrokenContext,
+            recovery_attempts=0,
+        )
+
+        result = fetcher.fetch(["HK00981"], now=now)["HK00981"]
+
+        self.assertTrue(result.is_stale)
+        self.assertEqual(result.source, "longbridge_batch_error")
+        self.assertNotIn("super-secret", json.dumps(fetcher.last_error))
+        self.assertIn("<redacted>", fetcher.last_error["message"])
+
     def test_oauth_cache_secret_accepts_wrapped_base64(self):
         payload = b'{"access_token":"test-only"}'
         encoded = base64.b64encode(payload).decode("ascii")
@@ -1100,11 +1171,11 @@ class TencentBatchTests(unittest.TestCase):
 
     def test_market_aware_fetcher_reports_missing_provider_timestamp(self):
         now = datetime(2026, 8, 11, 14, 45, tzinfo=TZ)
-        delayed_hk = RealtimeQuote(
+        fresh_unverified_hk = RealtimeQuote(
             symbol="HK06181",
             price=383.8,
-            provider_timestamp=(now - timedelta(minutes=15)).isoformat(),
-            is_stale=True,
+            provider_timestamp=(now - timedelta(seconds=5)).isoformat(),
+            is_stale=False,
             source="tencent_batch",
         )
         missing_timestamp = RealtimeQuote(
@@ -1116,7 +1187,7 @@ class TencentBatchTests(unittest.TestCase):
             source="longbridge_batch",
         )
         fetcher = DecisionQuoteFetcher(
-            tencent_fetcher=FakeFetcher([{"HK06181": delayed_hk}]),
+            tencent_fetcher=FakeFetcher([{"HK06181": fresh_unverified_hk}]),
             longbridge_fetcher=FakeLongbridgeFetcher(
                 [{"HK06181": missing_timestamp}]
             ),
@@ -1124,7 +1195,8 @@ class TencentBatchTests(unittest.TestCase):
 
         result = fetcher.fetch(["HK06181"], now=now)
 
-        self.assertIs(result["HK06181"], delayed_hk)
+        self.assertTrue(result["HK06181"].is_stale)
+        self.assertIn("strict_hk_block", result["HK06181"].source)
         self.assertEqual(fetcher.last_diagnostics["hk_fresh_upgraded"], 0)
         self.assertEqual(fetcher.last_diagnostics["hk_provider_timestamped"], 0)
         self.assertTrue(fetcher.last_diagnostics["hk_degraded"])
@@ -1165,6 +1237,35 @@ class TencentBatchTests(unittest.TestCase):
             stale_payload, ["300408"], fetched_at=now, freshness_seconds=90
         )
         self.assertTrue(stale["300408"].is_stale)
+
+    def test_tencent_primary_route_failure_recovers_from_fallback(self):
+        now = datetime(2026, 8, 28, 13, 11, 30, tzinfo=TZ)
+        payload = tencent_record(
+            "sz300408", "三环集团", 40, 39, "20260828131100"
+        )
+        calls = []
+
+        def opener(outgoing, timeout):
+            calls.append((outgoing.full_url, timeout))
+            if outgoing.full_url.startswith("https://primary.invalid/"):
+                raise OSError("primary disconnected")
+            return FakeResponse(payload)
+
+        fetcher = TencentBatchQuoteFetcher(
+            endpoint="https://primary.invalid/q=",
+            fallback_endpoint="https://fallback.invalid/q=",
+            opener=opener,
+            retry_backoff_seconds=0,
+        )
+
+        result = fetcher.fetch(["300408"], now=now)["300408"]
+
+        self.assertFalse(result.is_stale)
+        self.assertEqual(result.source, "tencent_batch_fallback")
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(fetcher.last_diagnostics["fallback_requested"], 1)
+        self.assertEqual(fetcher.last_diagnostics["fallback_covered"], 1)
+        self.assertTrue(fetcher.last_diagnostics["provider_errors"])
 
     def test_exact_twelve_symbol_watchlist_is_fetched_in_one_batch(self):
         now = datetime(2026, 7, 28, 10, 30, 30, tzinfo=TZ)
