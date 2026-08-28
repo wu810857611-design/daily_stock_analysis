@@ -6,9 +6,25 @@ on:
     - cron: '30 6 * * 1-5'   # 北京时间 14:30
     - cron: '15 11 * * 1-5'  # 北京时间 19:15，避开 18:00 收盘分析
   workflow_dispatch:
+    inputs:
+      slot:
+        description: '时段；watchdog 必须显式传入，普通手动运行保持 auto'
+        required: false
+        default: auto
+        type: choice
+        options:
+          - auto
+          - morning
+          - afternoon
+          - close
+      trigger_source:
+        description: '触发来源，仅用于审计'
+        required: false
+        default: manual
+        type: string
 
 concurrency:
-  group: market-scan-simulation
+  group: market-scan-${{ github.ref }}-${{ github.event.schedule == '30 2 * * 1-5' && 'morning' || github.event.schedule == '30 6 * * 1-5' && 'afternoon' || github.event.schedule == '15 11 * * 1-5' && 'close' || inputs.slot || 'manual' }}
   cancel-in-progress: false
 
 permissions:
@@ -46,6 +62,7 @@ jobs:
       MARKET_SCAN_A_CACHE_MAX_AGE_HOURS: ${{ vars.MARKET_SCAN_A_CACHE_MAX_AGE_HOURS || '6' }}
       MARKET_SCAN_HK_CACHE_MAX_AGE_HOURS: ${{ vars.MARKET_SCAN_HK_CACHE_MAX_AGE_HOURS || '6' }}
       MARKET_SCAN_HK_MEMBERSHIP_CACHE_MAX_AGE_HOURS: ${{ vars.MARKET_SCAN_HK_MEMBERSHIP_CACHE_MAX_AGE_HOURS || '840' }}
+      MARKET_SCAN_SNAPSHOT_RETRY_BACKOFF_SECONDS: ${{ vars.MARKET_SCAN_SNAPSHOT_RETRY_BACKOFF_SECONDS || '1.0' }}
       MARKET_SCAN_MIN_ACTIONABLE_DATA_QUALITY: ${{ vars.MARKET_SCAN_MIN_ACTIONABLE_DATA_QUALITY || '0.70' }}
 
     steps:
@@ -149,8 +166,26 @@ jobs:
           test -f data/market_scan/latest.json
           echo "✅ 已从同分支最新 artifact 恢复扫描与待推送状态"
 
+      - name: 校验扫描时段、迟到边界与幂等状态
+        id: slot_guard
+        shell: bash
+        env:
+          REQUESTED_SLOT: ${{ inputs.slot || 'auto' }}
+          TRIGGER_SOURCE: ${{ inputs.trigger_source || github.event_name }}
+          EVENT_SCHEDULE: ${{ github.event.schedule }}
+        run: |
+          set -euo pipefail
+          python3 scripts/market_scan_slot_guard.py \
+            --state-dir "$MARKET_SCAN_STATE_DIR" \
+            --event-name "${GITHUB_EVENT_NAME}" \
+            --event-schedule "${EVENT_SCHEDULE:-}" \
+            --requested-slot "${REQUESTED_SLOT:-auto}" \
+            --trigger-source "${TRIGGER_SOURCE:-unknown}" \
+            --github-output "$GITHUB_OUTPUT"
+
       - name: 执行分层选股（不连接券商）
         id: market_scan
+        if: steps.slot_guard.outputs.should_run == 'true'
         shell: bash
         run: |
           set +e
@@ -165,24 +200,39 @@ jobs:
             --a-cache-max-age-hours "$MARKET_SCAN_A_CACHE_MAX_AGE_HOURS" \
             --hk-cache-max-age-hours "$MARKET_SCAN_HK_CACHE_MAX_AGE_HOURS" \
             --hk-membership-cache-max-age-hours "$MARKET_SCAN_HK_MEMBERSHIP_CACHE_MAX_AGE_HOURS" \
+            --snapshot-retry-backoff-seconds "$MARKET_SCAN_SNAPSHOT_RETRY_BACKOFF_SECONDS" \
             --min-actionable-data-quality "$MARKET_SCAN_MIN_ACTIONABLE_DATA_QUALITY" \
+            --slot "${{ steps.slot_guard.outputs.slot }}" \
+            --trigger-source "${{ steps.slot_guard.outputs.trigger_source }}" \
             --notify
           SCAN_EXIT_CODE=$?
           echo "exit_code=$SCAN_EXIT_CODE" >> "$GITHUB_OUTPUT"
           exit 0
 
+      - name: 标记本时段扫描成功
+        if: steps.slot_guard.outputs.should_run == 'true' && steps.market_scan.outputs.exit_code == '0'
+        run: |
+          python3 scripts/market_scan_slot_guard.py \
+            --state-dir "$MARKET_SCAN_STATE_DIR" \
+            --mark-complete \
+            --slot-key "${{ steps.slot_guard.outputs.slot_key }}" \
+            --run-id "$GITHUB_RUN_ID"
+
       - name: 保存全市场扫描状态缓存
+        if: steps.slot_guard.outputs.should_run == 'true'
         uses: actions/cache/save@v4
         with:
           path: data/market_scan/
           key: market-scan-state-${{ github.run_id }}-${{ github.run_attempt }}
 
       - name: 打包固定名扫描状态
+        if: steps.slot_guard.outputs.should_run == 'true'
         run: |
           test -f data/market_scan/latest.json
           tar -czf market-scan-state.tar.gz data/market_scan/
 
       - name: 上传固定名状态供其他模拟工作流恢复
+        if: steps.slot_guard.outputs.should_run == 'true'
         uses: actions/upload-artifact@v6
         with:
           name: market-scan-state
@@ -198,6 +248,7 @@ jobs:
           path: |
             reports/market_scan.md
             reports/market_scan.json
+            reports/market_scan_slot_guard.json
           if-no-files-found: warn
           retention-days: 90
 
@@ -207,6 +258,14 @@ jobs:
         env:
           SCAN_EXIT_CODE: ${{ steps.market_scan.outputs.exit_code }}
         run: |
+          if [ -z "${{ steps.slot_guard.outputs.should_run }}" ]; then
+            echo "❌ 扫描时段护栏没有生成结果，不能按安全跳过处理"
+            exit 1
+          fi
+          if [ "${{ steps.slot_guard.outputs.should_run }}" != "true" ]; then
+            echo "ℹ️ 本轮被时段幂等/迟到护栏安全跳过：${{ steps.slot_guard.outputs.skip_reason }}"
+            exit 0
+          fi
           if [ "${SCAN_EXIT_CODE:-1}" -ne 0 ]; then
             echo "❌ 全市场买入链路未通过严格健康检查，报告和状态已保留"
             exit "${SCAN_EXIT_CODE:-1}"

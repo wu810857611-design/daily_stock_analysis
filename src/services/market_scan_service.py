@@ -20,6 +20,7 @@ import math
 import os
 import re
 import tempfile
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -42,6 +43,7 @@ SnapshotLoader = Callable[[], Any]
 HistoryLoader = Callable[[str, int], Any]
 Reviewer = Callable[[Sequence[Mapping[str, Any]]], Any]
 Clock = Callable[[], datetime]
+Sleeper = Callable[[float], None]
 
 
 class MarketScanError(RuntimeError):
@@ -74,8 +76,12 @@ class MarketScanConfig:
     hk_membership_cache_max_age_hours: float = 24.0 * 35.0
     min_actionable_data_quality: float = 0.70
     snapshot_retries: int = 2
+    snapshot_retry_backoff_seconds: float = 0.0
     a_cache_path: Path = Path("data/market_scan/a_share_snapshot.json")
     hk_cache_path: Path = Path("data/market_scan/hk_connect_snapshot.json")
+    hk_membership_cache_path: Path = Path(
+        "data/market_scan/hk_connect_membership.json"
+    )
 
     def __post_init__(self) -> None:
         if self.top_a_history < 1 or self.top_hk_history < 1:
@@ -88,6 +94,8 @@ class MarketScanConfig:
             raise ValueError("min_net_rr must be positive")
         if self.snapshot_retries < 1 or self.snapshot_retries > 5:
             raise ValueError("snapshot_retries must be between 1 and 5")
+        if self.snapshot_retry_backoff_seconds < 0:
+            raise ValueError("snapshot_retry_backoff_seconds cannot be negative")
         if self.hk_membership_cache_max_age_hours <= 0:
             raise ValueError("hk_membership_cache_max_age_hours must be positive")
         if not 0.70 <= self.min_actionable_data_quality <= 1:
@@ -877,6 +885,7 @@ class MarketScanService:
         hk_all_snapshot_loader: Optional[SnapshotLoader] = None,
         config: Optional[MarketScanConfig] = None,
         clock: Clock = _now_shanghai,
+        sleeper: Sleeper = time.sleep,
     ):
         self.a_snapshot_loader = a_snapshot_loader
         self.hk_connect_snapshot_loader = hk_connect_snapshot_loader
@@ -886,6 +895,14 @@ class MarketScanService:
         self.deepseek_reviewer = deepseek_reviewer
         self.config = config or MarketScanConfig()
         self.clock = clock
+        self.sleeper = sleeper
+
+    def _wait_before_snapshot_retry(self, attempt: int) -> None:
+        """Apply bounded exponential backoff between provider attempts."""
+
+        delay = self.config.snapshot_retry_backoff_seconds * (2 ** max(attempt, 0))
+        if delay > 0:
+            self.sleeper(delay)
 
     def run_l1(self) -> L1Result:
         """Run the full-market, vectorised stage.  This method never calls an LLM."""
@@ -956,8 +973,10 @@ class MarketScanService:
         self,
         now: datetime,
     ) -> Tuple[pd.DataFrame, Dict[str, Any], bool, str]:
-        provider_error = ""
-        for _attempt in range(self.config.snapshot_retries):
+        provider_errors: List[str] = []
+        for attempt in range(self.config.snapshot_retries):
+            if attempt:
+                self._wait_before_snapshot_retry(attempt - 1)
             try:
                 raw = self.a_snapshot_loader()
                 frame_raw, metadata = _coerce_snapshot_payload(raw, now=now)
@@ -972,15 +991,19 @@ class MarketScanService:
                     "as_of": metadata["as_of"],
                     "fetched_at": metadata["fetched_at"],
                     "source": str(metadata.get("source") or "a_share_provider"),
-                    "provider_errors": list(metadata.get("provider_errors") or []),
+                    "provider_errors": [
+                        *provider_errors,
+                        *(str(item) for item in (metadata.get("provider_errors") or [])),
+                    ],
                     "is_full_a_universe": True,
                     "records": frame.to_dict(orient="records"),
                 }
                 _atomic_write_json(self.config.a_cache_path, cache_payload)
                 metadata["source"] = cache_payload["source"]
+                metadata["provider_errors"] = cache_payload["provider_errors"]
                 return frame.reset_index(drop=True), metadata, False, ""
             except Exception as exc:  # noqa: BLE001 - bounded retries precede cache fallback.
-                provider_error = str(exc)
+                provider_errors.append(f"attempt_{attempt + 1}:{type(exc).__name__}:{exc}")
 
         cached = self._read_snapshot_cache(
             now,
@@ -992,8 +1015,8 @@ class MarketScanService:
         if cached is not None:
             frame, metadata = cached
             metadata["source"] = f"{metadata.get('source') or 'unknown'}:last_good_cache"
-            metadata["provider_error"] = provider_error
-            metadata["provider_errors"] = [provider_error] if provider_error else []
+            metadata["provider_error"] = provider_errors[-1] if provider_errors else ""
+            metadata["provider_errors"] = provider_errors
             return frame, metadata, False, ""
 
         reason = "A股全市场快照不可用或缓存过期，已安全停止本轮主动推送"
@@ -1001,9 +1024,10 @@ class MarketScanService:
             pd.DataFrame(columns=("code", "name", "market")),
             {
                 "as_of": "",
+                "fetched_at": "",
                 "source": "unavailable",
-                "provider_error": provider_error,
-                "provider_errors": [provider_error] if provider_error else [],
+                "provider_error": provider_errors[-1] if provider_errors else "",
+                "provider_errors": provider_errors,
             },
             True,
             reason,
@@ -1014,7 +1038,9 @@ class MarketScanService:
         now: datetime,
     ) -> Tuple[pd.DataFrame, Dict[str, Any], bool, str]:
         provider_errors: List[str] = []
-        for _attempt in range(self.config.snapshot_retries):
+        for attempt in range(self.config.snapshot_retries):
+            if attempt:
+                self._wait_before_snapshot_retry(attempt - 1)
             try:
                 raw = self.hk_connect_snapshot_loader()
                 frame_raw, metadata = _coerce_snapshot_payload(raw, now=now)
@@ -1043,6 +1069,7 @@ class MarketScanService:
                     "records": frame.to_dict(orient="records"),
                 }
                 _atomic_write_json(self.config.hk_cache_path, cache_payload)
+                self._write_hk_membership_cache(cache_payload)
                 metadata["source"] = cache_payload["source"]
                 metadata["provider_errors"] = cache_payload["provider_errors"]
                 metadata["membership_age_hours"] = 0.0
@@ -1054,7 +1081,9 @@ class MarketScanService:
         membership = self._read_hk_membership_cache(now)
         if membership is not None and self.hk_all_snapshot_loader is not None:
             membership_codes, membership_metadata = membership
-            for _attempt in range(self.config.snapshot_retries):
+            for attempt in range(self.config.snapshot_retries):
+                if attempt:
+                    self._wait_before_snapshot_retry(attempt - 1)
                 try:
                     raw = self.hk_all_snapshot_loader()
                     frame_raw, metadata = _coerce_snapshot_payload(raw, now=now)
@@ -1128,6 +1157,7 @@ class MarketScanService:
             pd.DataFrame(columns=("code", "name", "market")),
             {
                 "as_of": "",
+                "fetched_at": "",
                 "source": "unavailable",
                 "provider_error": provider_errors[-1] if provider_errors else "",
                 "provider_errors": provider_errors,
@@ -1135,6 +1165,35 @@ class MarketScanService:
             True,
             reason,
         )
+
+    def _write_hk_membership_cache(self, snapshot: Mapping[str, Any]) -> None:
+        """Persist constituent membership separately from volatile quote data."""
+
+        membership_codes = sorted(
+            {
+                code
+                for code in (
+                    _normalise_symbol(item, MARKET_HK)
+                    for item in (snapshot.get("membership_codes") or [])
+                )
+                if code
+            }
+        )
+        if not membership_codes:
+            raise MarketScanError("HK Connect membership cache would be empty")
+        payload = {
+            "schema_version": SCHEMA_VERSION,
+            "saved_at": str(snapshot.get("membership_fetched_at") or ""),
+            "membership_fetched_at": str(
+                snapshot.get("membership_fetched_at") or ""
+            ),
+            "membership_source": str(
+                snapshot.get("membership_source") or snapshot.get("source") or ""
+            ),
+            "is_connect_universe": True,
+            "membership_codes": membership_codes,
+        }
+        _atomic_write_json(self.config.hk_membership_cache_path, payload)
 
     def _read_hk_membership_cache(
         self, now: datetime
@@ -1146,9 +1205,21 @@ class MarketScanService:
         Refreshing quotes never extends the constituent-set lifetime.
         """
 
-        try:
-            payload = json.loads(self.config.hk_cache_path.read_text(encoding="utf-8"))
-        except (FileNotFoundError, OSError, json.JSONDecodeError):
+        payload: Optional[Mapping[str, Any]] = None
+        for path in (
+            self.config.hk_membership_cache_path,
+            self.config.hk_cache_path,
+        ):
+            try:
+                candidate = json.loads(path.read_text(encoding="utf-8"))
+            except (FileNotFoundError, OSError, json.JSONDecodeError):
+                continue
+            if isinstance(candidate, Mapping) and candidate.get(
+                "is_connect_universe"
+            ):
+                payload = candidate
+                break
+        if payload is None:
             return None
         if not isinstance(payload, Mapping) or not payload.get("is_connect_universe"):
             return None
@@ -1336,17 +1407,33 @@ class MarketScanService:
 
         candidates: List[Dict[str, Any]] = []
         candidate_rejection_reasons: Dict[str, int] = {}
+        candidate_rejection_reasons_by_market: Dict[str, Dict[str, int]] = {
+            MARKET_A: {},
+            MARKET_HK: {},
+        }
         dual_pass_count = 0
         actionable_count = 0
-        root_snapshot_complete = not l1.a_safe_halt and not l1.hk_safe_halt
+        actionable_by_market = {MARKET_A: 0, MARKET_HK: 0}
+        market_snapshot_complete = {
+            MARKET_A: not l1.a_safe_halt,
+            MARKET_HK: not l1.hk_safe_halt,
+        }
 
-        def count_candidate_rejection(reason: str) -> None:
+        def count_candidate_rejection(reason: str, market: str) -> None:
             candidate_rejection_reasons[reason] = (
                 candidate_rejection_reasons.get(reason, 0) + 1
             )
+            market_reasons = candidate_rejection_reasons_by_market.setdefault(
+                market, {}
+            )
+            market_reasons[reason] = market_reasons.get(reason, 0) + 1
 
         for rank, candidate in enumerate(ranked, start=1):
             code = str(candidate["code"])
+            candidate_market = str(candidate.get("market") or "")
+            candidate_snapshot_complete = bool(
+                market_snapshot_complete.get(candidate_market, False)
+            )
             qwen = qwen_reviews.get(code) or _missing_review(qwen_error or "qwen_review_missing")
             deepseek = deepseek_reviews.get(code) or _missing_review(
                 deepseek_error or "deepseek_review_missing"
@@ -1392,7 +1479,7 @@ class MarketScanService:
                 and both_pass
                 and not disagreement
                 and not hard_risk
-                and root_snapshot_complete
+                and candidate_snapshot_complete
                 and float(evidence_contract["data_quality"])
                 >= self.config.min_actionable_data_quality
                 and plan
@@ -1400,6 +1487,9 @@ class MarketScanService:
             action = "conditional_buy" if actionable else "watch"
             if actionable:
                 actionable_count += 1
+                actionable_by_market[candidate_market] = (
+                    actionable_by_market.get(candidate_market, 0) + 1
+                )
                 opportunity = classify_opportunity(
                     rank=rank,
                     data_quality=evidence_contract["data_quality"],
@@ -1445,18 +1535,29 @@ class MarketScanService:
                         "模拟净值分级试错，后续加仓仍需新一轮确认"
                     ),
                 }
-            elif not root_snapshot_complete:
-                count_candidate_rejection("root_snapshot_incomplete")
+            elif not candidate_snapshot_complete:
+                count_candidate_rejection(
+                    "a_share_snapshot_incomplete"
+                    if candidate_market == MARKET_A
+                    else "hk_connect_snapshot_incomplete",
+                    candidate_market,
+                )
             elif not review_complete:
-                count_candidate_rejection("dual_model_review_incomplete")
+                count_candidate_rejection(
+                    "dual_model_review_incomplete", candidate_market
+                )
             elif hard_risk:
-                count_candidate_rejection("hard_risk_veto")
+                count_candidate_rejection("hard_risk_veto", candidate_market)
             elif disagreement:
-                count_candidate_rejection("model_disagreement")
+                count_candidate_rejection("model_disagreement", candidate_market)
             elif not both_pass:
-                count_candidate_rejection("dual_model_not_both_pass")
+                count_candidate_rejection(
+                    "dual_model_not_both_pass", candidate_market
+                )
             else:
-                count_candidate_rejection("data_quality_below_actionable_threshold")
+                count_candidate_rejection(
+                    "data_quality_below_actionable_threshold", candidate_market
+                )
             candidate_output.update(
                 {
                     "rank": rank,
@@ -1474,14 +1575,14 @@ class MarketScanService:
                         else (
                             "data_quality_not_passed"
                             if (
-                                root_snapshot_complete
+                                candidate_snapshot_complete
                                 and review_complete
                                 and both_pass
                                 and not hard_risk
                             )
                             else (
                                 "snapshot_incomplete"
-                                if not root_snapshot_complete
+                                if not candidate_snapshot_complete
                                 else "review_not_passed"
                             )
                         )
@@ -1497,14 +1598,32 @@ class MarketScanService:
                         hard_risk=hard_risk,
                         both_pass=both_pass,
                         actionable=actionable,
-                        root_snapshot_complete=root_snapshot_complete,
+                        market=candidate_market,
+                        market_snapshot_complete=candidate_snapshot_complete,
+                        initial_position_fraction=(
+                            evidence_contract.get("initial_position_fraction")
+                        ),
                     ),
                     **evidence_contract,
                 }
             )
             candidates.append(_json_safe(candidate_output))
 
-        push_block_reasons = list(l1.push_block_reasons)
+        market_block_reasons = {
+            MARKET_A: (
+                ["A股全市场快照不可用或缓存过期，已阻止A股主动推荐"]
+                if l1.a_safe_halt
+                else []
+            ),
+            MARKET_HK: (
+                ["港股通成分或报价快照不可用，已阻止港股通主动推荐"]
+                if l1.hk_safe_halt
+                else []
+            ),
+        }
+        push_block_reasons: List[str] = []
+        if l1.a_safe_halt and l1.hk_safe_halt:
+            push_block_reasons.extend(l1.push_block_reasons)
         if not review_complete:
             push_block_reasons.append("通义或 DeepSeek 独立复核未完成，已停止主动推荐推送")
         if not candidates:
@@ -1517,6 +1636,14 @@ class MarketScanService:
             operational_failures.append("hk_connect_snapshot_unavailable")
         if ranked and not review_complete:
             operational_failures.append("dual_model_review_incomplete")
+        if l1.a_safe_halt and l1.hk_safe_halt:
+            operational_status = "failed"
+        elif ranked and not review_complete:
+            operational_status = "failed"
+        elif l1.a_safe_halt or l1.hk_safe_halt:
+            operational_status = "degraded"
+        else:
+            operational_status = "healthy"
 
         history_rejection_counts: Dict[str, int] = {}
         for reason in history_rejections.values():
@@ -1542,6 +1669,10 @@ class MarketScanService:
             "actionable_count": actionable_count,
             "history_rejection_reasons": history_rejection_counts,
             "candidate_rejection_reasons": candidate_rejection_reasons,
+            "candidate_rejection_reasons_by_market": (
+                candidate_rejection_reasons_by_market
+            ),
+            "actionable_by_market": actionable_by_market,
         }
 
         result = {
@@ -1569,14 +1700,19 @@ class MarketScanService:
             },
             "safe_to_push": not push_block_reasons,
             "push_block_reasons": list(dict.fromkeys(push_block_reasons)),
+            "market_block_reasons": market_block_reasons,
             "review_complete": review_complete,
             "review_errors": {
                 key: value
                 for key, value in {"qwen": qwen_error, "deepseek": deepseek_error}.items()
                 if value
             },
-            "operational_status": "failed" if operational_failures else "healthy",
+            "operational_status": operational_status,
             "operational_failures": operational_failures,
+            "market_operational_status": {
+                MARKET_A: "blocked" if l1.a_safe_halt else "healthy",
+                MARKET_HK: "blocked" if l1.hk_safe_halt else "healthy",
+            },
             "diagnostics": {
                 **l1.diagnostics,
                 "history_requested_count": len(l1.a_candidates) + len(l1.hk_candidates),
@@ -1662,20 +1798,27 @@ class MarketScanService:
         hard_risk: bool,
         both_pass: bool,
         actionable: bool,
-        root_snapshot_complete: bool,
+        market: str,
+        market_snapshot_complete: bool,
+        initial_position_fraction: Any = None,
     ) -> str:
         if not review_complete:
             return "双模型独立复核不完整，降级为观察"
         if hard_risk:
             return "至少一个模型识别到硬风险，否决主动推荐"
-        if not root_snapshot_complete:
-            return "A股或港股通根快照不完整，本轮所有候选均降级为观察"
+        if not market_snapshot_complete:
+            market_label = "A股" if market == MARKET_A else "港股通"
+            return f"{market_label}根快照不完整，仅该市场候选降级为观察"
         if disagreement:
             return "通义与 DeepSeek 意见冲突，降级为观察"
         if both_pass and actionable:
+            try:
+                fraction_text = f"{float(initial_position_fraction) * 100:g}%"
+            except (TypeError, ValueError):
+                fraction_text = "动态仓位"
             return (
                 "技术规则、扣费后风险回报与双模型复核通过；"
-                "仅在新鲜价格进入计划区后首笔模拟建仓2.5%，并需人工确认"
+                f"仅在新鲜价格进入计划区后首笔模拟建仓{fraction_text}，并需人工确认"
             )
         if both_pass:
             return "双模型通过，但数据质量未达到当前主动建仓阈值，保持观察"
@@ -1753,24 +1896,52 @@ def default_history_loader(stock_code: str, lookback_days: int) -> Any:
 def render_market_scan_markdown(result: Mapping[str, Any]) -> str:
     """Render a concise, mobile-friendly scanner report."""
 
+    diagnostics = result.get("diagnostics") or {}
+    as_of = result.get("as_of") or {}
+
+    def snapshot_summary(market: str) -> str:
+        is_a_share = market == MARKET_A
+        strict = bool(
+            diagnostics.get(
+                "a_full_market_strict" if is_a_share else "hk_connect_strict"
+            )
+        )
+        if not strict:
+            return "不可用（该市场已安全阻断）"
+        source = diagnostics.get(
+            "a_snapshot_source" if is_a_share else "hk_snapshot_source"
+        ) or "未知来源"
+        fetched_at = diagnostics.get(
+            "a_snapshot_fetched_at" if is_a_share else "hk_snapshot_fetched_at"
+        ) or "未知"
+        provider_time = as_of.get(market) or "提供方未返回"
+        return (
+            f"可用；来源={source}；本轮抓取={fetched_at}；"
+            f"提供方时间={provider_time}"
+        )
+
     lines = [
         "# A股 + 港股通全市场分层选股",
         "",
         f"- 数据时间：{result.get('generated_at') or '未知'}",
-        f"- A股快照：{(result.get('as_of') or {}).get(MARKET_A) or '不可用'}",
-        f"- 港股通快照：{(result.get('as_of') or {}).get(MARKET_HK) or '不可用'}",
+        f"- A股快照：{snapshot_summary(MARKET_A)}",
+        f"- 港股通快照：{snapshot_summary(MARKET_HK)}",
         "- 模式：模拟研究；不连接券商；不自动下单",
         f"- 买入链路：{result.get('operational_status') or 'unknown'}",
         f"- 主动取数：{(result.get('data_policy') or {}).get('description') or '已启用'}",
         "",
     ]
     block_reasons = result.get("push_block_reasons") or []
-    if block_reasons:
+    market_block_reasons = result.get("market_block_reasons") or {}
+    if block_reasons or any(market_block_reasons.values()):
         lines.extend(["## 安全状态", ""])
         lines.extend(f"- {reason}" for reason in block_reasons)
+        for market, reasons in market_block_reasons.items():
+            for reason in reasons or []:
+                lines.append(f"- {market}：{reason}")
         lines.append("")
 
-    funnel = (result.get("diagnostics") or {}).get("buy_funnel") or {}
+    funnel = diagnostics.get("buy_funnel") or {}
     if funnel:
         lines.extend(
             [
@@ -1783,6 +1954,7 @@ def render_market_scan_markdown(result: Mapping[str, Any]) -> str:
                 f"- 双模型完成/同时通过：{funnel.get('dual_model_reviewed_count', 0)} / "
                 f"{funnel.get('dual_model_pass_count', 0)}",
                 f"- 可进入盘中买入区复核：{funnel.get('actionable_count', 0)}",
+                f"- 分市场可复核：{json.dumps(funnel.get('actionable_by_market') or {}, ensure_ascii=False)}",
                 f"- 历史/计划淘汰原因：{json.dumps(funnel.get('history_rejection_reasons') or {}, ensure_ascii=False)}",
                 f"- 双模型/质量淘汰原因：{json.dumps(funnel.get('candidate_rejection_reasons') or {}, ensure_ascii=False)}",
                 "",

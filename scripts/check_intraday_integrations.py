@@ -84,6 +84,24 @@ def verify_state(state: Mapping[str, Any]) -> dict[str, Any]:
             "price_timestamp_stale_observations": int(
                 integration.get("hk_price_timestamp_stale_observations") or 0
             ),
+            "longbridge_recovery_attempts": int(
+                integration.get("longbridge_recovery_attempts") or 0
+            ),
+            "longbridge_recovery_successes": int(
+                integration.get("longbridge_recovery_successes") or 0
+            ),
+            "longbridge_recovery_failures": int(
+                integration.get("longbridge_recovery_failures") or 0
+            ),
+            "longbridge_last_error": dict(
+                quote_fetcher.get("longbridge_last_error") or {}
+            ),
+            "primary_fallback_requests": int(
+                integration.get("primary_fallback_requests") or 0
+            ),
+            "primary_fallback_covered": int(
+                integration.get("primary_fallback_covered") or 0
+            ),
         },
         "degradation": {
             "hk_degraded_cycles": hk_degraded_cycles,
@@ -151,6 +169,14 @@ def render_markdown(result: Mapping[str, Any]) -> str:
                 "- 无近期成交快照："
                 f"{market['price_timestamp_stale_observations']} 次；"
                 "这些快照不触发买卖建议，也不计作实时行情源降级"
+            ),
+            (
+                "- 自动恢复：Longbridge 会话重建 "
+                f"{market['longbridge_recovery_attempts']} 次（成功 "
+                f"{market['longbridge_recovery_successes']}、失败 "
+                f"{market['longbridge_recovery_failures']}）；PRIMARY 备用路由恢复 "
+                f"{market['primary_fallback_covered']}/"
+                f"{market['primary_fallback_requests']} 个标的次"
             ),
             (
                 "- 行情降级：港股降级轮次 "
