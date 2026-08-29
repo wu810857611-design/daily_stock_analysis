@@ -9,6 +9,7 @@ from zoneinfo import ZoneInfo
 
 import yaml
 
+from scripts.market_scan_calendar import evaluate_market_sessions
 from scripts.market_scan_slot_guard import (
     _write_outputs,
     evaluate_slot,
@@ -85,6 +86,59 @@ def test_slot_guard_rejects_late_and_completed_slot(tmp_path: Path) -> None:
     )
     assert late["should_run"] is False
     assert late["skip_reason"] == "slot_too_late"
+
+
+def test_calendar_gate_skips_weekend_and_isolates_divergent_market_holiday() -> None:
+    saturday = evaluate_market_sessions(
+        datetime(2026, 8, 29, 10, 42, tzinfo=TZ),
+        phase_resolver=lambda _market, **_kwargs: "non_trading",
+    )
+    assert saturday["should_run"] is False
+    assert saturday["status"] == "market_closed"
+    assert saturday["active_markets"] == []
+
+    split = evaluate_market_sessions(
+        datetime(2026, 9, 3, 10, 42, tzinfo=TZ),
+        phase_resolver=lambda market, **_kwargs: (
+            "non_trading" if market == "cn" else "intraday"
+        ),
+    )
+    assert split["should_run"] is True
+    assert split["status"] == "partial_market_open"
+    assert split["active_markets"] == ["hk"]
+    assert split["market_states"] == {"cn": "closed", "hk": "open_session_day"}
+
+
+def test_calendar_unknown_fails_open_without_claiming_calendar_health() -> None:
+    result = evaluate_market_sessions(
+        datetime(2026, 8, 31, 10, 42, tzinfo=TZ),
+        phase_resolver=lambda _market, **_kwargs: "unknown",
+    )
+    assert result["should_run"] is True
+    assert result["calendar_degraded"] is True
+    assert result["status"] == "calendar_degraded"
+    assert result["active_markets"] == ["cn", "hk"]
+
+
+def test_slot_guard_marks_confirmed_closed_day_as_neutral_skip() -> None:
+    result = evaluate_slot(
+        event_name="workflow_dispatch",
+        event_schedule="",
+        requested_slot="morning",
+        trigger_source="watchdog",
+        now=datetime(2026, 8, 29, 10, 42, tzinfo=TZ),
+        ledger={"schema_version": 1, "slots": {}},
+        market_sessions={
+            "status": "market_closed",
+            "should_run": False,
+            "calendar_degraded": False,
+            "active_markets": [],
+            "market_states": {"cn": "closed", "hk": "closed"},
+        },
+    )
+    assert result["should_run"] is False
+    assert result["skip_reason"] == "all_markets_closed"
+    assert result["calendar_status"] == "market_closed"
 
 
 def test_slot_guard_outputs_cannot_inject_additional_github_outputs(
@@ -168,6 +222,34 @@ def test_watchdog_dispatches_only_when_slot_is_not_covered() -> None:
     ]
 
 
+def test_watchdog_returns_before_wait_or_api_calls_when_markets_are_closed() -> None:
+    calls: list[str] = []
+
+    class FailIfCalledClient:
+        def recent_runs(self, _workflow, _ref):
+            raise AssertionError("closed-day watchdog must not query workflow runs")
+
+        def dispatch(self, _workflow, _ref, _slot):
+            raise AssertionError("closed-day watchdog must not dispatch")
+
+    result = run_watchdog(
+        slot="close",
+        now_fn=lambda: datetime(2026, 8, 29, 5, 0, tzinfo=TZ),
+        sleep_fn=lambda _seconds: calls.append("sleep"),
+        client=FailIfCalledClient(),
+        workflow="02-market-scan.yml",
+        ref="main",
+        session_gate=lambda _now: {
+            "status": "market_closed",
+            "should_run": False,
+            "active_markets": [],
+            "market_states": {"cn": "closed", "hk": "closed"},
+        },
+    )
+    assert result["status"] == "market_closed"
+    assert calls == []
+
+
 def test_existing_run_filter_is_market_slot_specific() -> None:
     runs = [
         {
@@ -191,6 +273,7 @@ def test_workflows_wire_active_watchdogs_and_slot_guard() -> None:
     scan = yaml.load(scan_text, Loader=yaml.BaseLoader)
     assert scan["on"]["workflow_dispatch"]["inputs"]["slot"]
     assert "market_scan_slot_guard.py" in scan_text
+    assert '--markets "${{ steps.slot_guard.outputs.active_markets }}"' in scan_text
     assert "snapshot-retry-backoff-seconds" in scan_text
 
     intraday_text = (ROOT / ".github/workflows/01-intraday-session.yml").read_text(
@@ -198,6 +281,8 @@ def test_workflows_wire_active_watchdogs_and_slot_guard() -> None:
     )
     intraday = yaml.load(intraday_text, Loader=yaml.BaseLoader)
     assert intraday["permissions"]["actions"] == "write"
+    assert "market_scan_calendar.py" in intraday_text
+    assert "steps.market_calendar.outputs.should_run == 'true'" in intraday_text
     assert "market_scan_watchdog.py" in intraday_text
     assert 'exit "$WATCHDOG_STATUS"' in intraday_text
 
@@ -205,4 +290,9 @@ def test_workflows_wire_active_watchdogs_and_slot_guard() -> None:
         encoding="utf-8"
     )
     daily = yaml.load(daily_text, Loader=yaml.BaseLoader)
-    assert daily["jobs"]["close-scan-watchdog"]["permissions"]["actions"] == "write"
+    close_watchdog = daily["jobs"]["close-scan-watchdog"]
+    assert close_watchdog["permissions"]["actions"] == "write"
+    assert close_watchdog["if"] == (
+        "github.event_name == 'schedule' && "
+        "github.event.schedule == '0 10 * * 1-5'"
+    )

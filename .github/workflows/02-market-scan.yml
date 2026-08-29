@@ -202,6 +202,8 @@ jobs:
             --hk-membership-cache-max-age-hours "$MARKET_SCAN_HK_MEMBERSHIP_CACHE_MAX_AGE_HOURS" \
             --snapshot-retry-backoff-seconds "$MARKET_SCAN_SNAPSHOT_RETRY_BACKOFF_SECONDS" \
             --min-actionable-data-quality "$MARKET_SCAN_MIN_ACTIONABLE_DATA_QUALITY" \
+            --markets "${{ steps.slot_guard.outputs.active_markets }}" \
+            --calendar-status "${{ steps.slot_guard.outputs.calendar_status }}" \
             --slot "${{ steps.slot_guard.outputs.slot }}" \
             --trigger-source "${{ steps.slot_guard.outputs.trigger_source }}" \
             --notify
@@ -263,7 +265,7 @@ jobs:
             exit 1
           fi
           if [ "${{ steps.slot_guard.outputs.should_run }}" != "true" ]; then
-            echo "ℹ️ 本轮被时段幂等/迟到护栏安全跳过：${{ steps.slot_guard.outputs.skip_reason }}"
+            echo "ℹ️ 本轮被交易日/时段幂等/迟到护栏安全跳过：${{ steps.slot_guard.outputs.skip_reason }}"
             exit 0
           fi
           if [ "${SCAN_EXIT_CODE:-1}" -ne 0 ]; then

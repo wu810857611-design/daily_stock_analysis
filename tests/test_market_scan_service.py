@@ -189,11 +189,45 @@ def test_l1_is_vectorised_and_makes_zero_history_or_llm_calls(tmp_path: Path) ->
     assert qwen.calls == []
     assert deepseek.calls == []
     assert history_calls == []
-    assert {item["code"] for item in result.a_candidates} <= {"600001", "600002", "600003"}
+    assert {item["code"] for item in result.a_candidates} <= {
+        "600001",
+        "600002",
+        "600003",
+    }
     assert result.diagnostics[MARKET_A]["filtered"]["st_or_delisting"] == 1
     assert result.diagnostics[MARKET_A]["filtered"]["suspended_or_zero_turnover"] >= 1
     assert result.diagnostics[MARKET_A]["filtered"]["extreme_chase"] == 1
     assert result.diagnostics[MARKET_A]["filtered"]["new_listing_name"] == 1
+
+
+def test_closed_market_is_not_loaded_and_open_market_remains_healthy(
+    tmp_path: Path,
+) -> None:
+    def closed_a_loader() -> Any:
+        raise AssertionError("closed A-share market must not fetch a snapshot")
+
+    result = _service(
+        tmp_path,
+        qwen=ReviewRecorder(),
+        deepseek=ReviewRecorder(),
+        a_loader=closed_a_loader,
+        config_overrides={"enabled_markets": (MARKET_HK,)},
+    ).run()
+
+    assert result["operational_status"] == "healthy"
+    assert result["market_operational_status"] == {
+        MARKET_A: "closed",
+        MARKET_HK: "healthy",
+    }
+    assert result["diagnostics"]["buy_funnel"]["a_snapshot_input_count"] == 0
+    assert result["diagnostics"]["buy_funnel"]["hk_snapshot_input_count"] > 0
+    assert result["diagnostics"]["market_session_status"] == {
+        MARKET_A: "closed",
+        MARKET_HK: "active",
+    }
+    report = render_market_scan_markdown(result)
+    assert "A股快照：休市；本轮未抓取、未筛选" in report
+    assert "港股通成分：来源=fake_hk_connect" in report
 
 
 def test_only_shortlist_loads_history_and_models_review_final_batch_independently(
@@ -489,13 +523,36 @@ def test_hk_quote_fallback_filters_fresh_all_market_quotes_by_cached_membership(
 
     assert result.hk_safe_halt is False
     assert {item["code"] for item in result.hk_candidates} == {"HK00700"}
-    assert result.diagnostics["hk_snapshot_source"].endswith(
-        ":cached_connect_membership"
-    )
+    assert result.diagnostics["hk_snapshot_source"] == "fake_all_hk"
+    assert result.diagnostics["hk_membership_source"] == "fake_hk_connect"
     cached = json.loads((tmp_path / "hk_connect.json").read_text(encoding="utf-8"))
     assert {item["code"] for item in cached["records"]} == {"HK00700"}
     assert set(cached["membership_codes"]) == {"HK00700", "HK00981"}
     assert cached["membership_fetched_at"] == NOW.isoformat()
+
+
+def test_legacy_hk_cache_source_is_rendered_as_quote_source_only(
+    tmp_path: Path,
+) -> None:
+    _service(
+        tmp_path,
+        qwen=ReviewRecorder(),
+        deepseek=ReviewRecorder(),
+    ).run_l1()
+    cache_path = tmp_path / "hk_connect.json"
+    cache = json.loads(cache_path.read_text(encoding="utf-8"))
+    cache["source"] = "fake_all_hk:cached_connect_membership"
+    cache_path.write_text(json.dumps(cache), encoding="utf-8")
+
+    result = _service(
+        tmp_path,
+        qwen=ReviewRecorder(),
+        deepseek=ReviewRecorder(),
+        hk_loader=lambda: (_ for _ in ()).throw(TimeoutError("provider timeout")),
+    ).run_l1()
+
+    assert result.diagnostics["hk_snapshot_source"] == "fake_all_hk:last_good_cache"
+    assert result.diagnostics["hk_membership_source"] == "fake_hk_connect"
 
 
 def test_dedicated_hk_membership_survives_volatile_quote_cache_loss(
@@ -579,8 +636,9 @@ def test_fetch_time_is_not_fabricated_as_provider_market_timestamp(tmp_path: Pat
             hk_loader=hk_without_provider_time,
         ).run()
     )
-    assert "A股快照：可用" in report
+    assert "A股快照：研究快照可用" in report
     assert "提供方时间=提供方未返回" in report
+    assert "研究快照不等于盘中新鲜报价" in report
 
 
 def test_a_snapshot_stale_cache_blocks_only_a_market(tmp_path: Path) -> None:
@@ -975,7 +1033,9 @@ def test_false_notification_result_stays_pending_and_retries_next_run(tmp_path: 
         "as_of": {MARKET_A: NOW.isoformat(), MARKET_HK: NOW.isoformat()},
         "safe_to_push": True,
         "push_block_reasons": [],
-        "candidates": [{"code": "600001", "action": "watch", "plan": {}}],
+        "candidates": [
+            {"code": "600001", "action": "conditional_buy", "plan": {}}
+        ],
         "disclaimer": "simulation only",
     }
     false_calls: list[int] = []
@@ -1007,6 +1067,85 @@ def test_false_notification_result_stays_pending_and_retries_next_run(tmp_path: 
     )
     assert second["obvious_change"] is True
     assert second["notification_sent"] is True
+
+
+def test_watch_only_candidate_churn_is_persisted_without_pushplus(tmp_path: Path) -> None:
+    first = {
+        "generated_at": NOW.isoformat(),
+        "as_of": {MARKET_A: NOW.isoformat(), MARKET_HK: NOW.isoformat()},
+        "safe_to_push": True,
+        "operational_status": "healthy",
+        "operational_failures": [],
+        "candidates": [{"code": "600001", "action": "watch", "plan": {}}],
+        "disclaimer": "simulation only",
+    }
+    calls: list[str] = []
+    first_outcome = persist_result_and_notify(
+        first,
+        report_path=tmp_path / "scan.md",
+        result_path=tmp_path / "scan.json",
+        state_dir=tmp_path / "state",
+        notify=True,
+        notifier=lambda title, _content: calls.append(title) or True,
+    )
+    assert first_outcome["obvious_change"] is False
+    assert first_outcome["notification_attempted"] is False
+
+    second = {
+        **first,
+        "generated_at": (NOW + timedelta(minutes=30)).isoformat(),
+        "candidates": [{"code": "600002", "action": "watch", "plan": {}}],
+    }
+    second_outcome = persist_result_and_notify(
+        second,
+        report_path=tmp_path / "scan.md",
+        result_path=tmp_path / "scan.json",
+        state_dir=tmp_path / "state",
+        notify=True,
+        notifier=lambda title, _content: calls.append(title) or True,
+    )
+    assert second_outcome["obvious_change"] is False
+    assert second_outcome["notification_attempted"] is False
+    assert calls == []
+    assert len(
+        (tmp_path / "state" / "history.jsonl").read_text(encoding="utf-8").splitlines()
+    ) == 2
+
+
+def test_actionable_candidate_removal_is_still_a_material_change(tmp_path: Path) -> None:
+    state_dir = tmp_path / "state"
+    actionable = {
+        "generated_at": NOW.isoformat(),
+        "safe_to_push": True,
+        "operational_status": "healthy",
+        "operational_failures": [],
+        "candidates": [
+            {"code": "600001", "action": "conditional_buy", "plan": {}}
+        ],
+        "disclaimer": "simulation only",
+    }
+    persist_result_and_notify(
+        actionable,
+        report_path=tmp_path / "scan.md",
+        result_path=tmp_path / "scan.json",
+        state_dir=state_dir,
+        notify=True,
+        notifier=lambda _title, _content: True,
+    )
+    removed = persist_result_and_notify(
+        {
+            **actionable,
+            "generated_at": (NOW + timedelta(minutes=30)).isoformat(),
+            "candidates": [{"code": "600002", "action": "watch", "plan": {}}],
+        },
+        report_path=tmp_path / "scan.md",
+        result_path=tmp_path / "scan.json",
+        state_dir=state_dir,
+        notify=True,
+        notifier=lambda _title, _content: True,
+    )
+    assert removed["notification_kind"] == "candidate_change"
+    assert removed["notification_sent"] is True
 
 
 def test_operational_failure_alert_is_deduped_and_recovery_is_sent_once(
@@ -1086,6 +1225,67 @@ def test_operational_failure_alert_is_deduped_and_recovery_is_sent_once(
         ),
     )
     assert stable["notification_attempted"] is False
+
+
+def test_closed_failed_market_does_not_emit_false_recovery(tmp_path: Path) -> None:
+    state_dir = tmp_path / "state"
+    failure = {
+        "generated_at": NOW.isoformat(),
+        "safe_to_push": True,
+        "operational_status": "degraded",
+        "operational_failures": ["hk_connect_snapshot_unavailable"],
+        "market_operational_status": {MARKET_A: "healthy", MARKET_HK: "blocked"},
+        "candidates": [],
+        "disclaimer": "simulation only",
+    }
+    persist_result_and_notify(
+        failure,
+        report_path=tmp_path / "scan.md",
+        result_path=tmp_path / "scan.json",
+        state_dir=state_dir,
+        notify=True,
+        notifier=lambda _title, _content: True,
+    )
+
+    calls: list[str] = []
+    hk_closed = persist_result_and_notify(
+        {
+            **failure,
+            "generated_at": (NOW + timedelta(days=1)).isoformat(),
+            "operational_status": "healthy",
+            "operational_failures": [],
+            "market_operational_status": {MARKET_A: "healthy", MARKET_HK: "closed"},
+        },
+        report_path=tmp_path / "scan.md",
+        result_path=tmp_path / "scan.json",
+        state_dir=state_dir,
+        notify=True,
+        notifier=lambda title, _content: calls.append(title) or True,
+    )
+    assert hk_closed["notification_kind"] == ""
+    assert hk_closed["notification_attempted"] is False
+    health = json.loads(
+        (state_dir / "operational_health.json").read_text(encoding="utf-8")
+    )
+    assert health["current_status"] == "pending_recovery"
+    assert health["failure_alert_active"] is True
+
+    hk_reopened = persist_result_and_notify(
+        {
+            **failure,
+            "generated_at": (NOW + timedelta(days=2)).isoformat(),
+            "operational_status": "healthy",
+            "operational_failures": [],
+            "market_operational_status": {MARKET_A: "healthy", MARKET_HK: "healthy"},
+        },
+        report_path=tmp_path / "scan.md",
+        result_path=tmp_path / "scan.json",
+        state_dir=state_dir,
+        notify=True,
+        notifier=lambda title, _content: calls.append(title) or True,
+    )
+    assert hk_reopened["notification_kind"] == "recovery"
+    assert calls == ["全市场买入链路已恢复"]
 
 
 def test_partial_market_degradation_dedupes_health_but_allows_healthy_market_change(
