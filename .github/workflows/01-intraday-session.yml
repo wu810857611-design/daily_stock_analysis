@@ -529,9 +529,19 @@ jobs:
 
       - name: 严格验证行情与 PushPlus
         # 定时与手动盘中运行都必须留下同一份严格契约证据；即使前序步骤
-        # 失败，只要任务未取消也要执行并明确报出缺失/不完整状态。
-        if: ${{ !cancelled() && steps.market_calendar.outputs.should_run == 'true' }}
-        run: python3 scripts/check_intraday_integrations.py
+        # 失败，只要任务未取消也要执行并明确报出缺失/不完整状态。双市场
+        # 休市时保留步骤级审计，但不得把“未运行”误判成集成故障。
+        if: ${{ !cancelled() }}
+        shell: bash
+        env:
+          MARKET_CALENDAR_SHOULD_RUN: ${{ steps.market_calendar.outputs.should_run }}
+        run: |
+          set -euo pipefail
+          if [ "$MARKET_CALENDAR_SHOULD_RUN" != "true" ]; then
+            echo "A股与港股均休市；严格集成验收安全跳过，未调用行情或 PushPlus。"
+            exit 0
+          fi
+          python3 scripts/check_intraday_integrations.py
 
       - name: 打包盘中状态
         if: ${{ always() && steps.market_calendar.outputs.should_run == 'true' }}
