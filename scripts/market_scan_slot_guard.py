@@ -6,11 +6,18 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
 import tempfile
 from datetime import datetime, time
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 from zoneinfo import ZoneInfo
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from scripts.market_scan_calendar import evaluate_market_sessions  # noqa: E402
 
 
 SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
@@ -88,19 +95,39 @@ def evaluate_slot(
     trigger_source: str,
     now: datetime,
     ledger: Mapping[str, Any],
+    market_sessions: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     slot = resolve_slot(
         event_name=event_name,
         event_schedule=event_schedule,
         requested_slot=requested_slot,
     )
+    calendar = dict(market_sessions or evaluate_market_sessions(now))
     base = {
         "slot": slot,
         "trigger_source": str(trigger_source or event_name or "unknown"),
         "observed_at": now.isoformat(timespec="seconds"),
         "should_run": True,
         "skip_reason": "",
+        "calendar_status": str(calendar.get("status") or "unknown"),
+        "calendar_degraded": bool(calendar.get("calendar_degraded")),
+        "active_markets": list(calendar.get("active_markets") or []),
+        "market_states": dict(calendar.get("market_states") or {}),
     }
+    if not calendar.get("should_run"):
+        slot_key = "manual" if slot == "manual" else f"{now.date().isoformat()}:{slot}"
+        scheduled_for = (
+            "manual"
+            if slot == "manual"
+            else f"{now.date().isoformat()}:{SLOT_WINDOWS[slot][0].isoformat()}"
+        )
+        return {
+            **base,
+            "slot_key": slot_key,
+            "scheduled_for": scheduled_for,
+            "should_run": False,
+            "skip_reason": "all_markets_closed",
+        }
     if slot == "manual":
         return {**base, "slot_key": "manual", "scheduled_for": "manual"}
 
@@ -165,10 +192,15 @@ def _write_outputs(path: str, result: Mapping[str, Any]) -> None:
             "scheduled_for",
             "trigger_source",
             "skip_reason",
+            "calendar_status",
+            "calendar_degraded",
+            "active_markets",
         ):
             value = result.get(key, "")
             if isinstance(value, bool):
                 value = str(value).lower()
+            elif isinstance(value, Sequence) and not isinstance(value, str):
+                value = ",".join(str(item) for item in value)
             scalar = str(value).replace("\r", " ").replace("\n", " ")[:500]
             handle.write(f"{key}={scalar}\n")
 

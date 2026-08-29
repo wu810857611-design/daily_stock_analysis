@@ -75,6 +75,7 @@ class MarketScanConfig:
     hk_cache_max_age_hours: float = 6.0
     hk_membership_cache_max_age_hours: float = 24.0 * 35.0
     min_actionable_data_quality: float = 0.70
+    enabled_markets: Tuple[str, ...] = (MARKET_A, MARKET_HK)
     snapshot_retries: int = 2
     snapshot_retry_backoff_seconds: float = 0.0
     a_cache_path: Path = Path("data/market_scan/a_share_snapshot.json")
@@ -102,6 +103,10 @@ class MarketScanConfig:
             raise ValueError(
                 "min_actionable_data_quality must be between 0.70 and 1"
             )
+        enabled = tuple(dict.fromkeys(self.enabled_markets))
+        if not enabled or any(item not in {MARKET_A, MARKET_HK} for item in enabled):
+            raise ValueError("enabled_markets must contain A and/or HK_CONNECT")
+        object.__setattr__(self, "enabled_markets", enabled)
 
 
 @dataclass
@@ -911,7 +916,15 @@ class MarketScanService:
         if now.tzinfo is None:
             now = now.replace(tzinfo=SHANGHAI_TZ)
 
-        a_frame, a_metadata, a_safe_halt, a_warning = self._load_a_snapshot(now)
+        a_enabled = MARKET_A in self.config.enabled_markets
+        hk_enabled = MARKET_HK in self.config.enabled_markets
+        if a_enabled:
+            a_frame, a_metadata, a_safe_halt, a_warning = self._load_a_snapshot(now)
+        else:
+            a_frame = pd.DataFrame(columns=("code", "name", "market"))
+            a_metadata = {"source": "market_closed", "session_status": "closed"}
+            a_safe_halt = False
+            a_warning = ""
         a_candidates: List[Dict[str, Any]] = []
         a_diagnostics: Dict[str, Any] = {
             "input_count": 0,
@@ -926,7 +939,15 @@ class MarketScanService:
                 limit=self.config.top_a_history,
             )
 
-        hk_frame, hk_metadata, hk_safe_halt, hk_warning = self._load_hk_connect_snapshot(now)
+        if hk_enabled:
+            hk_frame, hk_metadata, hk_safe_halt, hk_warning = (
+                self._load_hk_connect_snapshot(now)
+            )
+        else:
+            hk_frame = pd.DataFrame(columns=("code", "name", "market"))
+            hk_metadata = {"source": "market_closed", "session_status": "closed"}
+            hk_safe_halt = False
+            hk_warning = ""
         hk_candidates: List[Dict[str, Any]] = []
         hk_diagnostics: Dict[str, Any] = {
             "input_count": 0,
@@ -963,6 +984,11 @@ class MarketScanService:
                 "hk_membership_source": hk_metadata.get("membership_source") or "",
                 "a_full_market_strict": not a_safe_halt,
                 "hk_connect_strict": not hk_safe_halt,
+                "enabled_markets": list(self.config.enabled_markets),
+                "market_session_status": {
+                    MARKET_A: "active" if a_enabled else "closed",
+                    MARKET_HK: "active" if hk_enabled else "closed",
+                },
             },
             a_safe_halt=a_safe_halt,
             hk_safe_halt=hk_safe_halt,
@@ -1099,9 +1125,8 @@ class MarketScanService:
                     provider_errors.extend(
                         str(item) for item in (metadata.get("provider_errors") or [])
                     )
-                    source = (
-                        f"{metadata.get('source') or 'hk_full_market_provider'}"
-                        ":cached_connect_membership"
+                    quote_source = str(
+                        metadata.get("source") or "hk_full_market_provider"
                     )
                     cache_payload = {
                         "schema_version": SCHEMA_VERSION,
@@ -1111,7 +1136,7 @@ class MarketScanService:
                         "membership_fetched_at": membership_metadata[
                             "membership_fetched_at"
                         ],
-                        "source": source,
+                        "source": quote_source,
                         "membership_source": membership_metadata[
                             "membership_source"
                         ],
@@ -1123,7 +1148,7 @@ class MarketScanService:
                     _atomic_write_json(self.config.hk_cache_path, cache_payload)
                     metadata.update(
                         {
-                            "source": source,
+                            "source": quote_source,
                             "provider_errors": provider_errors,
                             "membership_age_hours": membership_metadata[
                                 "membership_age_hours"
@@ -1307,10 +1332,13 @@ class MarketScanService:
         )
         if frame.empty:
             return None
+        source = str(payload.get("source") or "")
+        if market == MARKET_HK:
+            source = source.replace(":cached_connect_membership", "")
         metadata = {
             "as_of": str(payload.get("as_of") or ""),
             "fetched_at": str(payload.get("fetched_at") or payload.get("saved_at") or ""),
-            "source": str(payload.get("source") or ""),
+            "source": source,
             "cache_age_hours": age_hours,
             trust_field: True,
         }
@@ -1609,6 +1637,7 @@ class MarketScanService:
             )
             candidates.append(_json_safe(candidate_output))
 
+        enabled_markets = set(self.config.enabled_markets)
         market_block_reasons = {
             MARKET_A: (
                 ["A股全市场快照不可用或缓存过期，已阻止A股主动推荐"]
@@ -1622,7 +1651,13 @@ class MarketScanService:
             ),
         }
         push_block_reasons: List[str] = []
-        if l1.a_safe_halt and l1.hk_safe_halt:
+        active_snapshot_halts = {
+            MARKET_A: l1.a_safe_halt,
+            MARKET_HK: l1.hk_safe_halt,
+        }
+        if enabled_markets and all(
+            active_snapshot_halts[market] for market in enabled_markets
+        ):
             push_block_reasons.extend(l1.push_block_reasons)
         if not review_complete:
             push_block_reasons.append("通义或 DeepSeek 独立复核未完成，已停止主动推荐推送")
@@ -1636,11 +1671,17 @@ class MarketScanService:
             operational_failures.append("hk_connect_snapshot_unavailable")
         if ranked and not review_complete:
             operational_failures.append("dual_model_review_incomplete")
-        if l1.a_safe_halt and l1.hk_safe_halt:
+        all_active_markets_blocked = bool(enabled_markets) and all(
+            active_snapshot_halts[market] for market in enabled_markets
+        )
+        any_active_market_blocked = any(
+            active_snapshot_halts[market] for market in enabled_markets
+        )
+        if all_active_markets_blocked:
             operational_status = "failed"
         elif ranked and not review_complete:
             operational_status = "failed"
-        elif l1.a_safe_halt or l1.hk_safe_halt:
+        elif any_active_market_blocked:
             operational_status = "degraded"
         else:
             operational_status = "healthy"
@@ -1710,8 +1751,20 @@ class MarketScanService:
             "operational_status": operational_status,
             "operational_failures": operational_failures,
             "market_operational_status": {
-                MARKET_A: "blocked" if l1.a_safe_halt else "healthy",
-                MARKET_HK: "blocked" if l1.hk_safe_halt else "healthy",
+                MARKET_A: (
+                    "closed"
+                    if MARKET_A not in enabled_markets
+                    else "blocked"
+                    if l1.a_safe_halt
+                    else "healthy"
+                ),
+                MARKET_HK: (
+                    "closed"
+                    if MARKET_HK not in enabled_markets
+                    else "blocked"
+                    if l1.hk_safe_halt
+                    else "healthy"
+                ),
             },
             "diagnostics": {
                 **l1.diagnostics,
@@ -1901,6 +1954,9 @@ def render_market_scan_markdown(result: Mapping[str, Any]) -> str:
 
     def snapshot_summary(market: str) -> str:
         is_a_share = market == MARKET_A
+        market_status = (result.get("market_operational_status") or {}).get(market)
+        if market_status == "closed":
+            return "休市；本轮未抓取、未筛选"
         strict = bool(
             diagnostics.get(
                 "a_full_market_strict" if is_a_share else "hk_connect_strict"
@@ -1916,9 +1972,19 @@ def render_market_scan_markdown(result: Mapping[str, Any]) -> str:
         ) or "未知"
         provider_time = as_of.get(market) or "提供方未返回"
         return (
-            f"可用；来源={source}；本轮抓取={fetched_at}；"
+            f"研究快照可用；报价来源={source}；本轮抓取={fetched_at}；"
             f"提供方时间={provider_time}"
         )
+
+    hk_membership_source = diagnostics.get("hk_membership_source") or "未单独提供"
+    hk_membership_age = diagnostics.get("hk_membership_age_hours")
+    hk_membership_summary = (
+        "休市；本轮未使用"
+        if (result.get("market_operational_status") or {}).get(MARKET_HK) == "closed"
+        else f"来源={hk_membership_source}；缓存年龄="
+        + (f"{float(hk_membership_age):.1f}小时" if hk_membership_age is not None else "未知")
+    )
+    funnel = diagnostics.get("buy_funnel") or {}
 
     lines = [
         "# A股 + 港股通全市场分层选股",
@@ -1926,8 +1992,11 @@ def render_market_scan_markdown(result: Mapping[str, Any]) -> str:
         f"- 数据时间：{result.get('generated_at') or '未知'}",
         f"- A股快照：{snapshot_summary(MARKET_A)}",
         f"- 港股通快照：{snapshot_summary(MARKET_HK)}",
+        f"- 港股通成分：{hk_membership_summary}",
         "- 模式：模拟研究；不连接券商；不自动下单",
-        f"- 买入链路：{result.get('operational_status') or 'unknown'}",
+        f"- 研究扫描链路：{result.get('operational_status') or 'unknown'}",
+        f"- 可执行条件候选：{funnel.get('actionable_count', 0)}",
+        "- 可交易性：研究快照不等于盘中新鲜报价；建仓前仍须通过新鲜L1与人工确认",
         f"- 主动取数：{(result.get('data_policy') or {}).get('description') or '已启用'}",
         "",
     ]
@@ -1941,7 +2010,6 @@ def render_market_scan_markdown(result: Mapping[str, Any]) -> str:
                 lines.append(f"- {market}：{reason}")
         lines.append("")
 
-    funnel = diagnostics.get("buy_funnel") or {}
     if funnel:
         lines.extend(
             [

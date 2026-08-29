@@ -19,6 +19,8 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from scripts.pushplus_notify import send_markdown  # noqa: E402
 from src.services.market_scan_service import (  # noqa: E402
+    MARKET_A,
+    MARKET_HK,
     MarketScanConfig,
     MarketScanService,
     default_a_snapshot_loader,
@@ -34,6 +36,30 @@ DEFAULT_RESULT_PATH = Path("reports/market_scan.json")
 DEFAULT_STATE_DIR = Path("data/market_scan")
 
 Notifier = Callable[[str, str], Any]
+
+
+def _parse_enabled_markets(value: str) -> tuple[str, ...]:
+    aliases = {
+        "a": MARKET_A,
+        "cn": MARKET_A,
+        "hk": MARKET_HK,
+        "hk_connect": MARKET_HK,
+    }
+    resolved: list[str] = []
+    for item in str(value or "").split(","):
+        normalized = item.strip().lower()
+        if not normalized:
+            continue
+        try:
+            market = aliases[normalized]
+        except KeyError as exc:
+            raise ValueError(f"unsupported market-scan market: {item}") from exc
+        if market not in resolved:
+            resolved.append(market)
+    if not resolved:
+        raise ValueError("market-scan requires at least one active market")
+    return tuple(resolved)
+
 
 MARKET_SCAN_REVIEW_SYSTEM_PROMPT = """
 你是独立的股票风险复核员。本系统已经主动查询可获得的全市场基础行情与OHLCV；
@@ -271,12 +297,9 @@ def has_obvious_change(
 
     if not current.get("safe_to_push"):
         return False
-    if previous is None:
-        return True
-
     old_candidates = {
         str(item.get("code")): item
-        for item in (previous.get("candidates") or [])
+        for item in ((previous or {}).get("candidates") or [])
         if isinstance(item, Mapping)
     }
     new_candidates = {
@@ -284,8 +307,6 @@ def has_obvious_change(
         for item in (current.get("candidates") or [])
         if isinstance(item, Mapping)
     }
-    if set(old_candidates) != set(new_candidates):
-        return True
     old_actionable = {
         code for code, item in old_candidates.items() if item.get("action") == "conditional_buy"
     }
@@ -294,12 +315,12 @@ def has_obvious_change(
     }
     if old_actionable != new_actionable:
         return True
+    if not new_actionable:
+        return False
 
-    for code in set(old_candidates) & set(new_candidates):
+    for code in old_actionable & new_actionable:
         old = old_candidates[code]
         new = new_candidates[code]
-        if old.get("action") != new.get("action"):
-            return True
         if bool(old.get("hard_risk_veto")) != bool(new.get("hard_risk_veto")):
             return True
         old_plan = old.get("plan") or {}
@@ -330,12 +351,60 @@ def _failure_fingerprint(result: Mapping[str, Any]) -> str:
     ).hexdigest()[:20]
 
 
+def _failure_markets(result: Mapping[str, Any]) -> set[str]:
+    statuses = result.get("market_operational_status") or {}
+    markets = {
+        str(market)
+        for market, status in statuses.items()
+        if str(status) == "blocked"
+    }
+    for failure in result.get("operational_failures") or []:
+        normalized = str(failure)
+        if normalized.startswith("a_share_"):
+            markets.add(MARKET_A)
+        elif normalized.startswith("hk_connect_"):
+            markets.add(MARKET_HK)
+        else:
+            markets.add("GLOBAL")
+    return markets
+
+
+def _recovery_confirmed(
+    previous_health: Mapping[str, Any], result: Mapping[str, Any]
+) -> bool:
+    previous_markets = {
+        str(item) for item in (previous_health.get("active_failure_markets") or [])
+    }
+    if not previous_markets:
+        previous_markets = _failure_markets(
+            {
+                "operational_failures": previous_health.get("current_failures") or [],
+                "market_operational_status": previous_health.get(
+                    "market_operational_status"
+                )
+                or {},
+            }
+        )
+    if "GLOBAL" in previous_markets:
+        return result.get("operational_status") == "healthy"
+    statuses = result.get("market_operational_status") or {}
+    if not statuses:
+        return result.get("operational_status") == "healthy"
+    return bool(previous_markets) and all(
+        str(statuses.get(market) or "") == "healthy"
+        for market in previous_markets
+    )
+
+
 def _health_notification_content(
     result: Mapping[str, Any], report: str, *, recovered: bool
 ) -> str:
     if recovered:
         heading = "# 全市场买入链路已恢复"
-        summary = "全市场输入与双模型买入候选链路已恢复正常，可继续按模拟规则筛选。"
+        summary = (
+            "此前故障市场的研究快照与双模型复核链路已重新验证为健康，可继续按模拟规则筛选；"
+            "这不代表本轮已经产生可执行建仓候选。"
+        )
     else:
         degraded = result.get("operational_status") == "degraded"
         heading = (
@@ -403,14 +472,22 @@ def persist_result_and_notify(
     )
     failure_fingerprint = _failure_fingerprint(result) if operational_failed else ""
     previous_alert_active = bool(previous_health.get("failure_alert_active"))
+    current_failure_markets = _failure_markets(result)
     health_kind = ""
     if operational_failed and (
         not previous_alert_active
         or previous_health.get("last_alerted_fingerprint") != failure_fingerprint
     ):
         health_kind = "failure"
-    elif not operational_failed and previous_alert_active:
+    elif (
+        not operational_failed
+        and previous_alert_active
+        and _recovery_confirmed(previous_health, result)
+    ):
         health_kind = "recovery"
+    recovery_pending = bool(
+        previous_alert_active and not operational_failed and health_kind != "recovery"
+    )
     hard_failure = result.get("operational_status") == "failed"
     notification_kind = health_kind or (
         "candidate_change" if candidate_change and not hard_failure else ""
@@ -423,10 +500,28 @@ def persist_result_and_notify(
         "current_status": (
             str(result.get("operational_status") or "failed")
             if operational_failed
+            else "pending_recovery"
+            if recovery_pending
             else "healthy"
         ),
         "current_failure_fingerprint": failure_fingerprint,
-        "current_failures": list(result.get("operational_failures") or []),
+        "current_failures": (
+            list(result.get("operational_failures") or [])
+            if operational_failed
+            else list(previous_health.get("current_failures") or [])
+            if recovery_pending
+            else []
+        ),
+        "active_failure_markets": (
+            sorted(current_failure_markets)
+            if operational_failed
+            else list(previous_health.get("active_failure_markets") or [])
+            if recovery_pending
+            else []
+        ),
+        "market_operational_status": dict(
+            result.get("market_operational_status") or {}
+        ),
         "failure_alert_active": previous_alert_active,
     }
     _atomic_write_text(
@@ -503,6 +598,7 @@ def persist_result_and_notify(
         health_state.update(
             {
                 "failure_alert_active": True,
+                "active_failure_markets": sorted(current_failure_markets),
                 "last_alerted_fingerprint": failure_fingerprint,
                 "last_alerted_at": result.get("generated_at"),
             }
@@ -511,6 +607,8 @@ def persist_result_and_notify(
         health_state.update(
             {
                 "failure_alert_active": False,
+                "active_failure_markets": [],
+                "current_failures": [],
                 "last_recovered_at": result.get("generated_at"),
             }
         )
@@ -543,6 +641,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--hk-membership-cache-max-age-hours", type=float, default=840.0)
     parser.add_argument("--snapshot-retry-backoff-seconds", type=float, default=1.0)
     parser.add_argument("--min-actionable-data-quality", type=float, default=0.70)
+    parser.add_argument("--markets", default="cn,hk")
+    parser.add_argument("--calendar-status", default="manual")
     parser.add_argument("--slot", default="manual")
     parser.add_argument("--trigger-source", default="manual")
     return parser
@@ -560,6 +660,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         hk_membership_cache_max_age_hours=args.hk_membership_cache_max_age_hours,
         snapshot_retry_backoff_seconds=args.snapshot_retry_backoff_seconds,
         min_actionable_data_quality=args.min_actionable_data_quality,
+        enabled_markets=_parse_enabled_markets(args.markets),
         a_cache_path=args.state_dir / "a_share_snapshot.json",
         hk_cache_path=args.state_dir / "hk_connect_snapshot.json",
         hk_membership_cache_path=args.state_dir / "hk_connect_membership.json",
@@ -577,6 +678,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     result["scheduler"] = {
         "slot": str(args.slot or "manual"),
         "trigger_source": str(args.trigger_source or "manual"),
+        "calendar_status": str(args.calendar_status or "unknown"),
+        "active_markets": [
+            "cn" if market == MARKET_A else "hk"
+            for market in config.enabled_markets
+        ],
     }
     outcome = persist_result_and_notify(
         result,

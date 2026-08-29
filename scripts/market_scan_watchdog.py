@@ -6,12 +6,19 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
 import time
 from datetime import datetime, time as datetime_time
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 from urllib import error, parse, request
 from zoneinfo import ZoneInfo
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from scripts.market_scan_calendar import evaluate_market_sessions  # noqa: E402
 
 
 SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
@@ -148,9 +155,20 @@ def run_watchdog(
     client: GitHubActionsClient,
     workflow: str,
     ref: str,
+    session_gate: Callable[[datetime], Mapping[str, Any]] = evaluate_market_sessions,
 ) -> dict[str, Any]:
     now = now_fn().astimezone(SHANGHAI_TZ)
     resolved_slot = resolve_slot(slot, now)
+    calendar = dict(session_gate(now))
+    if not calendar.get("should_run"):
+        return {
+            "status": "market_closed",
+            "slot": resolved_slot,
+            "observed_at": now.isoformat(timespec="seconds"),
+            "calendar_status": calendar.get("status") or "market_closed",
+            "active_markets": list(calendar.get("active_markets") or []),
+            "market_states": dict(calendar.get("market_states") or {}),
+        }
     target, latest = target_at(resolved_slot, now)
     while now < target:
         sleep_fn(min(60.0, (target - now).total_seconds()))
@@ -160,6 +178,8 @@ def run_watchdog(
             "status": "skipped_late",
             "slot": resolved_slot,
             "observed_at": now.isoformat(timespec="seconds"),
+            "calendar_status": calendar.get("status") or "unknown",
+            "active_markets": list(calendar.get("active_markets") or []),
         }
     runs = client.recent_runs(workflow, ref)
     if existing_run_covers_slot(runs, slot=resolved_slot, session_date=now.date()):
@@ -167,12 +187,16 @@ def run_watchdog(
             "status": "already_covered",
             "slot": resolved_slot,
             "observed_at": now.isoformat(timespec="seconds"),
+            "calendar_status": calendar.get("status") or "unknown",
+            "active_markets": list(calendar.get("active_markets") or []),
         }
     client.dispatch(workflow, ref, resolved_slot)
     return {
         "status": "dispatched",
         "slot": resolved_slot,
         "observed_at": now.isoformat(timespec="seconds"),
+        "calendar_status": calendar.get("status") or "unknown",
+        "active_markets": list(calendar.get("active_markets") or []),
     }
 
 

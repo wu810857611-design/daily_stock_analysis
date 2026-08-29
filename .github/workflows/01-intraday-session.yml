@@ -62,7 +62,30 @@ jobs:
           echo "LATE_START_POLICY=$LATE_START_POLICY" >> "$GITHUB_ENV"
           echo "监控时段: $SESSION；测试轮数: $MAX_CYCLES；迟到策略: $LATE_START_POLICY"
 
+      - name: 检查 A股/港股交易日
+        id: market_calendar
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/market_scan_calendar.py \
+            --github-output "$GITHUB_OUTPUT" \
+            --report reports/market_session_gate.json
+
+      - name: 记录休市安全跳过
+        if: steps.market_calendar.outputs.should_run != 'true'
+        shell: bash
+        run: |
+          {
+            echo "# 分钟级盘中模拟监控"
+            echo
+            echo "A股与港股均为非交易日；本轮未恢复私密状态、未启动行情监控、未启动买入扫描兜底，也未执行PushPlus。"
+            echo
+            echo "- 状态：market_closed"
+            echo "- 安全性：未拉取行情、未生成买卖建议、未下单"
+          } > reports/intraday_session.md
+
       - name: 恢复最近收盘数据库
+        if: steps.market_calendar.outputs.should_run == 'true'
         uses: actions/cache/restore@v4
         with:
           path: |
@@ -73,6 +96,7 @@ jobs:
             paper-close-state-
 
       - name: 缓存缺失时恢复最新收盘数据库备份
+        if: steps.market_calendar.outputs.should_run == 'true'
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -159,6 +183,7 @@ jobs:
           fi
 
       - name: 恢复全市场候选计划缓存
+        if: steps.market_calendar.outputs.should_run == 'true'
         uses: actions/cache/restore@v4
         with:
           path: data/market_scan/
@@ -167,6 +192,7 @@ jobs:
             market-scan-state-
 
       - name: 缓存缺失时恢复最新候选计划备份
+        if: steps.market_calendar.outputs.should_run == 'true'
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -242,6 +268,7 @@ jobs:
           echo "✅ 已从同分支最新 market-scan-state artifact 恢复候选计划"
 
       - name: 恢复盘中状态缓存
+        if: steps.market_calendar.outputs.should_run == 'true'
         uses: actions/cache/restore@v4
         with:
           path: data/intraday/
@@ -251,6 +278,7 @@ jobs:
             intraday-alert-state-
 
       - name: 缓存缺失时恢复最新盘中状态备份
+        if: steps.market_calendar.outputs.should_run == 'true'
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -365,6 +393,7 @@ jobs:
           fi
 
       - name: 运行分钟级 A/H 盘中模拟监控
+        if: steps.market_calendar.outputs.should_run == 'true'
         shell: bash
         env:
           STOCK_LIST_CONFIG: ${{ vars.STOCK_LIST || secrets.STOCK_LIST }}
@@ -500,12 +529,22 @@ jobs:
 
       - name: 严格验证行情与 PushPlus
         # 定时与手动盘中运行都必须留下同一份严格契约证据；即使前序步骤
-        # 失败，只要任务未取消也要执行并明确报出缺失/不完整状态。
+        # 失败，只要任务未取消也要执行并明确报出缺失/不完整状态。双市场
+        # 休市时保留步骤级审计，但不得把“未运行”误判成集成故障。
         if: ${{ !cancelled() }}
-        run: python3 scripts/check_intraday_integrations.py
+        shell: bash
+        env:
+          MARKET_CALENDAR_SHOULD_RUN: ${{ steps.market_calendar.outputs.should_run }}
+        run: |
+          set -euo pipefail
+          if [ "$MARKET_CALENDAR_SHOULD_RUN" != "true" ]; then
+            echo "A股与港股均休市；严格集成验收安全跳过，未调用行情或 PushPlus。"
+            exit 0
+          fi
+          python3 scripts/check_intraday_integrations.py
 
       - name: 打包盘中状态
-        if: always()
+        if: ${{ always() && steps.market_calendar.outputs.should_run == 'true' }}
         id: package_state
         shell: bash
         env:
@@ -561,7 +600,7 @@ jobs:
           fi
 
       - name: 上传固定名盘中状态备份
-        if: ${{ always() && steps.package_state.outputs.available == 'true' }}
+        if: ${{ always() && steps.market_calendar.outputs.should_run == 'true' && steps.package_state.outputs.available == 'true' }}
         uses: actions/upload-artifact@v6
         with:
           name: intraday-alert-state
@@ -571,7 +610,7 @@ jobs:
           compression-level: 0
 
       - name: 保存盘中状态缓存
-        if: ${{ always() && steps.package_state.outputs.available == 'true' }}
+        if: ${{ always() && steps.market_calendar.outputs.should_run == 'true' && steps.package_state.outputs.available == 'true' }}
         uses: actions/cache/save@v4
         with:
           path: data/intraday/
@@ -585,6 +624,7 @@ jobs:
           path: |
             reports/intraday_session.md
             reports/intraday_state_missing.md
+            reports/market_session_gate.json
             reports/market_scan_watchdog_*.json
             data/intraday/session_state.json
           if-no-files-found: warn
