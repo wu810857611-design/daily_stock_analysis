@@ -130,32 +130,73 @@ class SessionError(RuntimeError):
     """Raised for invalid configuration or irrecoverable local state."""
 
 
-def _safe_provider_error(exc: Exception) -> Dict[str, str]:
-    """Return useful provider diagnostics without exposing credentials."""
-
-    raw_message = str(exc or "").strip()
-    message = re.sub(
-        r"(?i)(access[_ -]?token|refresh[_ -]?token|authorization|"
-        r"app[_ -]?secret|api[_ -]?key|cookie)\s*[:=]\s*[^\s,;]+",
-        r"\1=<redacted>",
-        raw_message,
+def _redact_provider_message(raw_message: str) -> str:
+    credential_name = (
+        r"access[_ -]?token|refresh[_ -]?token|authorization|"
+        r"app[_ -]?secret|client[_ -]?secret|api[_ -]?key|cookie"
     )
     message = re.sub(
-        r"(?i)bearer\s+[A-Za-z0-9._~+\-/=]+",
-        "Bearer <redacted>",
+        r"(?i)\b(bearer|basic)\s+[A-Za-z0-9._~+\-/=]+",
+        r"\1 <redacted>",
+        str(raw_message or "").strip(),
+    )
+    message = re.sub(
+        rf"(?i)([\"']?(?:{credential_name})[\"']?\s*[:=]\s*)"
+        r"[\"']?[^\"'\s,;}&]+[\"']?",
+        r"\1<redacted>",
         message,
     )
+    return message
+
+
+def _provider_error_code(exc: Exception) -> str:
     code = ""
     for attribute in ("status_code", "status", "code", "errno"):
         value = getattr(exc, attribute, None)
         if value is not None and str(value).strip():
             code = f"{attribute}={str(value).strip()[:80]}"
             break
+    return code
+
+
+def _safe_provider_error(exc: Exception) -> Dict[str, str]:
+    """Return root-cause provider diagnostics without exposing credentials."""
+
+    chain: List[Exception] = []
+    current: Optional[BaseException] = exc
+    seen: set[int] = set()
+    while isinstance(current, Exception) and id(current) not in seen and len(chain) < 6:
+        chain.append(current)
+        seen.add(id(current))
+        current = current.__cause__ or current.__context__
+    root = chain[-1] if chain else exc
     return {
         "error_type": type(exc).__name__,
-        "error_code": code,
-        "message": message[:240],
+        "error_code": _provider_error_code(exc),
+        "message": _redact_provider_message(str(exc))[:240],
+        "root_error_type": type(root).__name__,
+        "root_error_code": _provider_error_code(root),
+        "root_message": _redact_provider_message(str(root))[:240],
+        "error_chain": " -> ".join(type(item).__name__ for item in chain),
     }
+
+
+def _fatal_longbridge_auth_error(diagnostic: Mapping[str, Any]) -> bool:
+    combined = " ".join(
+        str(diagnostic.get(key) or "")
+        for key in ("message", "root_message", "error_chain")
+    ).lower()
+    return any(
+        marker in combined
+        for marker in (
+            "oauth 无交互认证失败",
+            "oauth 缓存需要重新授权",
+            "token 缓存已失效",
+            "token cache has expired",
+            "不支持打开授权页面",
+            "未找到可用 oauth token 缓存",
+        )
+    )
 
 
 @dataclass(frozen=True)
@@ -524,6 +565,7 @@ class TencentBatchQuoteFetcher:
         provider_errors: List[Dict[str, str]] = []
         fallback_requested = 0
         fallback_covered = 0
+        route_stats: List[Dict[str, Any]] = []
         for offset in range(0, len(canonical), self.chunk_size):
             chunk = canonical[offset : offset + self.chunk_size]
             unresolved = list(chunk)
@@ -534,6 +576,8 @@ class TencentBatchQuoteFetcher:
             for route_index, endpoint in enumerate(endpoints):
                 if not unresolved:
                     break
+                route_name = "primary" if route_index == 0 else "alternate"
+                route_requested = len(unresolved)
                 if route_index:
                     fallback_requested += len(unresolved)
                     if self.retry_backoff_seconds > 0:
@@ -569,10 +613,22 @@ class TencentBatchQuoteFetcher:
                     )
                 except Exception as exc:
                     diagnostic = {
-                        "route": "primary" if route_index == 0 else "fallback",
+                        "route": route_name,
                         **_safe_provider_error(exc),
                     }
                     provider_errors.append(diagnostic)
+                    route_stats.append(
+                        {
+                            "route": route_name,
+                            "requested": route_requested,
+                            "price_returned": 0,
+                            "provider_timestamped": 0,
+                            "fresh_covered": 0,
+                            "stale_or_untradeable": 0,
+                            "missing": route_requested,
+                            "failed": True,
+                        }
+                    )
                     print(
                         "腾讯批量行情路由失败"
                         f"（{diagnostic['route']}，{','.join(unresolved)}）："
@@ -581,6 +637,39 @@ class TencentBatchQuoteFetcher:
                         file=sys.stderr,
                     )
                     continue
+                route_stats.append(
+                    {
+                        "route": route_name,
+                        "requested": route_requested,
+                        "price_returned": sum(
+                            1
+                            for symbol in unresolved
+                            if parsed[symbol].price is not None
+                        ),
+                        "provider_timestamped": sum(
+                            1
+                            for symbol in unresolved
+                            if parsed[symbol].provider_timestamp
+                        ),
+                        "fresh_covered": sum(
+                            1
+                            for symbol in unresolved
+                            if _quote_has_live_snapshot(parsed[symbol])
+                        ),
+                        "stale_or_untradeable": sum(
+                            1
+                            for symbol in unresolved
+                            if parsed[symbol].price is not None
+                            and not _quote_has_live_snapshot(parsed[symbol])
+                        ),
+                        "missing": sum(
+                            1
+                            for symbol in unresolved
+                            if parsed[symbol].price is None
+                        ),
+                        "failed": False,
+                    }
+                )
                 next_unresolved: List[str] = []
                 for symbol in unresolved:
                     candidate = parsed[symbol]
@@ -612,6 +701,20 @@ class TencentBatchQuoteFetcher:
             "fallback_covered": fallback_covered,
             "fallback_active": fallback_requested > 0,
             "provider_errors": provider_errors,
+            "route_stats": route_stats,
+            "route_price_returned": sum(
+                int(item["price_returned"]) for item in route_stats
+            ),
+            "route_provider_timestamped": sum(
+                int(item["provider_timestamped"]) for item in route_stats
+            ),
+            "route_fresh_covered": sum(
+                int(item["fresh_covered"]) for item in route_stats
+            ),
+            "route_stale_or_untradeable": sum(
+                int(item["stale_or_untradeable"]) for item in route_stats
+            ),
+            "route_missing": sum(int(item["missing"]) for item in route_stats),
         }
         return results
 
@@ -758,8 +861,25 @@ def _longbridge_oauth_cache_path(client_id: str) -> Path:
     return Path.home() / ".longbridge" / "openapi" / "tokens" / client_id
 
 
+def _valid_longbridge_oauth_cache(payload: bytes) -> bool:
+    try:
+        cache_data = json.loads(payload.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return False
+    return isinstance(cache_data, dict) and bool(cache_data)
+
+
 def _restore_longbridge_oauth_cache(client_id: str) -> Path:
     path = _longbridge_oauth_cache_path(client_id)
+    # The workflow may have restored a newer, SDK-refreshed cache from the
+    # encrypted state artifact.  Never overwrite a valid local cache with the
+    # static bootstrap secret on every context rebuild.
+    if path.is_file():
+        try:
+            if _valid_longbridge_oauth_cache(path.read_bytes()):
+                return path
+        except OSError:
+            pass
     encoded = "".join(
         os.getenv("LONGBRIDGE_OAUTH_TOKEN_CACHE_B64", "").split()
     )
@@ -771,11 +891,7 @@ def _restore_longbridge_oauth_cache(client_id: str) -> Path:
         raise SessionError("Longbridge OAuth token cache 不是有效 base64") from exc
     if not payload:
         raise SessionError("Longbridge OAuth token cache 为空")
-    try:
-        cache_data = json.loads(payload.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise SessionError("Longbridge OAuth token cache 不是有效 JSON") from exc
-    if not isinstance(cache_data, dict) or not cache_data:
+    if not _valid_longbridge_oauth_cache(payload):
         raise SessionError("Longbridge OAuth token cache 结构无效")
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     descriptor, temporary_name = tempfile.mkstemp(
@@ -888,9 +1004,13 @@ def _noninteractive_longbridge_context() -> Any:
             config = Config.from_apikey(*legacy_values)
     if config is None:
         if oauth_error is not None:
+            diagnostic = _safe_provider_error(oauth_error)
             raise SessionError(
                 "Longbridge OAuth 无交互认证失败："
-                f"{type(oauth_error).__name__}"
+                f"{diagnostic['error_type']}；"
+                f"root={diagnostic['root_error_type']}；"
+                f"code={diagnostic['root_error_code'] or diagnostic['error_code'] or 'none'}；"
+                f"message={diagnostic['root_message'] or diagnostic['message'] or 'none'}"
             ) from oauth_error
         raise SessionError("Longbridge 已声明但没有可用的无交互认证配置")
     try:
@@ -932,6 +1052,10 @@ class LongbridgeBatchQuoteFetcher:
         self.last_error: Dict[str, str] = {}
         self.last_recovery_attempted = False
         self.last_recovery_succeeded = False
+        self.auth_blocked = False
+        self.auth_block_reason = ""
+        self.auth_failure_count = 0
+        self.last_auth_blocked_new = False
 
     def fetch(
         self, symbols: Sequence[str], *, now: Optional[datetime] = None
@@ -954,6 +1078,19 @@ class LongbridgeBatchQuoteFetcher:
                     fetched_at=_iso(fetched_at),
                     is_stale=True,
                     source="longbridge_unconfigured",
+                )
+                for symbol in canonical
+            }
+        self.last_auth_blocked_new = False
+        if self.auth_blocked:
+            self.last_recovery_attempted = False
+            self.last_recovery_succeeded = False
+            return {
+                symbol: RealtimeQuote(
+                    symbol=symbol,
+                    fetched_at=_iso(fetched_at),
+                    is_stale=True,
+                    source="longbridge_auth_blocked",
                 )
                 for symbol in canonical
             }
@@ -1004,16 +1141,35 @@ class LongbridgeBatchQuoteFetcher:
                 return results
             except Exception as exc:
                 self.last_error = _safe_provider_error(exc)
+                fatal_auth = _fatal_longbridge_auth_error(self.last_error)
                 print(
-                    "Longbridge 港股批量行情失败，重建会话并保留严格降级："
+                    "Longbridge 港股批量行情失败，保留严格降级："
                     f"attempt={attempt + 1}/{self.recovery_attempts + 1} "
                     f"{self.last_error['error_type']} "
                     f"{self.last_error['error_code']} "
-                    f"{self.last_error['message']}",
+                    f"{self.last_error['message']} "
+                    f"root={self.last_error['root_error_type']} "
+                    f"{self.last_error['root_error_code']} "
+                    f"{self.last_error['root_message']}",
                     file=sys.stderr,
                 )
                 self._context = None
                 self.realtime_entitled = None
+                if fatal_auth:
+                    self.auth_blocked = True
+                    self.last_auth_blocked_new = True
+                    self.auth_failure_count += 1
+                    self.auth_block_reason = (
+                        self.last_error.get("root_error_type")
+                        or self.last_error.get("error_type")
+                        or "oauth_auth_failure"
+                    )
+                    print(
+                        "Longbridge OAuth 已判定为本场不可恢复；停止重复重建，"
+                        "等待凭据恢复或下一次独立任务。",
+                        file=sys.stderr,
+                    )
+                    break
         return {
             symbol: RealtimeQuote(
                 symbol=symbol,
@@ -1062,6 +1218,7 @@ class DecisionQuoteFetcher:
         upgraded = 0
         provider_timestamped = 0
         inactive_price_timestamps = 0
+        primary_fallback_covered = 0
         degradation_reasons: Dict[str, int] = {}
         longbridge = self.longbridge_fetcher.fetch(hk_symbols, now=fetched_at)
         for symbol in hk_symbols:
@@ -1082,6 +1239,22 @@ class DecisionQuoteFetcher:
             if reason:
                 degradation_reasons[reason] = degradation_reasons.get(reason, 0) + 1
                 baseline = results.get(symbol)
+                if (
+                    baseline is not None
+                    and baseline.price is not None
+                    and baseline.provider_timestamp
+                    and not baseline.is_stale
+                ):
+                    # Tencent is allowed to carry the decision only when its
+                    # own provider timestamp passes the same hard freshness
+                    # gate.  Typical delayed HK quotes remain blocked.
+                    results[symbol] = replace(
+                        baseline,
+                        provider_snapshot_fresh=False,
+                        source=f"{baseline.source}:fresh_hk_fallback",
+                    )
+                    primary_fallback_covered += 1
+                    continue
                 if candidate is not None and candidate.price is not None:
                     blocked = replace(
                         candidate,
@@ -1129,6 +1302,10 @@ class DecisionQuoteFetcher:
             "hk_price_timestamp_stale": inactive_price_timestamps,
             "hk_degraded": bool(hk_symbols and upgraded != len(hk_symbols)),
             "hk_degradation_reasons": degradation_reasons,
+            "hk_primary_fallback_fresh_covered": primary_fallback_covered,
+            "hk_tradeable_covered": (
+                upgraded - inactive_price_timestamps + primary_fallback_covered
+            ),
             "longbridge_last_error": dict(
                 getattr(self.longbridge_fetcher, "last_error", {}) or {}
             ),
@@ -1145,6 +1322,35 @@ class DecisionQuoteFetcher:
                     "last_recovery_succeeded",
                     False,
                 )
+            ),
+            "longbridge_auth_mode": (
+                "oauth"
+                if _longbridge_oauth_client_id()
+                else "legacy"
+                if all(
+                    os.getenv(name, "").strip()
+                    for name in (
+                        "LONGBRIDGE_APP_KEY",
+                        "LONGBRIDGE_APP_SECRET",
+                        "LONGBRIDGE_ACCESS_TOKEN",
+                    )
+                )
+                else "unconfigured"
+            ),
+            "longbridge_oauth_cache_source": os.getenv(
+                "LONGBRIDGE_OAUTH_CACHE_SOURCE", "runtime_bootstrap_or_local"
+            ),
+            "longbridge_auth_blocked": bool(
+                getattr(self.longbridge_fetcher, "auth_blocked", False)
+            ),
+            "longbridge_auth_blocked_new": bool(
+                getattr(self.longbridge_fetcher, "last_auth_blocked_new", False)
+            ),
+            "longbridge_auth_block_reason": str(
+                getattr(self.longbridge_fetcher, "auth_block_reason", "") or ""
+            ),
+            "longbridge_auth_failure_count": int(
+                getattr(self.longbridge_fetcher, "auth_failure_count", 0) or 0
             ),
             "strict_no_delayed_trade_decisions": True,
         }
@@ -4199,15 +4405,62 @@ def run_cycle(
                 verification[outcome_key] = int(
                     verification.get(outcome_key) or 0
                 ) + 1
+            if quote_diagnostics.get("longbridge_auth_blocked_new"):
+                verification["longbridge_auth_blocks"] = int(
+                    verification.get("longbridge_auth_blocks") or 0
+                ) + 1
+            if quote_diagnostics.get("longbridge_auth_blocked"):
+                verification["longbridge_auth_block_reason"] = str(
+                    quote_diagnostics.get("longbridge_auth_block_reason") or ""
+                )
+            verification["hk_primary_fallback_fresh_covered"] = int(
+                verification.get("hk_primary_fallback_fresh_covered") or 0
+            ) + int(
+                quote_diagnostics.get("hk_primary_fallback_fresh_covered") or 0
+            )
         if isinstance(verification, MutableMapping):
             baseline_diagnostics = quote_diagnostics.get("baseline_diagnostics")
             if isinstance(baseline_diagnostics, Mapping):
+                alternate_requests = int(
+                    baseline_diagnostics.get("fallback_requested") or 0
+                )
+                alternate_covered = int(
+                    baseline_diagnostics.get("fallback_covered") or 0
+                )
+                for key, increment in (
+                    ("tencent_alternate_route_requests", alternate_requests),
+                    ("tencent_alternate_route_fresh_covered", alternate_covered),
+                    (
+                        "tencent_route_price_returned",
+                        int(baseline_diagnostics.get("route_price_returned") or 0),
+                    ),
+                    (
+                        "tencent_route_provider_timestamped",
+                        int(
+                            baseline_diagnostics.get("route_provider_timestamped")
+                            or 0
+                        ),
+                    ),
+                    (
+                        "tencent_route_stale_or_untradeable",
+                        int(
+                            baseline_diagnostics.get("route_stale_or_untradeable")
+                            or 0
+                        ),
+                    ),
+                    (
+                        "tencent_route_missing",
+                        int(baseline_diagnostics.get("route_missing") or 0),
+                    ),
+                ):
+                    verification[key] = int(verification.get(key) or 0) + increment
+                # Backward-compatible aliases for older report consumers.
                 verification["primary_fallback_requests"] = int(
                     verification.get("primary_fallback_requests") or 0
-                ) + int(baseline_diagnostics.get("fallback_requested") or 0)
+                ) + alternate_requests
                 verification["primary_fallback_covered"] = int(
                     verification.get("primary_fallback_covered") or 0
-                ) + int(baseline_diagnostics.get("fallback_covered") or 0)
+                ) + alternate_covered
     primary_valid = [
         quote
         for quote in quotes
@@ -4640,7 +4893,15 @@ def render_session_report(
             "- Longbridge 会话恢复："
             f"尝试 {int(integration_verification.get('longbridge_recovery_attempts') or 0)} 次；"
             f"成功 {int(integration_verification.get('longbridge_recovery_successes') or 0)} 次；"
-            f"失败 {int(integration_verification.get('longbridge_recovery_failures') or 0)} 次。"
+            f"失败 {int(integration_verification.get('longbridge_recovery_failures') or 0)} 次；"
+            f"认证熔断 {int(integration_verification.get('longbridge_auth_blocks') or 0)} 次。"
+        )
+        lines.append(
+            "- Longbridge 认证状态："
+            f"模式={quote_fetcher.get('longbridge_auth_mode') or 'unknown'}；"
+            f"缓存来源={quote_fetcher.get('longbridge_oauth_cache_source') or 'unknown'}；"
+            f"本场熔断={'是' if quote_fetcher.get('longbridge_auth_blocked') else '否'}；"
+            f"原因={quote_fetcher.get('longbridge_auth_block_reason') or '无'}。"
         )
         longbridge_error = quote_fetcher.get("longbridge_last_error") or {}
         if isinstance(longbridge_error, Mapping) and longbridge_error:
@@ -4648,12 +4909,24 @@ def render_session_report(
                 "- Longbridge 最近错误："
                 f"{longbridge_error.get('error_type') or 'unknown'}；"
                 f"{longbridge_error.get('error_code') or 'no_code'}；"
-                f"{longbridge_error.get('message') or 'no_message'}。"
+                f"{longbridge_error.get('message') or 'no_message'}；"
+                f"根因={longbridge_error.get('root_error_type') or 'unknown'}；"
+                f"{longbridge_error.get('root_error_code') or 'no_code'}；"
+                f"{longbridge_error.get('root_message') or 'no_message'}。"
             )
         lines.append(
-            "- PRIMARY 备用路由："
-            f"请求 {int(integration_verification.get('primary_fallback_requests') or 0)} 个标的次；"
-            f"恢复 {int(integration_verification.get('primary_fallback_covered') or 0)} 个标的次。"
+            "- 腾讯备用路由（同提供方双入口）："
+            f"请求 {int(integration_verification.get('tencent_alternate_route_requests') or 0)} 个标的路由次；"
+            f"新鲜恢复 {int(integration_verification.get('tencent_alternate_route_fresh_covered') or 0)}；"
+            f"返回价格 {int(integration_verification.get('tencent_route_price_returned') or 0)}；"
+            f"带提供方时间戳 {int(integration_verification.get('tencent_route_provider_timestamped') or 0)}；"
+            f"陈旧/不可交易 {int(integration_verification.get('tencent_route_stale_or_untradeable') or 0)}；"
+            f"缺失 {int(integration_verification.get('tencent_route_missing') or 0)}。"
+        )
+        lines.append(
+            "- 港股新鲜备用行情："
+            f"通过同一 90 秒门槛恢复 {int(integration_verification.get('hk_primary_fallback_fresh_covered') or 0)} 个标的次；"
+            "延迟行情仍保持拦截。"
         )
         lines.append(
             "- PRIMARY/交易日历降级："
@@ -4896,6 +5169,15 @@ def run_session(
             "longbridge_recovery_attempts": 0,
             "longbridge_recovery_successes": 0,
             "longbridge_recovery_failures": 0,
+            "longbridge_auth_blocks": 0,
+            "longbridge_auth_block_reason": "",
+            "hk_primary_fallback_fresh_covered": 0,
+            "tencent_alternate_route_requests": 0,
+            "tencent_alternate_route_fresh_covered": 0,
+            "tencent_route_price_returned": 0,
+            "tencent_route_provider_timestamped": 0,
+            "tencent_route_stale_or_untradeable": 0,
+            "tencent_route_missing": 0,
             "primary_fallback_requests": 0,
             "primary_fallback_covered": 0,
             "primary_degraded_cycles": 0,
@@ -5141,6 +5423,15 @@ def run_session(
         "longbridge_recovery_attempts": 0,
         "longbridge_recovery_successes": 0,
         "longbridge_recovery_failures": 0,
+        "longbridge_auth_blocks": 0,
+        "longbridge_auth_block_reason": "",
+        "hk_primary_fallback_fresh_covered": 0,
+        "tencent_alternate_route_requests": 0,
+        "tencent_alternate_route_fresh_covered": 0,
+        "tencent_route_price_returned": 0,
+        "tencent_route_provider_timestamped": 0,
+        "tencent_route_stale_or_untradeable": 0,
+        "tencent_route_missing": 0,
         "primary_fallback_requests": 0,
         "primary_fallback_covered": 0,
         "primary_degraded_cycles": 0,

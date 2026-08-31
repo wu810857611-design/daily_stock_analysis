@@ -604,6 +604,49 @@ def test_dedicated_hk_membership_survives_volatile_quote_cache_loss(
     assert {item["code"] for item in result.hk_candidates} == {"HK00700"}
 
 
+def test_hk_membership_near_expiry_is_visible_but_keeps_hard_boundary(
+    tmp_path: Path,
+) -> None:
+    _service(
+        tmp_path,
+        qwen=ReviewRecorder(),
+        deepseek=ReviewRecorder(),
+    ).run_l1()
+    later = NOW + timedelta(days=34)
+
+    def broken_connect_loader() -> Any:
+        raise TimeoutError("connect endpoint unavailable")
+
+    def fresh_all_hk_loader() -> Mapping[str, Any]:
+        return {
+            "source": "fake_all_hk",
+            "as_of": later.isoformat(),
+            "fetched_at": later.isoformat(),
+            "is_full_hk_universe": True,
+            "records": _hk_snapshot(include_non_connect=False)["records"],
+        }
+
+    result = _service(
+        tmp_path,
+        qwen=ReviewRecorder(),
+        deepseek=ReviewRecorder(),
+        hk_loader=broken_connect_loader,
+        hk_all_loader=fresh_all_hk_loader,
+        clock=lambda: later,
+    ).run()
+
+    assert result["operational_status"] == "healthy"
+    assert result["diagnostics"]["hk_membership_age_hours"] == pytest.approx(816)
+    assert result["diagnostics"]["hk_membership_remaining_hours"] == pytest.approx(24)
+    assert result["diagnostics"]["hk_membership_warning_level"] == "critical"
+    assert result["operational_warnings"] == [
+        "hk_connect_membership_cache_expires_within_24h"
+    ]
+    report = render_market_scan_markdown(result)
+    assert "距硬到期=24.0小时" in report
+    assert "预警=critical" in report
+
+
 def test_fetch_time_is_not_fabricated_as_provider_market_timestamp(tmp_path: Path) -> None:
     def a_without_provider_time() -> Mapping[str, Any]:
         payload = dict(_a_snapshot())
@@ -937,6 +980,138 @@ def test_opportunity_tier_controls_soft_cash_floor_and_dynamic_concentration(
         expected_initial_fraction
     )
     assert policy.add_position_fraction == pytest.approx(expected_add_fraction)
+
+
+def test_membership_maintenance_warning_is_pushed_once_per_threshold(
+    tmp_path: Path,
+) -> None:
+    calls: list[tuple[str, str]] = []
+    result = {
+        "generated_at": NOW.isoformat(),
+        "as_of": {MARKET_A: NOW.isoformat(), MARKET_HK: NOW.isoformat()},
+        "safe_to_push": True,
+        "push_block_reasons": [],
+        "operational_status": "healthy",
+        "operational_failures": [],
+        "operational_warnings": [
+            "hk_connect_membership_cache_expires_within_72h"
+        ],
+        "market_operational_status": {MARKET_A: "healthy", MARKET_HK: "healthy"},
+        "diagnostics": {},
+        "candidates": [],
+    }
+
+    def notifier(title: str, content: str) -> bool:
+        calls.append((title, content))
+        return True
+
+    first = persist_result_and_notify(
+        result,
+        report_path=tmp_path / "reports" / "scan.md",
+        result_path=tmp_path / "reports" / "scan.json",
+        state_dir=tmp_path / "state",
+        notify=True,
+        notifier=notifier,
+    )
+    duplicate = persist_result_and_notify(
+        result,
+        report_path=tmp_path / "reports" / "scan.md",
+        result_path=tmp_path / "reports" / "scan.json",
+        state_dir=tmp_path / "state",
+        notify=True,
+        notifier=notifier,
+    )
+    escalated = persist_result_and_notify(
+        {
+            **result,
+            "operational_warnings": [
+                "hk_connect_membership_cache_expires_within_24h"
+            ],
+        },
+        report_path=tmp_path / "reports" / "scan.md",
+        result_path=tmp_path / "reports" / "scan.json",
+        state_dir=tmp_path / "state",
+        notify=True,
+        notifier=notifier,
+    )
+
+    assert first["notification_kind"] == "warning"
+    assert first["notification_sent"] is True
+    assert duplicate["notification_kind"] == ""
+    assert duplicate["notification_attempted"] is False
+    assert escalated["notification_kind"] == "warning"
+    assert len(calls) == 2
+    assert all(title == "全市场买入链路维护预警" for title, _ in calls)
+
+
+def test_candidate_change_and_warning_share_one_notification(
+    tmp_path: Path,
+) -> None:
+    calls: list[tuple[str, str]] = []
+    result = {
+        "generated_at": NOW.isoformat(),
+        "as_of": {MARKET_A: NOW.isoformat(), MARKET_HK: NOW.isoformat()},
+        "safe_to_push": True,
+        "push_block_reasons": [],
+        "operational_status": "healthy",
+        "operational_failures": [],
+        "operational_warnings": [
+            "hk_connect_membership_cache_expires_within_72h"
+        ],
+        "market_operational_status": {MARKET_A: "healthy", MARKET_HK: "healthy"},
+        "diagnostics": {},
+        "candidates": [
+            {
+                "rank": 1,
+                "code": "600001",
+                "name": "甲公司",
+                "action": "conditional_buy",
+                "plan": {
+                    "entry_low": 99,
+                    "entry_high": 100,
+                    "stop_loss": 95,
+                    "take_profit_1": 110,
+                    "take_profit_2": 115,
+                    "net_rr": 2.0,
+                },
+                "qwen_review": {"verdict": "pass"},
+                "deepseek_review": {"verdict": "pass"},
+            }
+        ],
+    }
+
+    def notifier(title: str, content: str) -> bool:
+        calls.append((title, content))
+        return True
+
+    first = persist_result_and_notify(
+        result,
+        report_path=tmp_path / "reports" / "scan.md",
+        result_path=tmp_path / "reports" / "scan.json",
+        state_dir=tmp_path / "state",
+        notify=True,
+        notifier=notifier,
+    )
+    duplicate = persist_result_and_notify(
+        result,
+        report_path=tmp_path / "reports" / "scan.md",
+        result_path=tmp_path / "reports" / "scan.json",
+        state_dir=tmp_path / "state",
+        notify=True,
+        notifier=notifier,
+    )
+
+    health = json.loads(
+        (tmp_path / "state" / "operational_health.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert first["notification_kind"] == "candidate_change"
+    assert duplicate["notification_kind"] == ""
+    assert len(calls) == 1
+    assert calls[0][0] == "A股+港股通全市场候选变化"
+    assert "hk_connect_membership_cache_expires_within_72h" in calls[0][1]
+    assert health["last_alerted_warning_fingerprint"]
 
 
 def test_push_failure_does_not_lose_report_or_independent_history(tmp_path: Path) -> None:

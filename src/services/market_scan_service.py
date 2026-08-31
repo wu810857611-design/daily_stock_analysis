@@ -38,6 +38,7 @@ SCHEMA_VERSION = 1
 MARKET_A = "A"
 MARKET_HK = "HK_CONNECT"
 INITIAL_POSITION_FRACTION = 0.025
+HK_MEMBERSHIP_WARNING_THRESHOLDS = (168.0, 72.0, 24.0)
 
 SnapshotLoader = Callable[[], Any]
 HistoryLoader = Callable[[str, int], Any]
@@ -48,6 +49,34 @@ Sleeper = Callable[[float], None]
 
 class MarketScanError(RuntimeError):
     """Raised when a scan cannot satisfy its safety contract."""
+
+
+def _membership_cache_warning(
+    age_hours: float, max_age_hours: float
+) -> Dict[str, Any]:
+    remaining = max(0.0, float(max_age_hours) - float(age_hours))
+    threshold = next(
+        (
+            value
+            for value in sorted(HK_MEMBERSHIP_WARNING_THRESHOLDS)
+            if remaining <= value
+        ),
+        None,
+    )
+    level = (
+        "critical"
+        if threshold == 24.0
+        else "warning"
+        if threshold == 72.0
+        else "notice"
+        if threshold == 168.0
+        else "none"
+    )
+    return {
+        "membership_remaining_hours": round(remaining, 4),
+        "membership_warning_level": level,
+        "membership_warning_threshold_hours": threshold,
+    }
 
 
 @dataclass(frozen=True)
@@ -982,6 +1011,16 @@ class MarketScanService:
                 "hk_snapshot_provider_errors": hk_metadata.get("provider_errors") or [],
                 "hk_membership_age_hours": hk_metadata.get("membership_age_hours"),
                 "hk_membership_source": hk_metadata.get("membership_source") or "",
+                "hk_membership_remaining_hours": hk_metadata.get(
+                    "membership_remaining_hours"
+                ),
+                "hk_membership_warning_level": hk_metadata.get(
+                    "membership_warning_level"
+                )
+                or "none",
+                "hk_membership_warning_threshold_hours": hk_metadata.get(
+                    "membership_warning_threshold_hours"
+                ),
                 "a_full_market_strict": not a_safe_halt,
                 "hk_connect_strict": not hk_safe_halt,
                 "enabled_markets": list(self.config.enabled_markets),
@@ -1100,6 +1139,11 @@ class MarketScanService:
                 metadata["provider_errors"] = cache_payload["provider_errors"]
                 metadata["membership_age_hours"] = 0.0
                 metadata["membership_source"] = cache_payload["membership_source"]
+                metadata.update(
+                    _membership_cache_warning(
+                        0.0, self.config.hk_membership_cache_max_age_hours
+                    )
+                )
                 return frame.reset_index(drop=True), metadata, False, ""
             except Exception as exc:  # noqa: BLE001 - bounded retries precede cache fallback.
                 provider_errors.append(f"connect:{type(exc).__name__}:{exc}")
@@ -1156,6 +1200,17 @@ class MarketScanService:
                             "membership_source": membership_metadata[
                                 "membership_source"
                             ],
+                            "membership_remaining_hours": membership_metadata[
+                                "membership_remaining_hours"
+                            ],
+                            "membership_warning_level": membership_metadata[
+                                "membership_warning_level"
+                            ],
+                            "membership_warning_threshold_hours": (
+                                membership_metadata[
+                                    "membership_warning_threshold_hours"
+                                ]
+                            ),
                         }
                     )
                     return frame.reset_index(drop=True), metadata, False, ""
@@ -1286,6 +1341,9 @@ class MarketScanService:
             "membership_source": str(
                 payload.get("membership_source") or payload.get("source") or ""
             ),
+            **_membership_cache_warning(
+                age_hours, self.config.hk_membership_cache_max_age_hours
+            ),
         }
 
     @staticmethod
@@ -1343,13 +1401,19 @@ class MarketScanService:
             trust_field: True,
         }
         if membership_fetched_at is not None:
-            metadata["membership_age_hours"] = round(
-                (now_utc - membership_fetched_at).total_seconds() / 3600.0,
-                4,
-            )
+            membership_age_hours = (
+                now_utc - membership_fetched_at
+            ).total_seconds() / 3600.0
+            metadata["membership_age_hours"] = round(membership_age_hours, 4)
             metadata["membership_source"] = str(
                 payload.get("membership_source") or ""
             )
+            if membership_max_age_hours is not None:
+                metadata.update(
+                    _membership_cache_warning(
+                        membership_age_hours, membership_max_age_hours
+                    )
+                )
         return frame, metadata
 
     def run(self) -> Dict[str, Any]:
@@ -1665,12 +1729,28 @@ class MarketScanService:
             push_block_reasons.append("没有通过数据、趋势和风险回报护栏的候选")
 
         operational_failures: List[str] = []
+        operational_warnings: List[str] = []
         if l1.a_safe_halt:
             operational_failures.append("a_share_full_market_snapshot_unavailable")
         if l1.hk_safe_halt:
             operational_failures.append("hk_connect_snapshot_unavailable")
         if ranked and not review_complete:
             operational_failures.append("dual_model_review_incomplete")
+        membership_warning_level = str(
+            l1.diagnostics.get("hk_membership_warning_level") or "none"
+        )
+        membership_warning_threshold = l1.diagnostics.get(
+            "hk_membership_warning_threshold_hours"
+        )
+        if (
+            MARKET_HK in enabled_markets
+            and membership_warning_level != "none"
+            and membership_warning_threshold is not None
+        ):
+            operational_warnings.append(
+                "hk_connect_membership_cache_expires_within_"
+                f"{int(float(membership_warning_threshold))}h"
+            )
         all_active_markets_blocked = bool(enabled_markets) and all(
             active_snapshot_halts[market] for market in enabled_markets
         )
@@ -1750,6 +1830,7 @@ class MarketScanService:
             },
             "operational_status": operational_status,
             "operational_failures": operational_failures,
+            "operational_warnings": operational_warnings,
             "market_operational_status": {
                 MARKET_A: (
                     "closed"
@@ -1978,11 +2059,20 @@ def render_market_scan_markdown(result: Mapping[str, Any]) -> str:
 
     hk_membership_source = diagnostics.get("hk_membership_source") or "未单独提供"
     hk_membership_age = diagnostics.get("hk_membership_age_hours")
+    hk_membership_remaining = diagnostics.get("hk_membership_remaining_hours")
+    hk_membership_warning = diagnostics.get("hk_membership_warning_level") or "none"
     hk_membership_summary = (
         "休市；本轮未使用"
         if (result.get("market_operational_status") or {}).get(MARKET_HK) == "closed"
         else f"来源={hk_membership_source}；缓存年龄="
         + (f"{float(hk_membership_age):.1f}小时" if hk_membership_age is not None else "未知")
+        + "；距硬到期="
+        + (
+            f"{float(hk_membership_remaining):.1f}小时"
+            if hk_membership_remaining is not None
+            else "未知"
+        )
+        + f"；预警={hk_membership_warning}"
     )
     funnel = diagnostics.get("buy_funnel") or {}
 
@@ -1995,6 +2085,8 @@ def render_market_scan_markdown(result: Mapping[str, Any]) -> str:
         f"- 港股通成分：{hk_membership_summary}",
         "- 模式：模拟研究；不连接券商；不自动下单",
         f"- 研究扫描链路：{result.get('operational_status') or 'unknown'}",
+        "- 运行预警："
+        + ("、".join(result.get("operational_warnings") or []) or "无"),
         f"- 可执行条件候选：{funnel.get('actionable_count', 0)}",
         "- 可交易性：研究快照不等于盘中新鲜报价；建仓前仍须通过新鲜L1与人工确认",
         f"- 主动取数：{(result.get('data_policy') or {}).get('description') or '已启用'}",

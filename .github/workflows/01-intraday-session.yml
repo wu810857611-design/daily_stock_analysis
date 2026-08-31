@@ -392,6 +392,30 @@ jobs:
             exit 1
           fi
 
+      - name: 恢复 Longbridge OAuth 刷新状态
+        if: steps.market_calendar.outputs.should_run == 'true'
+        shell: bash
+        env:
+          LONGBRIDGE_OAUTH_CLIENT_ID: ${{ vars.LONGBRIDGE_OAUTH_CLIENT_ID || secrets.LONGBRIDGE_OAUTH_CLIENT_ID }}
+          LONGBRIDGE_OAUTH_TOKEN_CACHE_B64: ${{ secrets.LONGBRIDGE_OAUTH_TOKEN_CACHE_B64 }}
+          LONGBRIDGE_OAUTH_CACHE_KEY: ${{ secrets.LONGBRIDGE_OAUTH_CACHE_KEY }}
+          LONGBRIDGE_APP_KEY: ${{ secrets.LONGBRIDGE_APP_KEY }}
+          LONGBRIDGE_ACCESS_TOKEN: ${{ secrets.LONGBRIDGE_ACCESS_TOKEN }}
+        run: |
+          set -euo pipefail
+          python3 scripts/longbridge_oauth_state.py restore \
+            --encrypted data/intraday/longbridge_oauth_cache.json.enc \
+            --report reports/longbridge_oauth_restore.json
+          OAUTH_SOURCE="$(python3 - <<'PY'
+          import json
+
+          with open("reports/longbridge_oauth_restore.json", encoding="utf-8") as handle:
+              print(json.load(handle).get("source") or "none")
+          PY
+          )"
+          echo "LONGBRIDGE_OAUTH_CACHE_SOURCE=$OAUTH_SOURCE" >> "$GITHUB_ENV"
+          echo "Longbridge OAuth cache source: $OAUTH_SOURCE"
+
       - name: 运行分钟级 A/H 盘中模拟监控
         if: steps.market_calendar.outputs.should_run == 'true'
         shell: bash
@@ -527,6 +551,22 @@ jobs:
           fi
           exit "$WATCHDOG_STATUS"
 
+      - name: 保存 Longbridge OAuth 刷新状态
+        if: ${{ always() && steps.market_calendar.outputs.should_run == 'true' }}
+        id: save_longbridge_oauth
+        shell: bash
+        env:
+          LONGBRIDGE_OAUTH_CLIENT_ID: ${{ vars.LONGBRIDGE_OAUTH_CLIENT_ID || secrets.LONGBRIDGE_OAUTH_CLIENT_ID }}
+          LONGBRIDGE_OAUTH_TOKEN_CACHE_B64: ${{ secrets.LONGBRIDGE_OAUTH_TOKEN_CACHE_B64 }}
+          LONGBRIDGE_OAUTH_CACHE_KEY: ${{ secrets.LONGBRIDGE_OAUTH_CACHE_KEY }}
+          LONGBRIDGE_APP_KEY: ${{ secrets.LONGBRIDGE_APP_KEY }}
+          LONGBRIDGE_ACCESS_TOKEN: ${{ secrets.LONGBRIDGE_ACCESS_TOKEN }}
+        run: |
+          set -euo pipefail
+          python3 scripts/longbridge_oauth_state.py save \
+            --encrypted data/intraday/longbridge_oauth_cache.json.enc \
+            --report reports/longbridge_oauth_save.json
+
       - name: 严格验证行情与 PushPlus
         # 定时与手动盘中运行都必须留下同一份严格契约证据；即使前序步骤
         # 失败，只要任务未取消也要执行并明确报出缺失/不完整状态。双市场
@@ -549,11 +589,32 @@ jobs:
         shell: bash
         env:
           SHADOW_AB_STATE_KEY: ${{ secrets.SHADOW_AB_STATE_KEY }}
+          LONGBRIDGE_OAUTH_CLIENT_ID: ${{ vars.LONGBRIDGE_OAUTH_CLIENT_ID || secrets.LONGBRIDGE_OAUTH_CLIENT_ID }}
         run: |
           set -euo pipefail
           mkdir -p reports
           SHADOW_CHECK="$(mktemp "$RUNNER_TEMP/shadow-ab-validate.XXXXXX")"
-          if [ -f data/intraday/session_state.json ] && [ -f data/intraday/shadow_ab_state.json.enc ]; then
+          OAUTH_STATE_VALID=1
+          if [ -n "${LONGBRIDGE_OAUTH_CLIENT_ID:-}" ]; then
+            if [ ! -s data/intraday/longbridge_oauth_cache.json.enc ] || \
+               [ ! -s reports/longbridge_oauth_save.json ]; then
+              OAUTH_STATE_VALID=0
+            else
+              OAUTH_SAVE_STATUS="$(python3 - <<'PY'
+          import json
+
+          with open("reports/longbridge_oauth_save.json", encoding="utf-8") as handle:
+              print(json.load(handle).get("status") or "missing")
+          PY
+              )"
+              if [ "$OAUTH_SAVE_STATUS" != "saved" ]; then
+                OAUTH_STATE_VALID=0
+              fi
+            fi
+          fi
+          if [ -f data/intraday/session_state.json ] && \
+             [ -f data/intraday/shadow_ab_state.json.enc ] && \
+             [ "$OAUTH_STATE_VALID" = "1" ]; then
             VALID_STATE=1
             openssl enc -d -aes-256-cbc -pbkdf2 \
               -pass env:SHADOW_AB_STATE_KEY \
@@ -580,12 +641,12 @@ jobs:
               tar -czf intraday-alert-state.tar.gz data/intraday
               echo "available=true" >> "$GITHUB_OUTPUT"
             else
-              echo "::error::盘中状态或加密 A/B 状态校验失败；不上传、不缓存损坏状态或不完整状态"
+              echo "::error::盘中状态、加密 A/B 状态或 OAuth 刷新状态校验失败；不上传、不缓存损坏状态或不完整状态"
               echo "available=false" >> "$GITHUB_OUTPUT"
               {
                 echo "# 盘中状态无效"
                 echo
-                echo "恢复或运行后的盘中/A/B状态未通过完整性校验；本轮不会覆盖最近有效备份。"
+                echo "恢复或运行后的盘中/A/B/OAuth状态未通过完整性校验；本轮不会覆盖最近有效备份。"
               } > reports/intraday_state_missing.md
             fi
             rm -f "$SHADOW_CHECK"
@@ -595,7 +656,7 @@ jobs:
             {
               echo "# 盘中状态未生成"
               echo
-              echo "盘中状态或加密 A/B 状态缺失；未创建空状态，也未覆盖历史有效备份。"
+              echo "盘中状态、加密 A/B 状态或 OAuth 刷新状态缺失；未创建空状态，也未覆盖历史有效备份。"
             } > reports/intraday_state_missing.md
           fi
 
@@ -626,6 +687,7 @@ jobs:
             reports/intraday_state_missing.md
             reports/market_session_gate.json
             reports/market_scan_watchdog_*.json
+            reports/longbridge_oauth_*.json
             data/intraday/session_state.json
           if-no-files-found: warn
           retention-days: 30

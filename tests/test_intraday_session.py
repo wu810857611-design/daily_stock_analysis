@@ -955,7 +955,11 @@ class TencentBatchTests(unittest.TestCase):
                 return [SimpleNamespace(key="HK_L1_OpenAPI", name="real-time")]
 
             def quote(self, _symbols):
-                raise RuntimeError("access_token=super-secret session rejected")
+                raise RuntimeError(
+                    '{"access_token":"super-secret",'
+                    '"client_secret":"another-secret"}; '
+                    "Authorization: Bearer bearer-secret"
+                )
 
         fetcher = LongbridgeBatchQuoteFetcher(
             configured=True,
@@ -968,7 +972,46 @@ class TencentBatchTests(unittest.TestCase):
         self.assertTrue(result.is_stale)
         self.assertEqual(result.source, "longbridge_batch_error")
         self.assertNotIn("super-secret", json.dumps(fetcher.last_error))
+        self.assertNotIn("another-secret", json.dumps(fetcher.last_error))
+        self.assertNotIn("bearer-secret", json.dumps(fetcher.last_error))
         self.assertIn("<redacted>", fetcher.last_error["message"])
+
+    def test_fatal_oauth_error_opens_one_session_breaker_for_the_run(self):
+        now = datetime(2026, 8, 28, 13, 11, tzinfo=TZ)
+        factory_calls = []
+        sleeps = []
+
+        class OpenApiException(RuntimeError):
+            pass
+
+        def factory():
+            factory_calls.append(True)
+            try:
+                raise OpenApiException("refresh_token=secret expired")
+            except OpenApiException as exc:
+                raise SessionError(
+                    "Longbridge OAuth 无交互认证失败：OpenApiException"
+                ) from exc
+
+        fetcher = LongbridgeBatchQuoteFetcher(
+            configured=True,
+            context_factory=factory,
+            recovery_attempts=2,
+            retry_backoff_seconds=0.5,
+            sleeper=sleeps.append,
+        )
+
+        first = fetcher.fetch(["HK00981"], now=now)["HK00981"]
+        second = fetcher.fetch(["HK00981"], now=now)["HK00981"]
+
+        self.assertEqual(first.source, "longbridge_batch_error")
+        self.assertEqual(second.source, "longbridge_auth_blocked")
+        self.assertEqual(len(factory_calls), 1)
+        self.assertEqual(sleeps, [])
+        self.assertTrue(fetcher.auth_blocked)
+        self.assertEqual(fetcher.auth_failure_count, 1)
+        self.assertEqual(fetcher.last_error["root_error_type"], "OpenApiException")
+        self.assertNotIn("secret", json.dumps(fetcher.last_error))
 
     def test_oauth_cache_secret_accepts_wrapped_base64(self):
         payload = b'{"access_token":"test-only"}'
@@ -1010,6 +1053,28 @@ class TencentBatchTests(unittest.TestCase):
                         "test-client"
                     )
             self.assertFalse(cache_path.exists())
+
+    def test_oauth_bootstrap_does_not_overwrite_valid_refreshed_local_cache(self):
+        bootstrap = b'{"refresh_token":"bootstrap"}'
+        refreshed = b'{"refresh_token":"sdk-refreshed"}'
+        encoded = base64.b64encode(bootstrap).decode("ascii")
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            cache_path = Path(temporary_directory) / "oauth-cache"
+            cache_path.write_bytes(refreshed)
+            with patch.dict(
+                os.environ,
+                {"LONGBRIDGE_OAUTH_TOKEN_CACHE_B64": encoded},
+                clear=False,
+            ), patch.object(
+                intraday_session_module,
+                "_longbridge_oauth_cache_path",
+                return_value=cache_path,
+            ):
+                restored = intraday_session_module._restore_longbridge_oauth_cache(
+                    "test-client"
+                )
+
+            self.assertEqual(restored.read_bytes(), refreshed)
 
     def test_longbridge_batch_uses_provider_timestamp_and_rejects_delay(self):
         now = datetime(2026, 8, 11, 14, 45, tzinfo=TZ)
@@ -1169,7 +1234,7 @@ class TencentBatchTests(unittest.TestCase):
         )
         self.assertFalse(fetcher.last_diagnostics["hk_degraded"])
 
-    def test_market_aware_fetcher_reports_missing_provider_timestamp(self):
+    def test_market_aware_fetcher_uses_only_fresh_timestamped_primary_fallback(self):
         now = datetime(2026, 8, 11, 14, 45, tzinfo=TZ)
         fresh_unverified_hk = RealtimeQuote(
             symbol="HK06181",
@@ -1195,14 +1260,41 @@ class TencentBatchTests(unittest.TestCase):
 
         result = fetcher.fetch(["HK06181"], now=now)
 
-        self.assertTrue(result["HK06181"].is_stale)
-        self.assertIn("strict_hk_block", result["HK06181"].source)
+        self.assertFalse(result["HK06181"].is_stale)
+        self.assertIn("fresh_hk_fallback", result["HK06181"].source)
         self.assertEqual(fetcher.last_diagnostics["hk_fresh_upgraded"], 0)
         self.assertEqual(fetcher.last_diagnostics["hk_provider_timestamped"], 0)
         self.assertTrue(fetcher.last_diagnostics["hk_degraded"])
         self.assertEqual(
+            fetcher.last_diagnostics["hk_primary_fallback_fresh_covered"], 1
+        )
+        self.assertEqual(
             fetcher.last_diagnostics["hk_degradation_reasons"],
             {"longbridge_provider_timestamp_missing": 1},
+        )
+
+    def test_market_aware_fetcher_keeps_delayed_primary_hk_quote_blocked(self):
+        now = datetime(2026, 8, 11, 14, 45, tzinfo=TZ)
+        delayed_hk = RealtimeQuote(
+            symbol="HK06181",
+            price=383.8,
+            provider_timestamp=(now - timedelta(minutes=15)).isoformat(),
+            fetched_at=now.isoformat(),
+            stale_seconds=900,
+            is_stale=True,
+            source="tencent_batch",
+        )
+        fetcher = DecisionQuoteFetcher(
+            tencent_fetcher=FakeFetcher([{"HK06181": delayed_hk}]),
+            longbridge_fetcher=FakeLongbridgeFetcher([{}]),
+        )
+
+        result = fetcher.fetch(["HK06181"], now=now)
+
+        self.assertTrue(result["HK06181"].is_stale)
+        self.assertIn("strict_hk_block", result["HK06181"].source)
+        self.assertEqual(
+            fetcher.last_diagnostics["hk_primary_fallback_fresh_covered"], 0
         )
 
     def test_mixed_a_h_batch_uses_one_request_and_enforces_freshness(self):
@@ -1265,6 +1357,15 @@ class TencentBatchTests(unittest.TestCase):
         self.assertEqual(len(calls), 2)
         self.assertEqual(fetcher.last_diagnostics["fallback_requested"], 1)
         self.assertEqual(fetcher.last_diagnostics["fallback_covered"], 1)
+        self.assertEqual(
+            [item["route"] for item in fetcher.last_diagnostics["route_stats"]],
+            ["primary", "alternate"],
+        )
+        self.assertEqual(fetcher.last_diagnostics["route_price_returned"], 1)
+        self.assertEqual(
+            fetcher.last_diagnostics["route_provider_timestamped"], 1
+        )
+        self.assertEqual(fetcher.last_diagnostics["route_fresh_covered"], 1)
         self.assertTrue(fetcher.last_diagnostics["provider_errors"])
 
     def test_exact_twelve_symbol_watchlist_is_fetched_in_one_batch(self):
@@ -3852,6 +3953,13 @@ class SessionLoopTests(unittest.TestCase):
         self.assertIn("data/market_scan/latest.json", workflow)
         self.assertIn("PRAGMA quick_check", workflow)
         self.assertIn("name: intraday-alert-state", workflow)
+        self.assertIn("scripts/longbridge_oauth_state.py restore", workflow)
+        self.assertIn("scripts/longbridge_oauth_state.py save", workflow)
+        self.assertIn("LONGBRIDGE_OAUTH_CACHE_KEY", workflow)
+        self.assertIn("longbridge_oauth_cache.json.enc", workflow)
+        self.assertIn("reports/longbridge_oauth_*.json", workflow)
+        self.assertIn('OAUTH_SAVE_STATUS" != "saved"', workflow)
+        self.assertIn("本轮不会覆盖最近有效备份", workflow)
         self.assertIn("load_state_v2(", workflow)
         self.assertIn("不上传、不缓存损坏状态", workflow)
         self.assertIn('LATE_START_POLICY="skip"', workflow)
