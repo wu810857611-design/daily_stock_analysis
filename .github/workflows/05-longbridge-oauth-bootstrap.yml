@@ -1,0 +1,182 @@
+name: Longbridge OAuth 设备授权引导（临时）
+
+on:
+  push:
+    branches:
+      - agent/fix-longbridge-token-persistence-and-hk-fallback
+    paths:
+      - .github/workflows/05-longbridge-oauth-bootstrap.yml
+
+permissions:
+  contents: write
+
+jobs:
+  oauth-bootstrap:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: 检出授权分支
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: 安装并校验 Longbridge 官方 CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          CLI_VERSION='v0.28.4'
+          CLI_SHA256='8053554eac1d62d09fe0b33c9cb45ad0f99dad25eb8ac96f2d8be97a921cee38'
+          CLI_ARCHIVE="$RUNNER_TEMP/longbridge-terminal.tar.gz"
+          CLI_DIR="$RUNNER_TEMP/longbridge-bin"
+          curl -fL \
+            -o "$CLI_ARCHIVE" \
+            "https://github.com/longbridge/longbridge-terminal/releases/download/${CLI_VERSION}/longbridge-terminal-linux-amd64.tar.gz"
+          echo "$CLI_SHA256  $CLI_ARCHIVE" | sha256sum -c -
+          mkdir -p "$CLI_DIR"
+          tar --no-same-owner -xzf "$CLI_ARCHIVE" -C "$CLI_DIR"
+          chmod 0755 "$CLI_DIR/longbridge"
+          "$CLI_DIR/longbridge" --version
+          echo "LONGBRIDGE_CLI=$CLI_DIR/longbridge" >> "$GITHUB_ENV"
+
+      - name: 设备授权并封存令牌
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+
+          export HOME="$RUNNER_TEMP/longbridge-home"
+          mkdir -p "$HOME" .github/oauth-bootstrap
+
+          PUBLIC_KEY="$RUNNER_TEMP/oauth-bootstrap-public.pem"
+          cat > "$PUBLIC_KEY" <<'EOF'
+          -----BEGIN PUBLIC KEY-----
+          MIIBojANBgkqhkiG9w0BAQEFAAOCAY8AMIIBigKCAYEAsLD3C2enCQeXPLhcEA5n
+          HvB9VSclrjoaTWvgm/N9qfW3nydbPAZmQe+XEkOZ08fWDd8dfIWlo3qCYyoq1OhR
+          UpV6+zM95pOMsttoMLy7N3IaLDxZ9PjKNdhDZtNRW9SKZeO7VK2/2JoZahARRuoD
+          pGD2QypNiED5Gzid0tGOiqC+vl5Nr1X6Ov20SU4cc6KrDoVKokb0EoOfD8jRHzRq
+          zo1tATpA4QcdwcR6KcTtQArmOmi4VE8sPCxO69T9ARuMt3fS0FrDJL92RUbZGn4/
+          QjLyQWFQcvoxUILYYau/Z8ZfvcoWqTHDnYZENfocu/Fp5uw200ABp9Lyaee+n7lG
+          l7YT1qEsEG1OAFhgnDU4FrZNbq9AJVxDqOFEev4mJypJ8Udowc0I3xzL3OrKCD4z
+          TGkcql9iMQgesj+8KuoqrG6yMJKUoYLIjuJnW7hytXmdU1J33NKu/qWJsiYQ3qzw
+          XuoiTRm7nuLPVePkeT1Yh93evyPINU1h1w/sEjFEcBfxAgMBAAE=
+          -----END PUBLIC KEY-----
+          EOF
+
+          seal_file() {
+            local source_file="$1"
+            local output_prefix="$2"
+            local passphrase_file="$RUNNER_TEMP/seal-passphrase"
+            openssl rand -hex 32 > "$passphrase_file"
+            openssl enc -aes-256-cbc -pbkdf2 -salt \
+              -pass file:"$passphrase_file" \
+              -in "$source_file" \
+              -out "${output_prefix}.enc"
+            openssl pkeyutl -encrypt \
+              -pubin \
+              -inkey "$PUBLIC_KEY" \
+              -pkeyopt rsa_padding_mode:oaep \
+              -pkeyopt rsa_oaep_md:sha256 \
+              -in "$passphrase_file" \
+              -out "${output_prefix}-key.enc"
+            shred -u "$passphrase_file"
+          }
+
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+
+          AUTH_LOG="$RUNNER_TEMP/longbridge-auth.log"
+          script -q -f -e \
+            -c "$LONGBRIDGE_CLI auth login --client-name 'daily_stock_analysis GitHub Actions'" \
+            "$AUTH_LOG" >/dev/null 2>&1 &
+          AUTH_PID=$!
+
+          PROMPT_READY=0
+          for _ in $(seq 1 90); do
+            if grep -Eq 'https://|http://' "$AUTH_LOG" 2>/dev/null; then
+              PROMPT_READY=1
+              break
+            fi
+            if ! kill -0 "$AUTH_PID" 2>/dev/null; then
+              break
+            fi
+            sleep 1
+          done
+          if [ "$PROMPT_READY" != '1' ]; then
+            echo 'Longbridge 设备授权提示未能生成。'
+            exit 1
+          fi
+
+          cp "$AUTH_LOG" "$RUNNER_TEMP/device-prompt.txt"
+          seal_file \
+            "$RUNNER_TEMP/device-prompt.txt" \
+            '.github/oauth-bootstrap/device-prompt'
+          git add \
+            .github/oauth-bootstrap/device-prompt.enc \
+            .github/oauth-bootstrap/device-prompt-key.enc
+          git commit -m 'chore: publish encrypted Longbridge device prompt [skip ci]'
+          git push origin "HEAD:${GITHUB_REF_NAME}"
+          echo 'Longbridge 设备授权提示已加密发布，等待用户确认。'
+
+          set +e
+          wait "$AUTH_PID"
+          AUTH_STATUS=$?
+          set -e
+          if [ "$AUTH_STATUS" -ne 0 ]; then
+            echo 'Longbridge 设备授权未完成或已超时。'
+            exit "$AUTH_STATUS"
+          fi
+
+          TOKEN_ROOT="$HOME/.longbridge/openapi/tokens"
+          mapfile -t TOKEN_FILES < <(find "$TOKEN_ROOT" -maxdepth 1 -type f -print)
+          if [ "${#TOKEN_FILES[@]}" -ne 1 ]; then
+            echo 'Longbridge OAuth 缓存文件数量异常，拒绝封存。'
+            exit 1
+          fi
+          TOKEN_FILE="${TOKEN_FILES[0]}"
+          CLIENT_ID="$(basename "$TOKEN_FILE")"
+          if ! [[ "$CLIENT_ID" =~ ^[A-Za-z0-9._-]{1,160}$ ]]; then
+            echo 'Longbridge OAuth client_id 格式异常。'
+            exit 1
+          fi
+          python3 - "$TOKEN_FILE" <<'PY'
+          import json
+          import sys
+
+          with open(sys.argv[1], encoding="utf-8") as handle:
+              payload = json.load(handle)
+          if not isinstance(payload, dict) or not payload:
+              raise SystemExit("Longbridge OAuth 缓存结构无效")
+          PY
+
+          seal_file "$TOKEN_FILE" '.github/oauth-bootstrap/token-cache'
+          printf '%s\n' "$CLIENT_ID" > .github/oauth-bootstrap/client-id.txt
+          python3 - <<'PY'
+          import hashlib
+          import json
+          from pathlib import Path
+
+          files = [
+              Path('.github/oauth-bootstrap/token-cache.enc'),
+              Path('.github/oauth-bootstrap/token-cache-key.enc'),
+          ]
+          manifest = {
+              'schema_version': 1,
+              'ciphertexts': {
+                  path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+                  for path in files
+              },
+          }
+          Path('.github/oauth-bootstrap/manifest.json').write_text(
+              json.dumps(manifest, indent=2) + '\n',
+              encoding='utf-8',
+          )
+          PY
+          git add \
+            .github/oauth-bootstrap/client-id.txt \
+            .github/oauth-bootstrap/manifest.json \
+            .github/oauth-bootstrap/token-cache.enc \
+            .github/oauth-bootstrap/token-cache-key.enc
+          git commit -m 'chore: publish encrypted Longbridge OAuth cache [skip ci]'
+          git push origin "HEAD:${GITHUB_REF_NAME}"
+          echo 'Longbridge OAuth 缓存已通过一次性公钥加密封存。'
