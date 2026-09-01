@@ -1,5 +1,5 @@
 name: Longbridge OAuth 设备授权引导（临时）
-# device-code retry 5
+# device-code retry 6
 
 on:
   push:
