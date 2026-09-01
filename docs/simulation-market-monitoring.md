@@ -209,7 +209,8 @@ Level-2 只允许使用交易所授权、持牌数据商或用户本人账户已
 | `INTRADAY_QUOTE_FRESHNESS_SECONDS` | `90` | 可触发交易建议的最新成交价最大年龄 |
 | `INTRADAY_MIN_QUOTE_COVERAGE` | `0.8` | 最低基础行情覆盖率 |
 | `LONGBRIDGE_OAUTH_CLIENT_ID` | - | 港股实时 L1 的 OAuth client_id（Variable 或 Secret） |
-| `LONGBRIDGE_OAUTH_TOKEN_CACHE_B64` | - | 港股实时 L1 的 OAuth token cache（Secret） |
+| `LONGBRIDGE_OAUTH_TOKEN_CACHE_B64` | - | 港股实时 L1 的 OAuth token cache 启动种子（Secret） |
+| `LONGBRIDGE_OAUTH_CACHE_KEY` | - | 加密持久化 SDK 自动刷新后 OAuth cache 的独立随机密钥（Secret） |
 | `MARKET_SCAN_TOP_A_HISTORY` | `40` | 进入历史计算的 A 股数量 |
 | `MARKET_SCAN_TOP_HK_HISTORY` | `20` | 进入历史计算的港股通数量 |
 | `MARKET_SCAN_FINAL_TOP_N` | `12` | 进入双模型复核的最多数量 |
@@ -221,10 +222,25 @@ Level-2 只允许使用交易所授权、持牌数据商或用户本人账户已
 港股实时监控也兼容 Legacy `LONGBRIDGE_APP_KEY`、`LONGBRIDGE_APP_SECRET`、
 `LONGBRIDGE_ACCESS_TOKEN` 三件套；OAuth 与 Legacy 均未配置或认证失败时，港股行情
 会严格降级并停止交易类建议，不会把腾讯约 15 分钟延迟行情伪装成实时数据。
-同一轮遇到 Longbridge `SessionError` 或连接失效时会丢弃旧 QuoteContext、重建会话
-并做一次有界重试；诊断只保留异常类型、代码和脱敏消息。PRIMARY 腾讯批量行情会对
-未覆盖或陈旧标的改走备用入口，主备都无新鲜价格时仍保持 fail-closed，不生成买卖
-建议。故障和恢复各只推送一次，详细主备覆盖与会话恢复计数保存在验收报告中。
+同一轮遇到瞬时 Longbridge `SessionError` 或连接失效时会丢弃旧 QuoteContext、重建
+会话并做一次有界重试；已明确属于无交互 OAuth 认证失败时，本场任务立即熔断重复
+重建，后续轮次直接保留严格降级。诊断同时保留外层与根因异常的类型、代码和脱敏
+消息。PRIMARY 腾讯批量行情会对未覆盖或陈旧标的改走同提供方备用入口；只有它自己
+返回的提供方时间戳也通过 90 秒门槛时才允许作为港股新鲜备用，常见的约15分钟延迟
+价仍保持 fail-closed。故障和恢复各只推送一次，详细路由、时间戳、陈旧/缺失及会话
+恢复计数保存在验收报告中。
+
+盘中工作流会先恢复 `data/intraday/longbridge_oauth_cache.json.enc`，结束时再把 SDK
+可能自动刷新过的 cache 用 `LONGBRIDGE_OAUTH_CACHE_KEY` 加密写回固定状态 artifact；
+明文只存在于 runner 的 SDK 私有目录，不进入报告或 artifact。静态 B64 Secret 只作
+启动种子，不能在每次 QuoteContext 重建时覆盖更新后的本地 cache；若运维人员更换
+B64 种子，其摘要变化会使新种子优先于旧加密状态。未配置至少32字节的独立加密
+密钥时，本轮仍可用旧启动种子尝试行情，但保存步骤会明确失败，且不会用不完整状态
+覆盖最近有效备份；正式启用前必须配置该密钥。
+
+港股通成员缓存继续保留 840 小时硬上限，刷新全港报价不会延长成员有效期。距离硬
+到期 168/72/24 小时时会分级写入报告，并按阈值变化各推送一次维护预警；预警本身
+不把健康扫描误判为故障，超过硬上限仍会封锁港股通新候选。
 
 ### OAuth 显示 `HK_Basic` / 行情恰好延迟 15 分钟
 
@@ -245,6 +261,9 @@ python scripts/generate_longbridge_oauth_token.py \
 恒生指数实时包均不通过。随后把新生成的
 `~/.longbridge/openapi/tokens/<client_id>` 重新 base64 编码，覆盖 GitHub
 Environment `STOCK_LIST` 中原有的 `LONGBRIDGE_OAUTH_TOKEN_CACHE_B64` Secret。
+首次启用跨运行刷新持久化时，再创建独立的
+`LONGBRIDGE_OAUTH_CACHE_KEY` Secret，例如使用密码管理器生成至少32字节随机值；
+不要复用 OAuth token、PushPlus token 或模型 API key。
 Linux 可执行：
 
 ```bash

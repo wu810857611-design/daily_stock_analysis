@@ -326,7 +326,7 @@ class TestLongbridgeAuthSelection(unittest.TestCase):
         mock_config.from_apikey.assert_not_called()
 
     @patch("src.config.get_config")
-    def test_oauth_replaces_existing_cache_when_base64_secret_differs(self, mock_get_config):
+    def test_oauth_preserves_valid_sdk_refreshed_cache_when_bootstrap_differs(self, mock_get_config):
         mock_get_config.return_value = self._config(oauth_client_id="client-1")
         modules = self._install_mock_longbridge()
         mock_lb_module, mock_lb_openapi, mock_config, _, mock_oauth_builder = modules
@@ -352,7 +352,10 @@ class TestLongbridgeAuthSelection(unittest.TestCase):
             ):
                 fetcher = LongbridgeFetcher()
                 ctx = fetcher._get_ctx()
-                self.assertEqual(token_cache.read_bytes(), b'{"refresh_token":"fresh"}')
+                self.assertEqual(
+                    token_cache.read_bytes(),
+                    b'{"refresh_token":"old-but-json-valid"}',
+                )
 
         self.assertEqual(ctx, "quote-context")
         mock_config.from_oauth.assert_called_once_with("oauth-token")

@@ -233,8 +233,10 @@ def _restore_oauth_token_cache_from_env(client_id: str) -> bool:
     The Longbridge SDK expects its OAuth token cache at
     ``~/.longbridge/openapi/tokens/<client_id>``.  In headless environments the
     file can be provided as base64 through ``LONGBRIDGE_OAUTH_TOKEN_CACHE_B64``.
-    If an env cache is supplied and differs from the existing file, treat the
-    env value as the operator-provided recovery source for headless runs.
+    A valid existing file may have been refreshed by the SDK or restored from
+    encrypted workflow state, so the static bootstrap secret must not replace
+    it during every context construction.  Invalid local state is replaced by
+    the bootstrap value.
     """
     raw = os.getenv("LONGBRIDGE_OAUTH_TOKEN_CACHE_B64")
     if not raw:
@@ -253,11 +255,17 @@ def _restore_oauth_token_cache_from_env(client_id: str) -> bool:
     token_cache = _oauth_token_cache_path(client_id)
     if token_cache.exists():
         try:
-            if token_cache.read_bytes() == payload:
-                logger.debug("[Longbridge] OAuth token 缓存已与 env secret 一致，跳过恢复: %s", token_cache)
+            if _is_valid_oauth_cache_file(token_cache):
+                logger.debug(
+                    "[Longbridge] 已存在有效 OAuth token 缓存，保留 SDK 刷新状态: %s",
+                    token_cache,
+                )
                 return False
         except OSError as exc:
-            logger.warning("[Longbridge] 读取现有 OAuth token 缓存失败，将尝试用 env secret 覆盖: %s", exc)
+            logger.warning(
+                "[Longbridge] 读取现有 OAuth token 缓存失败，将尝试用 bootstrap 覆盖: %s",
+                exc,
+            )
 
     try:
         token_cache.parent.mkdir(parents=True, exist_ok=True)

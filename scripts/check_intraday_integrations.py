@@ -34,6 +34,8 @@ def verify_state(state: Mapping[str, Any]) -> dict[str, Any]:
         issues.append("longbridge_not_configured")
     if not quote_fetcher.get("hk_realtime_entitled"):
         issues.append("longbridge_realtime_permission_unverified")
+    if quote_fetcher.get("longbridge_auth_blocked"):
+        issues.append("longbridge_oauth_auth_blocked")
     if hk_requested <= 0 or hk_cycles <= 0:
         issues.append("no_hk_quote_cycle_checked")
     if hk_requested > 0 and hk_live != hk_requested:
@@ -96,11 +98,48 @@ def verify_state(state: Mapping[str, Any]) -> dict[str, Any]:
             "longbridge_last_error": dict(
                 quote_fetcher.get("longbridge_last_error") or {}
             ),
+            "longbridge_auth_mode": str(
+                quote_fetcher.get("longbridge_auth_mode") or "unknown"
+            ),
+            "longbridge_oauth_cache_source": str(
+                quote_fetcher.get("longbridge_oauth_cache_source") or "unknown"
+            ),
+            "longbridge_auth_blocked": bool(
+                quote_fetcher.get("longbridge_auth_blocked")
+            ),
+            "longbridge_auth_blocks": int(
+                integration.get("longbridge_auth_blocks") or 0
+            ),
             "primary_fallback_requests": int(
                 integration.get("primary_fallback_requests") or 0
             ),
             "primary_fallback_covered": int(
                 integration.get("primary_fallback_covered") or 0
+            ),
+            "tencent_alternate_route_requests": int(
+                integration.get("tencent_alternate_route_requests")
+                or integration.get("primary_fallback_requests")
+                or 0
+            ),
+            "tencent_alternate_route_fresh_covered": int(
+                integration.get("tencent_alternate_route_fresh_covered")
+                or integration.get("primary_fallback_covered")
+                or 0
+            ),
+            "tencent_route_price_returned": int(
+                integration.get("tencent_route_price_returned") or 0
+            ),
+            "tencent_route_provider_timestamped": int(
+                integration.get("tencent_route_provider_timestamped") or 0
+            ),
+            "tencent_route_stale_or_untradeable": int(
+                integration.get("tencent_route_stale_or_untradeable") or 0
+            ),
+            "tencent_route_missing": int(
+                integration.get("tencent_route_missing") or 0
+            ),
+            "hk_primary_fallback_fresh_covered": int(
+                integration.get("hk_primary_fallback_fresh_covered") or 0
             ),
         },
         "degradation": {
@@ -174,9 +213,21 @@ def render_markdown(result: Mapping[str, Any]) -> str:
                 "- 自动恢复：Longbridge 会话重建 "
                 f"{market['longbridge_recovery_attempts']} 次（成功 "
                 f"{market['longbridge_recovery_successes']}、失败 "
-                f"{market['longbridge_recovery_failures']}）；PRIMARY 备用路由恢复 "
-                f"{market['primary_fallback_covered']}/"
-                f"{market['primary_fallback_requests']} 个标的次"
+                f"{market['longbridge_recovery_failures']}）；认证熔断 "
+                f"{market['longbridge_auth_blocks']} 次；模式 "
+                f"{market['longbridge_auth_mode']}；缓存来源 "
+                f"{market['longbridge_oauth_cache_source']}"
+            ),
+            (
+                "- 腾讯备用路由：新鲜恢复 "
+                f"{market['tencent_alternate_route_fresh_covered']}/"
+                f"{market['tencent_alternate_route_requests']} 个标的路由次；"
+                f"返回价格 {market['tencent_route_price_returned']}；"
+                f"带时间戳 {market['tencent_route_provider_timestamped']}；"
+                f"陈旧/不可交易 {market['tencent_route_stale_or_untradeable']}；"
+                f"缺失 {market['tencent_route_missing']}；"
+                "港股通过90秒门槛恢复 "
+                f"{market['hk_primary_fallback_fresh_covered']} 个标的次"
             ),
             (
                 "- 行情降级：港股降级轮次 "

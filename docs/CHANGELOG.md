@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 > For user-friendly release highlights, see the [GitHub Releases](https://github.com/ZhuLinsen/daily_stock_analysis/releases) page.
 
 ## [Unreleased]
+- [修复] Longbridge OAuth token cache 改为“静态 Secret 仅启动、SDK 刷新状态独立加密持久化”，避免每次重建 QuoteContext 或新 runner 用旧种子覆盖新 refresh token；无交互认证失败新增本场熔断与根因异常链脱敏诊断。腾讯港股备用仅在自身提供方时间戳通过原90秒门槛时接力，并把价格返回、时间戳、陈旧和缺失分项报告；港股通成员缓存增加168/72/24小时到期分级预警与阈值去重推送，840小时硬到期和所有安全拦截保持不变。
 - [修复] 全市场扫描 watchdog、时段护栏与分钟监控新增 A/H 独立交易日门：两市休市时正常跳过且不抓行情、不调用模型、不推送，仅单边开市时隔离扫描；日历未知仍保守继续并保留原行情新鲜度门。仅观察名单变化且无可执行候选时不再发送 PushPlus，港股通成分缓存与报价来源分开展示，休市市场不会被误报为健康或提前发送恢复通知。
 - [修复] 为全市场买入链路增加时段漏跑 watchdog、成功时段幂等账本和迟到拦截；A 股与港股通快照改为有界重试、独立成员缓存和跨市场隔离，单一市场故障只封锁该市场并准确标记部分降级。盘中 Longbridge `SessionError` 会自动重建 QuoteContext，PRIMARY 腾讯行情增加备用入口与覆盖诊断；故障/恢复 PushPlus 去重、报告来源与可用性语义同步修正，所有行情时间戳、新鲜度和 fail-closed 安全门保持不变。
 - [改进] PRIMARY 买入侧把15%现金从绝对底线改为机会分级软护栏：普通/强/极强机会的现金底线分别为15%/5%/0%，单股动态上限分别为15%/35%/50%；首笔仓位分别为2.5%/5%/10%，后续加仓分别为2.5%/5%/5%，受现金或单股上限约束时可自动降至较小档位。加仓要求新一轮可信双模型复核和不低于实验基准价的右侧确认，并计入待执行预留与成本且禁止负现金，硬止损保持最高优先级。

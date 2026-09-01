@@ -351,6 +351,13 @@ def _failure_fingerprint(result: Mapping[str, Any]) -> str:
     ).hexdigest()[:20]
 
 
+def _warning_fingerprint(result: Mapping[str, Any]) -> str:
+    warnings = sorted(str(item) for item in (result.get("operational_warnings") or []))
+    return hashlib.sha256(
+        json.dumps(warnings, ensure_ascii=False).encode("utf-8")
+    ).hexdigest()[:20]
+
+
 def _failure_markets(result: Mapping[str, Any]) -> set[str]:
     statuses = result.get("market_operational_status") or {}
     markets = {
@@ -434,6 +441,22 @@ def _health_notification_content(
     )
 
 
+def _warning_notification_content(result: Mapping[str, Any], report: str) -> str:
+    warnings = "、".join(
+        str(item) for item in (result.get("operational_warnings") or [])
+    ) or "unknown"
+    return "\n".join(
+        [
+            "# 全市场买入链路维护预警",
+            "",
+            f"预警项：{warnings}。当前安全门仍有效、工作流不因此判为故障；"
+            "系统会在后续扫描继续尝试刷新，硬到期前仍未恢复则自动阻断对应市场。",
+            "",
+            report,
+        ]
+    )
+
+
 def persist_result_and_notify(
     result: Mapping[str, Any],
     *,
@@ -471,6 +494,10 @@ def persist_result_and_notify(
         or result.get("operational_failures")
     )
     failure_fingerprint = _failure_fingerprint(result) if operational_failed else ""
+    operational_warnings = list(result.get("operational_warnings") or [])
+    warning_fingerprint = (
+        _warning_fingerprint(result) if operational_warnings else ""
+    )
     previous_alert_active = bool(previous_health.get("failure_alert_active"))
     current_failure_markets = _failure_markets(result)
     health_kind = ""
@@ -488,9 +515,20 @@ def persist_result_and_notify(
     recovery_pending = bool(
         previous_alert_active and not operational_failed and health_kind != "recovery"
     )
+    warning_changed = bool(
+        not operational_failed
+        and not health_kind
+        and operational_warnings
+        and previous_health.get("last_alerted_warning_fingerprint")
+        != warning_fingerprint
+    )
     hard_failure = result.get("operational_status") == "failed"
     notification_kind = health_kind or (
-        "candidate_change" if candidate_change and not hard_failure else ""
+        "candidate_change"
+        if candidate_change and not hard_failure
+        else "warning"
+        if warning_changed
+        else ""
     )
     obvious_change = bool(notification_kind)
     health_state = {
@@ -523,6 +561,13 @@ def persist_result_and_notify(
             result.get("market_operational_status") or {}
         ),
         "failure_alert_active": previous_alert_active,
+        "current_warnings": operational_warnings,
+        "current_warning_fingerprint": warning_fingerprint,
+        "last_alerted_warning_fingerprint": (
+            previous_health.get("last_alerted_warning_fingerprint", "")
+            if operational_warnings
+            else ""
+        ),
     }
     _atomic_write_text(
         health_path,
@@ -552,6 +597,9 @@ def persist_result_and_notify(
     elif health_kind == "recovery":
         selected_title = "全市场买入链路已恢复"
         selected_content = _health_notification_content(result, report, recovered=True)
+    elif notification_kind == "warning":
+        selected_title = "全市场买入链路维护预警"
+        selected_content = _warning_notification_content(result, report)
 
     def save_outbox(error: str) -> None:
         payload = {
@@ -613,8 +661,26 @@ def persist_result_and_notify(
             }
         )
         _atomic_write_text(last_notified_path, serialised + "\n")
+    elif notification_kind == "warning":
+        health_state.update(
+            {
+                "last_alerted_warning_fingerprint": warning_fingerprint,
+                "last_warning_alerted_at": result.get("generated_at"),
+            }
+        )
+        _atomic_write_text(last_notified_path, serialised + "\n")
     else:
         _atomic_write_text(last_notified_path, serialised + "\n")
+        if warning_changed:
+            # Candidate notifications contain the complete report, including
+            # maintenance warnings.  Mark both as delivered so an unchanged
+            # warning does not produce a second push on the next scan.
+            health_state.update(
+                {
+                    "last_alerted_warning_fingerprint": warning_fingerprint,
+                    "last_warning_alerted_at": result.get("generated_at"),
+                }
+            )
     _atomic_write_text(
         health_path,
         json.dumps(health_state, ensure_ascii=False, indent=2) + "\n",
