@@ -1,7 +1,0 @@
-{
-  "schema_version": 1,
-  "ciphertexts": {
-    "token-cache.enc": "8e3ade17e9749ebc82d541f8006142870d46ebd3c1e7e1fc4dc0465f188d4616",
-    "token-cache-key.enc": "44998afff0b99506949e033f59ad8f363815c5f14acabdfe3b28add0b4c02a2f"
-  }
-}
