@@ -10,8 +10,10 @@ import os
 import re
 import sys
 import tempfile
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, Mapping, Optional, Sequence
+from zoneinfo import ZoneInfo
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -36,6 +38,121 @@ DEFAULT_RESULT_PATH = Path("reports/market_scan.json")
 DEFAULT_STATE_DIR = Path("data/market_scan")
 
 Notifier = Callable[[str, str], Any]
+SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
+
+
+def _bounded_research_value(value: Any, *, depth: int = 0) -> Any:
+    """Keep per-candidate research evidence structured but prompt-bounded."""
+
+    if depth >= 4:
+        return str(value)[:240]
+    if isinstance(value, Mapping):
+        return {
+            str(key): _bounded_research_value(item, depth=depth + 1)
+            for key, item in list(value.items())[:20]
+        }
+    if isinstance(value, (list, tuple)):
+        return [
+            _bounded_research_value(item, depth=depth + 1)
+            for item in list(value)[:5]
+        ]
+    if isinstance(value, str):
+        return value[:500]
+    return value
+
+
+def default_research_evidence_loader(candidate: Mapping[str, Any]) -> Dict[str, Any]:
+    """Fetch available fundamentals and event/news evidence for one finalist.
+
+    Each source fails independently. Missing data stays explicit and ordinary
+    news is never represented as a verified exchange announcement.
+    """
+
+    from src.services.alphasift_service import (
+        get_dsa_fundamental_context,
+        search_dsa_stock_news,
+    )
+
+    code = str(candidate.get("code") or "").strip()
+    name = str(candidate.get("name") or "").strip()
+    errors: list[str] = []
+    fundamentals: Dict[str, Any] = {"status": "unavailable", "data": {}}
+    try:
+        raw_fundamentals = get_dsa_fundamental_context(code)
+        compact = (
+            _bounded_research_value(raw_fundamentals)
+            if isinstance(raw_fundamentals, Mapping)
+            else {}
+        )
+        coverage = compact.get("coverage") if isinstance(compact, Mapping) else {}
+        coverage_states = {
+            str(value).strip().lower()
+            for value in (coverage.values() if isinstance(coverage, Mapping) else [])
+        }
+        has_data = any(
+            isinstance(value, Mapping) and bool(value.get("data"))
+            for key, value in compact.items()
+            if key not in {"coverage", "errors"}
+        ) if isinstance(compact, Mapping) else False
+        if "available" in coverage_states:
+            status = "available"
+        elif "partial" in coverage_states or has_data:
+            status = "partial"
+        else:
+            status = "unavailable"
+        fundamentals = {"status": status, "data": compact}
+        if isinstance(compact, Mapping) and compact.get("errors"):
+            errors.append("fundamentals:provider_error")
+    except Exception as exc:  # noqa: BLE001 - preserve the other evidence source.
+        errors.append(f"fundamentals_error:{type(exc).__name__}")
+
+    announcements_and_news: Dict[str, Any] = {
+        "status": "unavailable",
+        "evidence_type": "news_search_not_verified_exchange_announcements",
+        "items": [],
+    }
+    try:
+        raw_news = search_dsa_stock_news(code, name, max_results=3)
+        raw_items = raw_news.get("results") if isinstance(raw_news, Mapping) else []
+        items = [
+            _bounded_research_value(item)
+            for item in (raw_items if isinstance(raw_items, list) else [])[:3]
+            if isinstance(item, Mapping)
+        ]
+        announcements_and_news = {
+            # Search results corroborate events but do not prove that an item
+            # is a filed company announcement, hence never mark them complete.
+            "status": "partial" if items else "unavailable",
+            "evidence_type": "news_search_not_verified_exchange_announcements",
+            "provider": str(raw_news.get("provider") or "")
+            if isinstance(raw_news, Mapping)
+            else "",
+            "items": items,
+        }
+        if isinstance(raw_news, Mapping) and raw_news.get("error"):
+            errors.append("news:provider_error")
+    except Exception as exc:  # noqa: BLE001 - preserve fundamental evidence.
+        errors.append(f"news_error:{type(exc).__name__}")
+
+    available_blocks = {
+        fundamentals.get("status"),
+        announcements_and_news.get("status"),
+    }
+    overall_status = (
+        "available"
+        if "available" in available_blocks and "unavailable" not in available_blocks
+        else "partial"
+        if available_blocks & {"available", "partial"}
+        else "unavailable"
+    )
+    return {
+        "attempted": True,
+        "status": overall_status,
+        "fetched_at": datetime.now(SHANGHAI_TZ).isoformat(timespec="seconds"),
+        "fundamentals": fundamentals,
+        "announcements_and_news": announcements_and_news,
+        "errors": errors[:6],
+    }
 
 
 def _parse_enabled_markets(value: str) -> tuple[str, ...]:
@@ -65,6 +182,8 @@ MARKET_SCAN_REVIEW_SYSTEM_PROMPT = """
 你是独立的股票风险复核员。本系统已经主动查询可获得的全市场基础行情与OHLCV；
 若输入把基本面、行业、公告、资金、政策、盘口L1或Level-2标记为 unavailable，
 必须明确数据不足，绝不补造新闻、资金流、主力意图、政策或价格。
+输入中的 announcements_and_news 可能只是新闻检索结果，除非明确标注为已验证交易所公告，
+不得把它写成公司正式公告。
 
 即使用户没有提供分时图、K线、盘口或成交量，也必须优先使用系统主动取得且带
 来源、授权状态和时间戳的数据，不得把“用户未上传截图”当成停止研究的理由。
@@ -90,10 +209,19 @@ MARKET_SCAN_REVIEW_SYSTEM_PROMPT = """
 首笔 2.5%–10% 模拟净值动态仓位、仍需人工确认的条件建仓建议；当前价未进入买入区的标的仍不会
 触发买入提醒。
 
+必须输出 watch_reason_code。verdict=pass 时只能填 passed；verdict=watch 时只能从
+non_critical_data_gap、trend_or_entry_uncertain、risk_reward_insufficient、
+material_fundamental_or_event_risk、hard_risk、other 中选择。只有在报价、OHLCV、交易计划
+与扣费后风险回报均足够，且无任何重大不利证据或硬风险，剩余缺口仅为非关键研究维度
+（例如Level-2、行业或政策补充）时，才可使用 non_critical_data_gap。任何停牌、监管、
+财务造假、退市、重大公告/财务风险、不可执行流动性或重大数据质量问题必须 reject 且
+hard_risk=true；一般趋势、入场或风险收益不确定不得伪装成非关键数据缺失。
+
 输出严格 JSON，必须为每个输入代码且仅输出一条 review；`facts`、`inferences`、
 `risks`、`invalidators` 各最多两条，`thesis` 和 `view` 各最多 120 个汉字：
 {"reviews":[{"code":"...","verdict":"pass|watch|reject","confidence":0到1,
-"hard_risk":false,"thesis":"一句话审慎观点","risks":["..."],
+"hard_risk":false,"watch_reason_code":"passed|non_critical_data_gap|trend_or_entry_uncertain|risk_reward_insufficient|material_fundamental_or_event_risk|hard_risk|other",
+"thesis":"一句话审慎观点","risks":["..."],
 "invalidators":["..."],"facts":["..."],"inferences":["..."],"view":"..."}]}。
 """.strip()
 
@@ -738,6 +866,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         history_loader=default_history_loader,
         qwen_reviewer=build_litellm_reviewer("qwen"),
         deepseek_reviewer=build_litellm_reviewer("deepseek"),
+        research_evidence_loader=default_research_evidence_loader,
         config=config,
     )
     result = service.run()

@@ -103,10 +103,12 @@ class ReviewRecorder:
         *,
         hard_risk: bool = False,
         confidence: float = 0.8,
+        watch_reason_code: str | None = None,
     ):
         self.verdict = verdict
         self.hard_risk = hard_risk
         self.confidence = confidence
+        self.watch_reason_code = watch_reason_code
         self.calls: list[list[Dict[str, Any]]] = []
 
     def __call__(self, candidates: Sequence[Mapping[str, Any]]) -> Mapping[str, Any]:
@@ -119,6 +121,10 @@ class ReviewRecorder:
                     "verdict": self.verdict,
                     "confidence": self.confidence,
                     "hard_risk": self.hard_risk,
+                    "watch_reason_code": (
+                        self.watch_reason_code
+                        or ("passed" if self.verdict == "pass" else "other")
+                    ),
                     "thesis": f"{self.verdict} from fake reviewer",
                     "risks": [],
                     "invalidators": ["跌破程序止损"],
@@ -155,6 +161,7 @@ def _service(
     hk_all_loader: Any = None,
     config_overrides: Mapping[str, Any] | None = None,
     clock: Any = None,
+    research_loader: Any = None,
 ) -> MarketScanService:
     return MarketScanService(
         a_snapshot_loader=a_loader,
@@ -163,6 +170,7 @@ def _service(
         history_loader=history_loader,
         qwen_reviewer=qwen,
         deepseek_reviewer=deepseek,
+        research_evidence_loader=research_loader,
         config=_config(tmp_path, **dict(config_overrides or {})),
         clock=clock or (lambda: NOW),
     )
@@ -870,6 +878,120 @@ def test_model_conflict_or_hard_risk_downgrades_to_watch(tmp_path: Path) -> None
     ).run()
     assert all(candidate["action"] == "watch" for candidate in hard_risk["candidates"])
     assert all(candidate["hard_risk_veto"] is True for candidate in hard_risk["candidates"])
+
+
+def test_finalists_receive_available_research_evidence_before_both_reviews(
+    tmp_path: Path,
+) -> None:
+    qwen = ReviewRecorder("pass")
+    deepseek = ReviewRecorder("pass")
+    requested: list[str] = []
+
+    def research_loader(candidate: Mapping[str, Any]) -> Mapping[str, Any]:
+        requested.append(str(candidate["code"]))
+        return {
+            "attempted": True,
+            "status": "partial",
+            "fetched_at": NOW.isoformat(),
+            "fundamentals": {
+                "status": "available",
+                "data": {"financial_indicators": {"roe": 18.2}},
+            },
+            "announcements_and_news": {
+                "status": "partial",
+                "evidence_type": "news_search_not_verified_exchange_announcements",
+                "items": [{"title": "候选公司公开事件", "source": "fixture"}],
+            },
+            "errors": [],
+        }
+
+    result = _service(
+        tmp_path,
+        qwen=qwen,
+        deepseek=deepseek,
+        research_loader=research_loader,
+    ).run()
+
+    assert requested == [item["code"] for item in result["candidates"]]
+    assert len(qwen.calls) == len(deepseek.calls) == 1
+    assert all(
+        candidate["research_evidence_attempted"] is True
+        and candidate["facts"]["fundamentals"]
+        and candidate["facts"]["announcements_and_news"]["items"]
+        for candidate in qwen.calls[0]
+    )
+    funnel = result["diagnostics"]["buy_funnel"]
+    assert funnel["research_requested_count"] == len(result["candidates"])
+    assert funnel["research_attempted_count"] == len(result["candidates"])
+    assert funnel["research_available_count"] == len(result["candidates"])
+
+
+def test_one_pass_one_noncritical_watch_enters_only_standard_manual_review(
+    tmp_path: Path,
+) -> None:
+    result = _service(
+        tmp_path,
+        qwen=ReviewRecorder("pass", confidence=0.95),
+        deepseek=ReviewRecorder(
+            "watch",
+            confidence=0.95,
+            watch_reason_code="non_critical_data_gap",
+        ),
+        research_loader=lambda _candidate: {
+            "attempted": True,
+            "status": "partial",
+            "fundamentals": {"status": "partial", "data": {}},
+            "announcements_and_news": {"status": "unavailable", "items": []},
+            "errors": [],
+        },
+    ).run()
+
+    assert result["candidates"]
+    for candidate in result["candidates"]:
+        assert candidate["action"] == "conditional_buy"
+        assert candidate["model_disagreement"] is True
+        assert candidate["conditional_review"] is True
+        assert candidate["consensus_mode"] == (
+            "conditional_one_pass_one_noncritical_watch"
+        )
+        assert candidate["opportunity_tier"] == "standard"
+        assert candidate["initial_position_fraction"] == pytest.approx(0.025)
+        assert candidate["add_position_fraction"] == pytest.approx(0.025)
+        assert candidate["cash_floor_ratio"] == pytest.approx(0.15)
+        assert candidate["max_single_position_ratio"] == pytest.approx(0.15)
+    funnel = result["diagnostics"]["buy_funnel"]
+    assert funnel["conditional_consensus_count"] == len(result["candidates"])
+    assert funnel["eligible_consensus_count"] == len(result["candidates"])
+
+
+@pytest.mark.parametrize(
+    "deepseek",
+    [
+        ReviewRecorder("watch", watch_reason_code="trend_or_entry_uncertain"),
+        ReviewRecorder("watc", watch_reason_code="non_critical_data_gap"),
+        ReviewRecorder("reject", watch_reason_code="hard_risk"),
+        ReviewRecorder("watch", hard_risk=True, watch_reason_code="hard_risk"),
+    ],
+)
+def test_conditional_consensus_never_bypasses_other_watch_reject_or_hard_risk(
+    tmp_path: Path,
+    deepseek: ReviewRecorder,
+) -> None:
+    result = _service(
+        tmp_path,
+        qwen=ReviewRecorder("pass"),
+        deepseek=deepseek,
+        research_loader=lambda _candidate: {
+            "attempted": True,
+            "status": "partial",
+        },
+    ).run()
+
+    assert all(candidate["action"] == "watch" for candidate in result["candidates"])
+    assert all(
+        candidate["eligible_for_intraday_review"] is False
+        for candidate in result["candidates"]
+    )
 
 
 def test_v4_prompt_and_report_separate_facts_inferences_views_and_mark_l2_unavailable(

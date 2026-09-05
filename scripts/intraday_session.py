@@ -114,6 +114,7 @@ DEFAULT_EXPECTED_HOLDING_DAYS = 20.0
 DEFAULT_TARGET_CASH_MIN_RATIO = 0.15
 DEFAULT_TARGET_CASH_MAX_RATIO = 0.25
 MAX_EXTRA_CANDIDATE_SYMBOLS = 12
+CONDITIONAL_CONSENSUS_MODE = "conditional_one_pass_one_noncritical_watch"
 TENCENT_BATCH_ENDPOINT = "https://qt.gtimg.cn/q="
 TENCENT_BATCH_FALLBACK_ENDPOINT = "https://web.sqt.gtimg.cn/q="
 _TENCENT_RECORD = re.compile(r'v_([A-Za-z0-9]+)="([^"]*)"')
@@ -2011,28 +2012,63 @@ def is_near_threshold(
     return False
 
 
-def load_candidate_plans(
-    path: Optional[Path], *, now: Optional[datetime] = None
-) -> List[Dict[str, Any]]:
-    """Read the optional, read-only JSON interface from a scanner/planner.
+def _trusted_conditional_review_candidate(candidate: Mapping[str, Any]) -> bool:
+    """Revalidate the scanner's narrow one-pass/one-watch exception."""
 
-    The monitor never asks the scanner to trade.  A producer must explicitly
-    label every item ``scope=simulation`` or ``scope=watchlist``; unlabeled
-    objects are ignored by the policy gate below.
-    """
+    reviews = [candidate.get("qwen_review"), candidate.get("deepseek_review")]
+    if not all(isinstance(review, Mapping) for review in reviews):
+        return False
+    if not all(review.get("verdict_schema_valid") is True for review in reviews):
+        return False
+    verdicts = [str(review.get("verdict") or "").strip().lower() for review in reviews]
+    if sorted(verdicts) != ["pass", "watch"]:
+        return False
+    watch_review = reviews[verdicts.index("watch")]
+    if watch_review.get("hard_risk") is True:
+        return False
+    if str(watch_review.get("watch_reason_code") or "") != "non_critical_data_gap":
+        return False
+    expected = opportunity_policy(DEFAULT_OPPORTUNITY_TIER)
+    numeric_contract = {
+        "initial_position_fraction": expected.initial_position_fraction,
+        "add_position_fraction": expected.add_position_fraction,
+        "cash_floor_ratio": expected.cash_floor_ratio,
+        "max_single_position_ratio": expected.max_single_position_ratio,
+    }
+    for key, expected_value in numeric_contract.items():
+        actual = _finite_float(candidate.get(key))
+        if actual is None or not math.isclose(
+            actual, expected_value, rel_tol=0.0, abs_tol=1e-9
+        ):
+            return False
+    return bool(
+        candidate.get("conditional_review") is True
+        and candidate.get("model_disagreement") is True
+        and candidate.get("consensus_mode") == CONDITIONAL_CONSENSUS_MODE
+        and candidate.get("opportunity_tier") == DEFAULT_OPPORTUNITY_TIER
+        and candidate.get("research_evidence_attempted") is True
+    )
 
-    if path is None or not path.exists():
-        return []
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        print(f"候选计划 JSON 不可用，跳过自适应复核: {exc}", file=sys.stderr)
-        return []
+
+@dataclass(frozen=True)
+class CandidatePlanFileSnapshot:
+    plans: List[Dict[str, Any]]
+    content_fingerprint: str
+    generated_at: Optional[datetime]
+    status: str
+    scan_artifact: bool
+    reason: str = ""
+
+
+def _normalise_candidate_plan_payload(
+    payload: Any, *, now: datetime
+) -> tuple[List[Dict[str, Any]], Optional[datetime], str, bool, str]:
     trusted_scan = False
     scan_artifact = isinstance(payload, Mapping)
+    generated_at: Optional[datetime] = None
     if scan_artifact:
         generated_at = _parse_iso(payload.get("generated_at"))
-        current = now or datetime.now(SHANGHAI_TZ)
+        current = now
         if current.tzinfo is None:
             current = current.replace(tzinfo=SHANGHAI_TZ)
         current = current.astimezone(SHANGHAI_TZ)
@@ -2058,14 +2094,27 @@ def load_candidate_plans(
     # pre-existing ``scope=simulation`` field.  Bare lists remain supported for
     # explicitly supplied local watchlists.
     if scan_artifact and not trusted_scan:
-        return []
+        return [], generated_at, "untrusted", True, "root_contract_not_satisfied"
     if not isinstance(items, list):
-        return []
+        return [], generated_at, "invalid", scan_artifact, "candidate_list_missing"
     normalised: List[Dict[str, Any]] = []
     for item in items:
         if not isinstance(item, Mapping):
             continue
         candidate = dict(item)
+        reviews = [candidate.get("qwen_review"), candidate.get("deepseek_review")]
+        reviewer_reject = any(
+            isinstance(review, Mapping)
+            and (
+                str(review.get("verdict") or "").strip().lower() == "reject"
+                or review.get("hard_risk") is True
+            )
+            for review in reviews
+        )
+        consensus_trusted = bool(
+            candidate.get("model_disagreement") is not True
+            or _trusted_conditional_review_candidate(candidate)
+        )
         trusted_candidate = bool(
             trusted_scan
             and candidate.get("eligible_for_intraday_review") is True
@@ -2073,7 +2122,8 @@ def load_candidate_plans(
             and candidate.get("action") == "conditional_buy"
             and candidate.get("research_status") in {"ready", "actionable", "approved"}
             and candidate.get("hard_risk_veto") is not True
-            and candidate.get("model_disagreement") is not True
+            and not reviewer_reject
+            and consensus_trusted
         )
         if trusted_candidate:
             candidate["_trusted_opportunity_policy"] = True
@@ -2131,7 +2181,66 @@ def load_candidate_plans(
             )
         ):
             normalised.append(candidate)
-    return normalised
+    return (
+        normalised,
+        generated_at,
+        "trusted" if scan_artifact else "local_watchlist",
+        scan_artifact,
+        "",
+    )
+
+
+def read_candidate_plan_snapshot(
+    path: Optional[Path], *, now: Optional[datetime] = None
+) -> CandidatePlanFileSnapshot:
+    """Read one atomic candidate-plan generation with audit metadata."""
+
+    if path is None or not path.exists():
+        return CandidatePlanFileSnapshot([], "", None, "missing", False, "file_missing")
+    try:
+        raw = path.read_bytes()
+    except OSError as exc:
+        return CandidatePlanFileSnapshot(
+            [], "", None, "invalid", False, f"read_error:{type(exc).__name__}"
+        )
+    fingerprint = hashlib.sha256(raw).hexdigest()
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        return CandidatePlanFileSnapshot(
+            [], fingerprint, None, "invalid", False, f"json_error:{type(exc).__name__}"
+        )
+    current = now or datetime.now(SHANGHAI_TZ)
+    plans, generated_at, status, scan_artifact, reason = (
+        _normalise_candidate_plan_payload(payload, now=current)
+    )
+    return CandidatePlanFileSnapshot(
+        plans,
+        fingerprint,
+        generated_at,
+        status,
+        scan_artifact,
+        reason,
+    )
+
+
+def load_candidate_plans(
+    path: Optional[Path], *, now: Optional[datetime] = None
+) -> List[Dict[str, Any]]:
+    """Read the optional, read-only JSON interface from a scanner/planner.
+
+    The monitor never asks the scanner to trade. A producer must explicitly
+    label every item ``scope=simulation`` or ``scope=watchlist``; unlabeled
+    objects are ignored by the policy gate.
+    """
+
+    snapshot = read_candidate_plan_snapshot(path, now=now)
+    if snapshot.status == "invalid":
+        print(
+            f"候选计划 JSON 不可用，跳过自适应复核: {snapshot.reason}",
+            file=sys.stderr,
+        )
+    return list(snapshot.plans)
 
 
 def _decision_signal_data_quality(raw_value: Any) -> Any:
@@ -4804,6 +4913,7 @@ def render_session_report(
     integration_verification = provider_status.get("integration_verification") or {}
     pushplus_session = provider_status.get("pushplus_session") or {}
     late_schedule = provider_status.get("late_schedule") or {}
+    candidate_monitoring = provider_status.get("candidate_plan_monitoring") or {}
     lines = [
         "# 分钟级盘中模拟监控",
         "",
@@ -4985,6 +5095,52 @@ def render_session_report(
                 f"{reason}={count}" for reason, count in sorted(reason_counts.items())
             )
         )
+    if candidate_monitoring:
+        fingerprint = str(
+            candidate_monitoring.get("active_content_fingerprint") or ""
+        )
+        lines.extend(
+            [
+                "",
+                "## 候选计划热加载",
+                "",
+                (
+                    "- 当前计划："
+                    f"{int(candidate_monitoring.get('plan_count') or 0)} 个；"
+                    "可信扫描候选 "
+                    f"{int(candidate_monitoring.get('trusted_scan_plan_count') or 0)} 个；"
+                    "固定观察 "
+                    f"{int(candidate_monitoring.get('fixed_watch_plan_count') or 0)} 个。"
+                ),
+                (
+                    "- 热加载："
+                    f"检查 {int(candidate_monitoring.get('hot_reload_checks') or 0)} 次；"
+                    f"应用 {int(candidate_monitoring.get('hot_reload_applied') or 0)} 次；"
+                    f"忽略 {int(candidate_monitoring.get('hot_reload_ignored') or 0)} 次；"
+                    "安全清空 "
+                    f"{int(candidate_monitoring.get('hot_reload_fail_closed') or 0)} 次。"
+                ),
+                (
+                    "- 最近状态："
+                    f"{candidate_monitoring.get('last_reload_status') or 'unknown'}；"
+                    f"原因={candidate_monitoring.get('last_reload_reason') or '无'}。"
+                ),
+                (
+                    "- 扫描版本："
+                    f"generated_at={candidate_monitoring.get('scan_generated_at') or '-'}；"
+                    f"fingerprint={fingerprint[:12] or '-'}。"
+                ),
+            ]
+        )
+        extra_symbols = candidate_monitoring.get("extra_symbols") or []
+        if isinstance(extra_symbols, Sequence) and not isinstance(
+            extra_symbols, (str, bytes)
+        ):
+            lines.append(
+                "- 盘中新增监控："
+                f"{len(extra_symbols)}/"
+                f"{int(candidate_monitoring.get('extra_symbol_limit') or 0)} 个。"
+            )
     if late_schedule:
         lines.extend(
             [
@@ -5075,6 +5231,76 @@ def _notify_shadow_scorecard(
         notification["status"] = "sent"
         notification["sent_at"] = _iso(now)
     return True
+
+
+def _merge_candidate_plan_sources(
+    scanner_plans: Sequence[Mapping[str, Any]],
+    fixed_watch_plans: Sequence[Mapping[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Prefer the current trusted scan over the fixed-watch fallback."""
+
+    merged = [dict(candidate) for candidate in scanner_plans]
+    seen: set[str] = set()
+    for candidate in merged:
+        try:
+            seen.add(
+                canonical_symbol(
+                    str(candidate.get("symbol") or candidate.get("code") or "")
+                )
+            )
+        except Exception:
+            continue
+    for candidate in fixed_watch_plans:
+        try:
+            symbol = canonical_symbol(
+                str(candidate.get("symbol") or candidate.get("code") or "")
+            )
+        except Exception:
+            continue
+        if symbol in seen:
+            continue
+        merged.append(dict(candidate))
+        seen.add(symbol)
+    return merged
+
+
+def _extra_candidate_symbols(
+    candidate_plans: Sequence[Mapping[str, Any]],
+    configured_symbols: Sequence[str],
+) -> List[str]:
+    extras: List[str] = []
+    configured = set(configured_symbols)
+    for candidate in candidate_plans:
+        try:
+            symbol = canonical_symbol(
+                str(candidate.get("symbol") or candidate.get("code") or "")
+            )
+        except Exception:
+            continue
+        if symbol and symbol not in configured and symbol not in extras:
+            extras.append(symbol)
+        if len(extras) >= MAX_EXTRA_CANDIDATE_SYMBOLS:
+            break
+    return extras
+
+
+def _session_symbol_universe(
+    *,
+    configured_symbols: Sequence[str],
+    extra_candidates: Sequence[str],
+    shadow_symbols: Sequence[str],
+) -> List[str]:
+    return list(
+        dict.fromkeys(
+            [
+                *PRIMARY_SYMBOLS,
+                *configured_symbols,
+                *account_quote_symbols(),
+                *extra_candidates,
+                *shadow_symbols,
+            ]
+        )
+    )
 
 
 def run_session(
@@ -5315,47 +5541,18 @@ def run_session(
             report_path=report_path,
         )
 
-    scanner_candidate_plans = load_candidate_plans(candidate_plans_path, now=started)
+    candidate_file_snapshot = read_candidate_plan_snapshot(
+        candidate_plans_path, now=started
+    )
+    scanner_candidate_plans = list(candidate_file_snapshot.plans)
     fixed_watch_candidate_plans = load_fixed_watch_candidate_plans(
         database_path,
         now=started,
     )
-    candidate_plans = list(scanner_candidate_plans)
-    candidate_symbols = set()
-    for candidate in candidate_plans:
-        try:
-            candidate_symbols.add(
-                canonical_symbol(
-                    str(candidate.get("symbol") or candidate.get("code") or "")
-                )
-            )
-        except Exception:
-            continue
-    for candidate in fixed_watch_candidate_plans:
-        try:
-            symbol = canonical_symbol(
-                str(candidate.get("symbol") or candidate.get("code") or "")
-            )
-        except Exception:
-            continue
-        # Preserve the existing trusted market-scan plan when both sources
-        # contain the same symbol; P3 is a fixed-candidate fallback only.
-        if symbol in candidate_symbols:
-            continue
-        candidate_plans.append(candidate)
-        candidate_symbols.add(symbol)
-    extra_candidates: List[str] = []
-    for candidate in candidate_plans:
-        try:
-            symbol = canonical_symbol(
-                str(candidate.get("symbol") or candidate.get("code") or "")
-            )
-        except Exception:
-            continue
-        if symbol and symbol not in configured_symbols and symbol not in extra_candidates:
-            extra_candidates.append(symbol)
-        if len(extra_candidates) >= MAX_EXTRA_CANDIDATE_SYMBOLS:
-            break
+    candidate_plans = _merge_candidate_plan_sources(
+        scanner_candidate_plans, fixed_watch_candidate_plans
+    )
+    extra_candidates = _extra_candidate_symbols(candidate_plans, configured_symbols)
     shadow_symbols: List[str] = []
     if shadow_state is not None:
         shadow_symbols.extend(shadow_initial_symbols(shadow_state))
@@ -5365,16 +5562,10 @@ def run_session(
         shadow_symbols.extend(str(symbol) for symbol in shadow_positions)
     # PRIMARY is always first.  Side accounts share one deduplicated quote
     # request but never become PRIMARY A/B positions or coverage denominators.
-    symbols = list(
-        dict.fromkeys(
-            [
-                *PRIMARY_SYMBOLS,
-                *configured_symbols,
-                *account_quote_symbols(),
-                *extra_candidates,
-                *shadow_symbols,
-            ]
-        )
+    symbols = _session_symbol_universe(
+        configured_symbols=configured_symbols,
+        extra_candidates=extra_candidates,
+        shadow_symbols=shadow_symbols,
     )
 
     state = load_state_v2(state_path, now=started)
@@ -5447,6 +5638,21 @@ def run_session(
         "fixed_watch_plan_count": len(fixed_watch_candidate_plans),
         "extra_symbols": extra_candidates,
         "extra_symbol_limit": MAX_EXTRA_CANDIDATE_SYMBOLS,
+        "hot_reload_checks": 0,
+        "hot_reload_applied": 0,
+        "hot_reload_ignored": 0,
+        "hot_reload_fail_closed": 0,
+        "last_reload_status": candidate_file_snapshot.status,
+        "last_reload_reason": candidate_file_snapshot.reason,
+        "requires_scan_artifact": (
+            candidate_file_snapshot.status != "local_watchlist"
+        ),
+        "active_content_fingerprint": candidate_file_snapshot.content_fingerprint,
+        "scan_generated_at": (
+            _iso(candidate_file_snapshot.generated_at)
+            if candidate_file_snapshot.generated_at is not None
+            else ""
+        ),
     }
     provider.setdefault(
         "data_capabilities",
@@ -5489,12 +5695,117 @@ def run_session(
     notified_total = 0
     last_cycle: Optional[CycleResult] = None
     termination_reason = "end_at"
+    observed_candidate_fingerprints = {
+        candidate_file_snapshot.content_fingerprint
+    } if candidate_file_snapshot.content_fingerprint else set()
+    last_trusted_scan_generated_at = (
+        candidate_file_snapshot.generated_at
+        if candidate_file_snapshot.status == "trusted"
+        else None
+    )
+    hot_reload_requires_scan_artifact = (
+        candidate_file_snapshot.status != "local_watchlist"
+    )
 
     while True:
         now = clock().astimezone(SHANGHAI_TZ)
         if now >= end_at or (max_cycles and cycles >= max_cycles):
             termination_reason = "max_cycles" if max_cycles and cycles >= max_cycles else "end_at"
             break
+        monitoring = provider.get("candidate_plan_monitoring")
+        if candidate_plans_path is not None and isinstance(
+            monitoring, MutableMapping
+        ):
+            monitoring["hot_reload_checks"] = int(
+                monitoring.get("hot_reload_checks") or 0
+            ) + 1
+            refreshed = read_candidate_plan_snapshot(candidate_plans_path, now=now)
+            fingerprint = refreshed.content_fingerprint
+            if fingerprint and fingerprint not in observed_candidate_fingerprints:
+                observed_candidate_fingerprints.add(fingerprint)
+                generated_at = refreshed.generated_at
+                demonstrably_older = bool(
+                    generated_at is not None
+                    and last_trusted_scan_generated_at is not None
+                    and generated_at <= last_trusted_scan_generated_at
+                )
+                if demonstrably_older:
+                    monitoring["hot_reload_ignored"] = int(
+                        monitoring.get("hot_reload_ignored") or 0
+                    ) + 1
+                    monitoring["last_reload_status"] = "ignored_out_of_order"
+                    monitoring["last_reload_reason"] = (
+                        "scan_generated_at_not_newer_than_active"
+                    )
+                else:
+                    trusted_refresh = bool(
+                        refreshed.status == "trusted"
+                        or (
+                            refreshed.status == "local_watchlist"
+                            and not hot_reload_requires_scan_artifact
+                        )
+                    )
+                    reload_reason = refreshed.reason
+                    if (
+                        not trusted_refresh
+                        and refreshed.status == "local_watchlist"
+                        and hot_reload_requires_scan_artifact
+                    ):
+                        reload_reason = "scan_artifact_required_for_hot_reload"
+                    scanner_candidate_plans = (
+                        list(refreshed.plans) if trusted_refresh else []
+                    )
+                    candidate_plans = _merge_candidate_plan_sources(
+                        scanner_candidate_plans, fixed_watch_candidate_plans
+                    )
+                    extra_candidates = _extra_candidate_symbols(
+                        candidate_plans, configured_symbols
+                    )
+                    symbols = _session_symbol_universe(
+                        configured_symbols=configured_symbols,
+                        extra_candidates=extra_candidates,
+                        shadow_symbols=shadow_symbols,
+                    )
+                    cleared = clear_removed_adaptive_plan_reviews(
+                        state,
+                        now=now,
+                        candidates=candidate_plans,
+                    )
+                    monitoring["hot_reload_applied"] = int(
+                        monitoring.get("hot_reload_applied") or 0
+                    ) + 1
+                    if not trusted_refresh:
+                        monitoring["hot_reload_fail_closed"] = int(
+                            monitoring.get("hot_reload_fail_closed") or 0
+                        ) + 1
+                    if refreshed.status == "trusted":
+                        last_trusted_scan_generated_at = generated_at
+                        hot_reload_requires_scan_artifact = True
+                    monitoring.update(
+                        {
+                            "plan_count": len(candidate_plans),
+                            "trusted_scan_plan_count": len(
+                                scanner_candidate_plans
+                            ),
+                            "extra_symbols": extra_candidates,
+                            "last_reload_status": (
+                                "applied"
+                                if trusted_refresh
+                                else "fail_closed"
+                            ),
+                            "last_reload_reason": reload_reason,
+                            "requires_scan_artifact": (
+                                hot_reload_requires_scan_artifact
+                            ),
+                            "last_reload_cleared_reviews": cleared,
+                            "active_content_fingerprint": fingerprint,
+                            "scan_generated_at": (
+                                _iso(generated_at)
+                                if generated_at is not None
+                                else ""
+                            ),
+                        }
+                    )
         phases = market_phases_at(symbols, now, phase_resolver)
         provider["market_phases"] = phases
         phase_values = set(phases.values())
