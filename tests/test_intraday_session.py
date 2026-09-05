@@ -135,6 +135,56 @@ def quote(symbol, price, change_pct, now, *, stale=False):
     )
 
 
+def trusted_scan_payload(generated_at, candidates):
+    return {
+        "generated_at": generated_at.isoformat(),
+        "simulation_only": True,
+        "auto_order_enabled": False,
+        "human_confirmation_required": True,
+        "safe_to_push": True,
+        "review_complete": True,
+        "candidates": candidates,
+    }
+
+
+def trusted_scan_candidate(code="600001", **overrides):
+    candidate = {
+        "code": code,
+        "name": code,
+        "market": "A",
+        "action": "conditional_buy",
+        "research_status": "actionable",
+        "eligible_for_intraday_review": True,
+        "review_complete": True,
+        "hard_risk_veto": False,
+        "model_disagreement": False,
+        "plan": {
+            "entry_low": 99,
+            "entry_high": 101,
+            "entry_mid": 100,
+            "stop_loss": 95,
+            "take_profit_1": 120,
+            "round_trip_cost_bps": 25,
+        },
+        "qwen_review": {
+            "verdict": "pass",
+            "verdict_schema_valid": True,
+            "confidence": 0.8,
+        },
+        "deepseek_review": {
+            "verdict": "pass",
+            "verdict_schema_valid": True,
+            "confidence": 0.8,
+        },
+        "data_availability": {
+            "basic_quote": "available",
+            "ohlcv": "available",
+        },
+    }
+    candidate.update(overrides)
+    return candidate
+
+
 def synthetic_shadow_state():
     return initialize_shadow_state(
         {
@@ -3391,6 +3441,299 @@ class SessionLoopTests(unittest.TestCase):
             ["HK00700"],
         )
         self.assertIn("adaptive_policy", saved["symbols"]["HK00700"])
+
+    def test_newer_watchdog_candidate_is_hot_loaded_on_next_cycle(self):
+        start = datetime(2026, 7, 28, 10, 0, tzinfo=TZ)
+        clock = FakeClock(start)
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            plans = root / "latest.json"
+            plans.write_text(
+                json.dumps(trusted_scan_payload(start, [])), encoding="utf-8"
+            )
+
+            def update_and_sleep(seconds):
+                if len(clock.sleeps) == 0:
+                    plans.write_text(
+                        json.dumps(
+                            trusted_scan_payload(
+                                start + timedelta(seconds=30),
+                                [trusted_scan_candidate("600001")],
+                            )
+                        ),
+                        encoding="utf-8",
+                    )
+                clock.sleep(seconds)
+
+            fetcher = FakeFetcher(
+                [
+                    lambda symbols, now: {
+                        symbol: quote(symbol, 100, 0.2, now) for symbol in symbols
+                    },
+                    lambda symbols, now: {
+                        symbol: quote(symbol, 100, 0.2, now) for symbol in symbols
+                    },
+                ]
+            )
+            run_session(
+                stocks="300408",
+                end_at=start + timedelta(minutes=5),
+                database_path=root / "missing.db",
+                state_path=root / "state.json",
+                report_path=root / "report.md",
+                candidate_plans_path=plans,
+                fetcher=fetcher,
+                phase_resolver=lambda _market, _now: "intraday",
+                clock=clock.now,
+                sleeper=update_and_sleep,
+                notification_sender=lambda **_: True,
+                max_cycles=2,
+            )
+            saved = json.loads((root / "state.json").read_text(encoding="utf-8"))
+            report = (root / "report.md").read_text(encoding="utf-8")
+
+        self.assertNotIn("600001", fetcher.calls[0][0])
+        self.assertIn("600001", fetcher.calls[1][0])
+        monitoring = saved["provider"]["candidate_plan_monitoring"]
+        self.assertEqual(monitoring["hot_reload_applied"], 1)
+        self.assertEqual(monitoring["trusted_scan_plan_count"], 1)
+        self.assertEqual(monitoring["extra_symbols"], ["600001"])
+        self.assertIn("## 候选计划热加载", report)
+        self.assertIn("应用 1 次", report)
+        self.assertIn("盘中新增监控：1/12 个", report)
+
+    def test_hot_reload_ignores_same_fingerprint_and_older_generation(self):
+        start = datetime(2026, 7, 28, 10, 0, tzinfo=TZ)
+        clock = FakeClock(start)
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            plans = root / "latest.json"
+            plans.write_text(
+                json.dumps(
+                    trusted_scan_payload(
+                        start, [trusted_scan_candidate("600001")]
+                    )
+                ),
+                encoding="utf-8",
+            )
+
+            def replace_with_older(seconds):
+                if len(clock.sleeps) == 0:
+                    plans.write_text(
+                        json.dumps(
+                            trusted_scan_payload(
+                                start - timedelta(minutes=1),
+                                [trusted_scan_candidate("600002")],
+                            )
+                        ),
+                        encoding="utf-8",
+                    )
+                clock.sleep(seconds)
+
+            fetcher = FakeFetcher(
+                [
+                    lambda symbols, now: {
+                        symbol: quote(symbol, 100, 0.2, now) for symbol in symbols
+                    },
+                    lambda symbols, now: {
+                        symbol: quote(symbol, 100, 0.2, now) for symbol in symbols
+                    },
+                ]
+            )
+            run_session(
+                stocks="300408",
+                end_at=start + timedelta(minutes=5),
+                database_path=root / "missing.db",
+                state_path=root / "state.json",
+                report_path=root / "report.md",
+                candidate_plans_path=plans,
+                fetcher=fetcher,
+                phase_resolver=lambda _market, _now: "intraday",
+                clock=clock.now,
+                sleeper=replace_with_older,
+                notification_sender=lambda **_: True,
+                max_cycles=2,
+            )
+            saved = json.loads((root / "state.json").read_text(encoding="utf-8"))
+
+        self.assertIn("600001", fetcher.calls[0][0])
+        self.assertIn("600001", fetcher.calls[1][0])
+        self.assertNotIn("600002", fetcher.calls[1][0])
+        monitoring = saved["provider"]["candidate_plan_monitoring"]
+        self.assertEqual(monitoring["hot_reload_applied"], 0)
+        self.assertEqual(monitoring["hot_reload_ignored"], 1)
+        self.assertEqual(monitoring["last_reload_status"], "ignored_out_of_order")
+
+    def test_newer_zero_candidate_scan_clears_old_entry_review_and_outbox(self):
+        start = datetime(2026, 7, 28, 10, 0, tzinfo=TZ)
+        clock = FakeClock(start)
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            plans = root / "latest.json"
+            plans.write_text(
+                json.dumps(
+                    trusted_scan_payload(
+                        start, [trusted_scan_candidate("600001")]
+                    )
+                ),
+                encoding="utf-8",
+            )
+
+            def clear_and_sleep(seconds):
+                if len(clock.sleeps) == 0:
+                    plans.write_text(
+                        json.dumps(
+                            trusted_scan_payload(
+                                start + timedelta(seconds=30), []
+                            )
+                        ),
+                        encoding="utf-8",
+                    )
+                clock.sleep(seconds)
+
+            fetcher = FakeFetcher(
+                [
+                    lambda symbols, now: {
+                        symbol: quote(symbol, 100, 0.2, now) for symbol in symbols
+                    },
+                    lambda symbols, now: {
+                        symbol: quote(symbol, 100, 0.2, now) for symbol in symbols
+                    },
+                ]
+            )
+            run_session(
+                stocks="300408",
+                end_at=start + timedelta(minutes=5),
+                database_path=root / "missing.db",
+                state_path=root / "state.json",
+                report_path=root / "report.md",
+                candidate_plans_path=plans,
+                fetcher=fetcher,
+                phase_resolver=lambda _market, _now: "intraday",
+                clock=clock.now,
+                sleeper=clear_and_sleep,
+                notification_sender=lambda **_: False,
+                max_cycles=2,
+            )
+            saved = json.loads((root / "state.json").read_text(encoding="utf-8"))
+
+        monitoring = saved["provider"]["candidate_plan_monitoring"]
+        self.assertEqual(monitoring["hot_reload_applied"], 1)
+        self.assertEqual(monitoring["trusted_scan_plan_count"], 0)
+        self.assertNotIn("600001", fetcher.calls[1][0])
+        review = saved["symbols"]["600001"]["adaptive_reviews"][
+            "adaptive_entry_review"
+        ]
+        self.assertEqual(review["status"], "cleared")
+        self.assertFalse(
+            any(item.get("symbol") == "600001" for item in saved["outbox"])
+        )
+
+    def test_hot_reload_does_not_downgrade_trusted_scanner_path_to_bare_list(self):
+        start = datetime(2026, 7, 28, 10, 0, tzinfo=TZ)
+        clock = FakeClock(start)
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            plans = root / "latest.json"
+            plans.write_text(
+                json.dumps(
+                    trusted_scan_payload(
+                        start, [trusted_scan_candidate("600001")]
+                    )
+                ),
+                encoding="utf-8",
+            )
+
+            def replace_with_bare_list(seconds):
+                if len(clock.sleeps) == 0:
+                    plans.write_text(
+                        json.dumps(
+                            [{"code": "600002", "scope": "watchlist"}]
+                        ),
+                        encoding="utf-8",
+                    )
+                clock.sleep(seconds)
+
+            fetcher = FakeFetcher(
+                [
+                    lambda symbols, now: {
+                        symbol: quote(symbol, 100, 0.2, now)
+                        for symbol in symbols
+                    },
+                    lambda symbols, now: {
+                        symbol: quote(symbol, 100, 0.2, now)
+                        for symbol in symbols
+                    },
+                ]
+            )
+            run_session(
+                stocks="300408",
+                end_at=start + timedelta(minutes=5),
+                database_path=root / "missing.db",
+                state_path=root / "state.json",
+                report_path=root / "report.md",
+                candidate_plans_path=plans,
+                fetcher=fetcher,
+                phase_resolver=lambda _market, _now: "intraday",
+                clock=clock.now,
+                sleeper=replace_with_bare_list,
+                notification_sender=lambda **_: True,
+                max_cycles=2,
+            )
+            saved = json.loads((root / "state.json").read_text(encoding="utf-8"))
+
+        self.assertIn("600001", fetcher.calls[0][0])
+        self.assertNotIn("600001", fetcher.calls[1][0])
+        self.assertNotIn("600002", fetcher.calls[1][0])
+        monitoring = saved["provider"]["candidate_plan_monitoring"]
+        self.assertEqual(monitoring["hot_reload_fail_closed"], 1)
+        self.assertEqual(monitoring["last_reload_status"], "fail_closed")
+        self.assertTrue(monitoring["requires_scan_artifact"])
+
+    def test_conditional_model_disagreement_is_trusted_only_at_standard_tier(self):
+        start = datetime(2026, 7, 28, 10, 0, tzinfo=TZ)
+        conditional = trusted_scan_candidate(
+            "600001",
+            model_disagreement=True,
+            conditional_review=True,
+            consensus_mode="conditional_one_pass_one_noncritical_watch",
+            research_evidence_attempted=True,
+            opportunity_tier="standard",
+            initial_position_fraction=0.025,
+            add_position_fraction=0.025,
+            cash_floor_ratio=0.15,
+            max_single_position_ratio=0.15,
+            deepseek_review={
+                "verdict": "watch",
+                "verdict_schema_valid": True,
+                "confidence": 0.8,
+                "hard_risk": False,
+                "watch_reason_code": "non_critical_data_gap",
+            },
+        )
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            valid_path = root / "valid.json"
+            valid_path.write_text(
+                json.dumps(trusted_scan_payload(start, [conditional])),
+                encoding="utf-8",
+            )
+            tampered_path = root / "tampered.json"
+            tampered_path.write_text(
+                json.dumps(
+                    trusted_scan_payload(
+                        start,
+                        [{**conditional, "initial_position_fraction": 0.05}],
+                    )
+                ),
+                encoding="utf-8",
+            )
+
+            accepted = load_candidate_plans(valid_path, now=start)
+            rejected = load_candidate_plans(tampered_path, now=start)
+
+        self.assertEqual([item["code"] for item in accepted], ["600001"])
+        self.assertEqual(rejected, [])
 
     def test_safe_report_does_not_promote_deep_research_watch_to_entry_review(self):
         start = datetime(2026, 7, 28, 10, 0, tzinfo=TZ)

@@ -30,7 +30,11 @@ from zoneinfo import ZoneInfo
 import numpy as np
 import pandas as pd
 
-from src.services.position_sizing_policy import classify_opportunity
+from src.services.position_sizing_policy import (
+    STANDARD_TIER,
+    classify_opportunity,
+    opportunity_policy,
+)
 
 
 SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
@@ -43,8 +47,21 @@ HK_MEMBERSHIP_WARNING_THRESHOLDS = (168.0, 72.0, 24.0)
 SnapshotLoader = Callable[[], Any]
 HistoryLoader = Callable[[str, int], Any]
 Reviewer = Callable[[Sequence[Mapping[str, Any]]], Any]
+ResearchEvidenceLoader = Callable[[Mapping[str, Any]], Any]
 Clock = Callable[[], datetime]
 Sleeper = Callable[[float], None]
+
+WATCH_REASON_CODES = {
+    "passed",
+    "non_critical_data_gap",
+    "trend_or_entry_uncertain",
+    "risk_reward_insufficient",
+    "material_fundamental_or_event_risk",
+    "hard_risk",
+    "other",
+}
+CONDITIONAL_CONSENSUS_MODE = "conditional_one_pass_one_noncritical_watch"
+FULL_CONSENSUS_MODE = "full_dual_pass"
 
 
 class MarketScanError(RuntimeError):
@@ -721,6 +738,15 @@ def _normalise_verdict(value: Any) -> str:
     return "watch"
 
 
+def _normalise_watch_reason_code(value: Any, *, verdict: str, hard_risk: bool) -> str:
+    if hard_risk:
+        return "hard_risk"
+    if verdict == "pass":
+        return "passed"
+    text = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+    return text if text in WATCH_REASON_CODES - {"passed"} else "other"
+
+
 def _normalise_review_payload(raw: Any, candidates: Sequence[Mapping[str, Any]], market_by_code: Mapping[str, str]) -> Dict[str, Dict[str, Any]]:
     value = raw
     if isinstance(raw, Mapping):
@@ -747,10 +773,24 @@ def _normalise_review_payload(raw: Any, candidates: Sequence[Mapping[str, Any]],
         if not code or code not in market_by_code:
             continue
         confidence = _finite_float(item.get("confidence"))
+        raw_verdict = item.get("verdict") or item.get("action")
+        verdict = _normalise_verdict(raw_verdict)
+        verdict_schema_valid = str(raw_verdict or "").strip().lower() in {
+            "pass",
+            "watch",
+            "reject",
+        }
+        hard_risk = bool(item.get("hard_risk") or item.get("hard_reject"))
         reviews[code] = {
-            "verdict": _normalise_verdict(item.get("verdict") or item.get("action")),
+            "verdict": verdict,
+            "verdict_schema_valid": verdict_schema_valid,
             "confidence": min(max(confidence if confidence is not None else 0.0, 0.0), 1.0),
-            "hard_risk": bool(item.get("hard_risk") or item.get("hard_reject")),
+            "hard_risk": hard_risk,
+            "watch_reason_code": _normalise_watch_reason_code(
+                item.get("watch_reason_code") or item.get("reason_code"),
+                verdict=verdict,
+                hard_risk=hard_risk,
+            ),
             "thesis": str(item.get("thesis") or item.get("reason") or "").strip(),
             "risks": [str(text).strip() for text in (item.get("risks") or []) if str(text).strip()],
             "invalidators": [
@@ -770,8 +810,10 @@ def _normalise_review_payload(raw: Any, candidates: Sequence[Mapping[str, Any]],
 def _missing_review(reason: str) -> Dict[str, Any]:
     return {
         "verdict": "watch",
+        "verdict_schema_valid": False,
         "confidence": 0.0,
         "hard_risk": False,
+        "watch_reason_code": "other",
         "thesis": "",
         "risks": [reason],
         "invalidators": [],
@@ -787,6 +829,7 @@ def _build_v4_evidence_contract(
     as_of: str,
     snapshot_fetched_at: str = "",
     snapshot_source: str = "",
+    research_evidence: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Separate verified facts, deterministic inferences, and cautious views."""
 
@@ -798,13 +841,33 @@ def _build_v4_evidence_contract(
         for field in ("price", "amount", "change_pct")
     )
     ohlcv_available = int(candidate.get("history_bars") or 0) >= 60
+    research = dict(research_evidence or {})
+    fundamentals = research.get("fundamentals")
+    fundamentals = dict(fundamentals) if isinstance(fundamentals, Mapping) else {}
+    announcements_and_news = research.get("announcements_and_news")
+    announcements_and_news = (
+        dict(announcements_and_news)
+        if isinstance(announcements_and_news, Mapping)
+        else {}
+    )
+    fundamentals_status = str(fundamentals.get("status") or "unavailable").lower()
+    if fundamentals_status not in {"available", "partial"}:
+        fundamentals_status = "unavailable"
+    announcements_status = str(
+        announcements_and_news.get("status") or "unavailable"
+    ).lower()
+    if announcements_status not in {"available", "partial"}:
+        announcements_status = "unavailable"
     availability = {
         "basic_quote": "available" if quote_available else "partial",
         "ohlcv": "available" if ohlcv_available else "partial",
         "valuation": "partial" if valuation_available else "unavailable",
-        "fundamentals": "unavailable",
+        "fundamentals": fundamentals_status,
         "industry": "unavailable",
-        "announcements": "unavailable",
+        # News search is useful corroboration but is not mislabelled as an
+        # exchange-filed announcement. It therefore contributes at most
+        # partial event coverage unless the loader verifies announcements.
+        "announcements": announcements_status,
         "capital_flow": "unavailable",
         "policy": "unavailable",
         "order_book_l1": "unavailable",
@@ -814,6 +877,20 @@ def _build_v4_evidence_contract(
         (0.30 if quote_available else 0.10)
         + (0.40 if ohlcv_available else 0.10)
         + (0.10 if valuation_available else 0.0)
+        + (
+            0.10
+            if fundamentals_status == "available"
+            else 0.05
+            if fundamentals_status == "partial"
+            else 0.0
+        )
+        + (
+            0.10
+            if announcements_status == "available"
+            else 0.05
+            if announcements_status == "partial"
+            else 0.0
+        )
     )
     if candidate.get("market") == MARKET_A:
         market_costs = {
@@ -848,6 +925,8 @@ def _build_v4_evidence_contract(
         "annualized_volatility20": candidate.get("annualized_volatility20"),
         "max_drawdown60": candidate.get("max_drawdown60"),
         "history_source": candidate.get("history_source"),
+        "fundamentals": _json_safe(fundamentals),
+        "announcements_and_news": _json_safe(announcements_and_news),
     }
     above_ma20 = bool(
         _finite_float(candidate.get("price"))
@@ -868,9 +947,33 @@ def _build_v4_evidence_contract(
     view = {
         "short_term": "技术候选，等待深度研究与触发条件确认",
         "swing": "仅保留条件价格计划，不构成买入建议",
-        "medium_term": "基本面、公告、行业与政策数据不足",
-        "long_term": "基本面与估值覆盖不足，无法形成长期观点",
+        "medium_term": (
+            "已补充可得基本面与事件证据，仍需关注明确缺口"
+            if fundamentals_status != "unavailable"
+            or announcements_status != "unavailable"
+            else "基本面、公告、行业与政策数据不足"
+        ),
+        "long_term": (
+            "已有部分基本面证据，但不足以替代持续跟踪"
+            if fundamentals_status != "unavailable"
+            else "基本面与估值覆盖不足，无法形成长期观点"
+        ),
     }
+    deep_research_missing = [
+        key
+        for key, status in availability.items()
+        if key
+        in {
+            "fundamentals",
+            "industry",
+            "announcements",
+            "capital_flow",
+            "policy",
+            "order_book_l1",
+            "level2",
+        }
+        and status == "unavailable"
+    ]
     return {
         "data_availability": availability,
         "data_quality": round(min(data_quality, 1.0), 4),
@@ -893,15 +996,9 @@ def _build_v4_evidence_contract(
         "market_costs": market_costs,
         "human_confirmation_required": True,
         "eligible_for_intraday_review": False,
-        "deep_research_missing": [
-            "fundamentals",
-            "industry",
-            "announcements",
-            "capital_flow",
-            "policy",
-            "order_book_l1",
-            "level2",
-        ],
+        "research_evidence": _json_safe(research),
+        "research_evidence_attempted": bool(research.get("attempted")),
+        "deep_research_missing": deep_research_missing,
     }
 
 
@@ -916,6 +1013,7 @@ class MarketScanService:
         history_loader: HistoryLoader,
         qwen_reviewer: Optional[Reviewer],
         deepseek_reviewer: Optional[Reviewer],
+        research_evidence_loader: Optional[ResearchEvidenceLoader] = None,
         hk_all_snapshot_loader: Optional[SnapshotLoader] = None,
         config: Optional[MarketScanConfig] = None,
         clock: Clock = _now_shanghai,
@@ -927,6 +1025,7 @@ class MarketScanService:
         self.history_loader = history_loader
         self.qwen_reviewer = qwen_reviewer
         self.deepseek_reviewer = deepseek_reviewer
+        self.research_evidence_loader = research_evidence_loader
         self.config = config or MarketScanConfig()
         self.clock = clock
         self.sleeper = sleeper
@@ -1447,35 +1546,74 @@ class MarketScanService:
             history_candidates.append(enriched)
 
         ranked = _rank_l2(history_candidates)[: self.config.final_top_n]
+        evidence_contracts: Dict[str, Dict[str, Any]] = {}
+        research_requested_count = 0
+        research_attempted_count = 0
+        research_available_count = 0
+        research_errors: Dict[str, List[str]] = {}
         review_payload = []
         for candidate in ranked:
+            code = str(candidate.get("code") or "")
+            research_evidence: Dict[str, Any] = {}
+            if self.research_evidence_loader is not None:
+                research_requested_count += 1
+                try:
+                    raw_research = self.research_evidence_loader(copy.deepcopy(candidate))
+                    if isinstance(raw_research, Mapping):
+                        research_evidence = dict(raw_research)
+                    else:
+                        research_evidence = {
+                            "attempted": True,
+                            "status": "unavailable",
+                            "errors": ["research_evidence_invalid_payload"],
+                        }
+                except Exception as exc:  # noqa: BLE001 - one symbol must not abort review.
+                    research_evidence = {
+                        "attempted": True,
+                        "status": "unavailable",
+                        "errors": [
+                            f"research_evidence_error:{type(exc).__name__}"
+                        ],
+                    }
+                research_evidence["attempted"] = True
+                research_attempted_count += 1
+                if str(research_evidence.get("status") or "").lower() in {
+                    "available",
+                    "partial",
+                }:
+                    research_available_count += 1
+                errors = research_evidence.get("errors")
+                if isinstance(errors, list) and errors:
+                    research_errors[code] = [str(item) for item in errors[:3]]
             payload = self._candidate_for_review(candidate)
             is_a_share = candidate.get("market") == MARKET_A
-            payload.update(
-                _build_v4_evidence_contract(
-                    candidate,
-                    as_of=str(l1.as_of.get(str(candidate.get("market"))) or ""),
-                    snapshot_fetched_at=str(
-                        l1.diagnostics.get(
-                            "a_snapshot_fetched_at"
-                            if is_a_share
-                            else "hk_snapshot_fetched_at"
-                        )
-                        or ""
-                    ),
-                    snapshot_source=str(
-                        l1.diagnostics.get(
-                            "a_snapshot_source" if is_a_share else "hk_snapshot_source"
-                        )
-                        or ""
-                    ),
-                )
+            evidence_contract = _build_v4_evidence_contract(
+                candidate,
+                as_of=str(l1.as_of.get(str(candidate.get("market"))) or ""),
+                snapshot_fetched_at=str(
+                    l1.diagnostics.get(
+                        "a_snapshot_fetched_at"
+                        if is_a_share
+                        else "hk_snapshot_fetched_at"
+                    )
+                    or ""
+                ),
+                snapshot_source=str(
+                    l1.diagnostics.get(
+                        "a_snapshot_source" if is_a_share else "hk_snapshot_source"
+                    )
+                    or ""
+                ),
+                research_evidence=research_evidence,
             )
+            evidence_contracts[code] = evidence_contract
+            payload.update(copy.deepcopy(evidence_contract))
             payload["review_request"] = {
                 "proposed_action": "advance_to_intraday_entry_zone_review",
                 "deterministic_initial_position_fraction_range": [0.025, 0.10],
                 "sizing_policy": (
-                    "规则门在双模型复核后按普通/强/极强机会分级，"
+                    "双模型均pass时规则门按普通/强/极强机会分级；"
+                    "一方pass且另一方仅因非关键数据缺失watch时最多2.5%，"
                     "模型不得自行决定仓位"
                 ),
                 "immediate_buy": False,
@@ -1504,6 +1642,7 @@ class MarketScanService:
             MARKET_HK: {},
         }
         dual_pass_count = 0
+        conditional_consensus_count = 0
         actionable_count = 0
         actionable_by_market = {MARKET_A: 0, MARKET_HK: 0}
         market_snapshot_complete = {
@@ -1535,30 +1674,46 @@ class MarketScanService:
             both_pass = qwen["verdict"] == deepseek["verdict"] == "pass"
             if both_pass:
                 dual_pass_count += 1
+            one_pass_one_watch = {qwen["verdict"], deepseek["verdict"]} == {
+                "pass",
+                "watch",
+            }
+            watch_review = (
+                qwen if qwen["verdict"] == "watch" else deepseek
+                if deepseek["verdict"] == "watch"
+                else {}
+            )
             final_score = (
                 float(candidate.get("technical_score") or 0.0) * 0.70
                 + float(qwen["confidence"]) * 15.0
                 + float(deepseek["confidence"]) * 15.0
             )
-            evidence_contract = _build_v4_evidence_contract(
-                candidate,
-                as_of=str(l1.as_of.get(str(candidate.get("market"))) or ""),
-                snapshot_fetched_at=str(
-                    l1.diagnostics.get(
-                        "a_snapshot_fetched_at"
-                        if candidate.get("market") == MARKET_A
-                        else "hk_snapshot_fetched_at"
-                    )
-                    or ""
-                ),
-                snapshot_source=str(
-                    l1.diagnostics.get(
-                        "a_snapshot_source"
-                        if candidate.get("market") == MARKET_A
-                        else "hk_snapshot_source"
-                    )
-                    or ""
-                ),
+            evidence_contract = copy.deepcopy(
+                evidence_contracts.get(code)
+                or _build_v4_evidence_contract(
+                    candidate,
+                    as_of=str(l1.as_of.get(candidate_market) or ""),
+                )
+            )
+            conditional_review = bool(
+                review_complete
+                and one_pass_one_watch
+                and qwen.get("verdict_schema_valid") is True
+                and deepseek.get("verdict_schema_valid") is True
+                and watch_review.get("watch_reason_code")
+                == "non_critical_data_gap"
+                and evidence_contract.get("research_evidence_attempted") is True
+                and not hard_risk
+            )
+            if conditional_review:
+                conditional_consensus_count += 1
+            eligible_consensus = both_pass or conditional_review
+            consensus_mode = (
+                FULL_CONSENSUS_MODE
+                if both_pass
+                else CONDITIONAL_CONSENSUS_MODE
+                if conditional_review
+                else "none"
             )
             candidate_output = dict(candidate)
             review_confidence = min(
@@ -1568,8 +1723,7 @@ class MarketScanService:
             plan = candidate.get("plan") or {}
             actionable = bool(
                 review_complete
-                and both_pass
-                and not disagreement
+                and eligible_consensus
                 and not hard_risk
                 and candidate_snapshot_complete
                 and float(evidence_contract["data_quality"])
@@ -1582,12 +1736,16 @@ class MarketScanService:
                 actionable_by_market[candidate_market] = (
                     actionable_by_market.get(candidate_market, 0) + 1
                 )
-                opportunity = classify_opportunity(
-                    rank=rank,
-                    data_quality=evidence_contract["data_quality"],
-                    net_rr=plan.get("net_rr"),
-                    qwen_confidence=qwen.get("confidence"),
-                    deepseek_confidence=deepseek.get("confidence"),
+                opportunity = (
+                    opportunity_policy(STANDARD_TIER)
+                    if conditional_review
+                    else classify_opportunity(
+                        rank=rank,
+                        data_quality=evidence_contract["data_quality"],
+                        net_rr=plan.get("net_rr"),
+                        qwen_confidence=qwen.get("confidence"),
+                        deepseek_confidence=deepseek.get("confidence"),
+                    )
                 )
                 evidence_contract.update(
                     {
@@ -1621,7 +1779,12 @@ class MarketScanService:
                 )
                 evidence_contract["view"] = {
                     **dict(evidence_contract.get("view") or {}),
-                    "short_term": "双模型与规则门已通过，仅在新鲜价格进入计划区时首笔建仓",
+                    "short_term": (
+                        "一方通过、另一方仅因非关键数据缺失而观察；"
+                        "仅允许最低档人工复核"
+                        if conditional_review
+                        else "双模型与规则门已通过，仅在新鲜价格进入计划区时首笔建仓"
+                    ),
                     "swing": (
                         f"首笔按{opportunity.initial_position_fraction * 100:g}%"
                         "模拟净值分级试错，后续加仓仍需新一轮确认"
@@ -1640,11 +1803,27 @@ class MarketScanService:
                 )
             elif hard_risk:
                 count_candidate_rejection("hard_risk_veto", candidate_market)
+            elif "reject" in {qwen["verdict"], deepseek["verdict"]}:
+                count_candidate_rejection("model_reject_veto", candidate_market)
             elif disagreement:
-                count_candidate_rejection("model_disagreement", candidate_market)
-            elif not both_pass:
+                if (
+                    one_pass_one_watch
+                    and watch_review.get("watch_reason_code")
+                    == "non_critical_data_gap"
+                    and evidence_contract.get("research_evidence_attempted") is not True
+                ):
+                    count_candidate_rejection(
+                        "research_enrichment_not_attempted", candidate_market
+                    )
+                elif one_pass_one_watch:
+                    count_candidate_rejection(
+                        "watch_reason_not_noncritical_data_gap", candidate_market
+                    )
+                else:
+                    count_candidate_rejection("model_disagreement", candidate_market)
+            elif not eligible_consensus:
                 count_candidate_rejection(
-                    "dual_model_not_both_pass", candidate_market
+                    "dual_model_not_eligible_consensus", candidate_market
                 )
             else:
                 count_candidate_rejection(
@@ -1656,6 +1835,8 @@ class MarketScanService:
                     "qwen_review": qwen,
                     "deepseek_review": deepseek,
                     "model_disagreement": disagreement,
+                    "conditional_review": conditional_review,
+                    "consensus_mode": consensus_mode,
                     "hard_risk_veto": hard_risk,
                     "review_complete": review_complete,
                     "action": action,
@@ -1669,7 +1850,7 @@ class MarketScanService:
                             if (
                                 candidate_snapshot_complete
                                 and review_complete
-                                and both_pass
+                                and eligible_consensus
                                 and not hard_risk
                             )
                             else (
@@ -1689,6 +1870,7 @@ class MarketScanService:
                         disagreement=disagreement,
                         hard_risk=hard_risk,
                         both_pass=both_pass,
+                        conditional_review=conditional_review,
                         actionable=actionable,
                         market=candidate_market,
                         market_snapshot_complete=candidate_snapshot_complete,
@@ -1787,6 +1969,11 @@ class MarketScanService:
             "history_and_plan_valid_count": len(history_candidates),
             "dual_model_reviewed_count": len(ranked) if review_complete else 0,
             "dual_model_pass_count": dual_pass_count,
+            "conditional_consensus_count": conditional_consensus_count,
+            "eligible_consensus_count": dual_pass_count + conditional_consensus_count,
+            "research_requested_count": research_requested_count,
+            "research_attempted_count": research_attempted_count,
+            "research_available_count": research_available_count,
             "actionable_count": actionable_count,
             "history_rejection_reasons": history_rejection_counts,
             "candidate_rejection_reasons": candidate_rejection_reasons,
@@ -1853,6 +2040,7 @@ class MarketScanService:
                 "history_accepted_count": len(history_candidates),
                 "history_rejections": history_rejections,
                 "llm_candidate_count": len(ranked),
+                "research_evidence_errors": research_errors,
                 "llm_calls": {
                     "qwen": 1 if ranked and self.qwen_reviewer is not None else 0,
                     "deepseek": 1 if ranked and self.deepseek_reviewer is not None else 0,
@@ -1931,6 +2119,7 @@ class MarketScanService:
         disagreement: bool,
         hard_risk: bool,
         both_pass: bool,
+        conditional_review: bool,
         actionable: bool,
         market: str,
         market_snapshot_complete: bool,
@@ -1943,6 +2132,11 @@ class MarketScanService:
         if not market_snapshot_complete:
             market_label = "A股" if market == MARKET_A else "港股通"
             return f"{market_label}根快照不完整，仅该市场候选降级为观察"
+        if conditional_review and actionable:
+            return (
+                "一方模型通过，另一方仅因非关键数据缺失而观察；"
+                "只进入2.5%最低档盘中人工复核，仍须满足全部硬门禁"
+            )
         if disagreement:
             return "通义与 DeepSeek 意见冲突，降级为观察"
         if both_pass and actionable:

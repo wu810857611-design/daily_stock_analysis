@@ -459,10 +459,11 @@ jobs:
           fi
           PLAN_ARGS=()
           if [ -n "${INTRADAY_CANDIDATE_PLANS_PATH:-}" ]; then
+            PLAN_ARGS=(--candidate-plans "$INTRADAY_CANDIDATE_PLANS_PATH")
             if [ -f "$INTRADAY_CANDIDATE_PLANS_PATH" ]; then
-              PLAN_ARGS=(--candidate-plans "$INTRADAY_CANDIDATE_PLANS_PATH")
+              echo "✅ 已加载启动时的候选计划；盘中将继续检查新版本"
             else
-              echo "::warning::候选计划路径不存在；本轮不生成自适应人工复核事件"
+              echo "::warning::候选计划路径暂不存在；盘中将等待 watchdog 安全同步"
             fi
           fi
           if [ -z "${SHADOW_AB_STATE_KEY:-}" ]; then
@@ -507,6 +508,7 @@ jobs:
               --slot "$SESSION" \
               --repo "$GITHUB_REPOSITORY" \
               --ref "$GITHUB_REF_NAME" \
+              --sync-latest-path "$INTRADAY_CANDIDATE_PLANS_PATH" \
               --output "reports/market_scan_watchdog_${SESSION}.json" &
             WATCHDOG_PID=$!
             echo "ℹ️ 已启动 ${SESSION} 时段全市场扫描漏跑兜底"
