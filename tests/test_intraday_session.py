@@ -4273,15 +4273,16 @@ class SessionLoopTests(unittest.TestCase):
         self.assertIn("::warning", output)
         self.assertIn("监控未执行", summary)
 
-    def test_workflow_is_independent_and_never_overwrites_with_empty_state(self):
+    def test_workflow_has_resilient_entry_and_never_overwrites_empty_state(self):
         workflow = (
             Path(__file__).resolve().parents[1]
             / ".github"
             / "workflows"
             / "01-intraday-session.yml"
         ).read_text(encoding="utf-8")
-        self.assertNotIn("schedule:", workflow)
-        self.assertNotIn("cron:", workflow)
+        self.assertIn("schedule:", workflow)
+        self.assertIn("cron: '20 1 * * 1-5'", workflow)
+        self.assertIn("cron: '50 4 * * 1-5'", workflow)
         self.assertIn("workflow_dispatch:", workflow)
         self.assertIn("- morning", workflow)
         self.assertIn("- afternoon", workflow)
@@ -4306,14 +4307,23 @@ class SessionLoopTests(unittest.TestCase):
         self.assertIn("load_state_v2(", workflow)
         self.assertIn("不上传、不缓存损坏状态", workflow)
         self.assertIn('LATE_START_POLICY="skip"', workflow)
-        self.assertIn('SESSION="${{ github.event.inputs.session', workflow)
+        self.assertIn("REQUESTED_SESSION_INPUT: ${{ inputs.session", workflow)
+        self.assertIn('REQUESTED_SESSION="$REQUESTED_SESSION_INPUT"', workflow)
+        self.assertIn("scripts/intraday_slot_guard.py", workflow)
+        self.assertIn("intraday-session-claim-", workflow)
+        self.assertIn("duplicate_session_claim", workflow)
+        self.assertIn("强制暴露盘中入口调度故障", workflow)
+        self.assertIn("session_too_late|stale_trade_date", workflow)
         self.assertIn('--late-start-policy "$LATE_START_POLICY"', workflow)
         self.assertIn('--shadow-state "$SHADOW_STATE_PLAIN"', workflow)
         self.assertNotIn("SHADOW_AB_INITIAL_PORTFOLIO_JSON", workflow)
         self.assertIn("WATCH_ACCOUNTS_PRIVATE_JSON", workflow)
         self.assertIn("拒绝重新初始化", workflow)
         self.assertIn("name: 严格验证行情与 PushPlus", workflow)
-        self.assertIn("if: ${{ !cancelled() }}", workflow)
+        self.assertIn(
+            "if: ${{ !cancelled() && steps.execution_gate.outputs.execute == 'true' }}",
+            workflow,
+        )
         self.assertNotIn("verify_integrations:", workflow)
         daily_workflow = (
             Path(__file__).resolve().parents[1]

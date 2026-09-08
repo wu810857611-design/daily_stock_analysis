@@ -7,10 +7,12 @@
 ## 云端运行节奏
 
 - `00-daily-analysis.yml`：交易日北京时间 18:00 执行收盘分析和模拟记账。
-- `01-intraday-session.yml`：不再配置 GitHub 原生 `schedule`。外部
-  cron-job.org 在交易日北京时间 09:20 以 `workflow_dispatch` 触发
-  `session=morning`，12:50 触发 `session=afternoon`。GitHub Actions 页面仍可用
-  Run workflow 手动选择 `auto`、`morning` 或 `afternoon`。每个连续监控时段正常约
+- `01-intraday-session.yml`：外部 cron-job.org 仍是主要精准触发源，在交易日
+  北京时间 09:20 以 `workflow_dispatch` 触发 `session=morning`，12:50 触发
+  `session=afternoon`；GitHub 原生 `schedule` 使用相同时间作为辅助兜底。三类入口
+  都先经过交易日、目标时段、迟到窗口和 `trade_date + session` 幂等占位，重复触发
+  只会留下安全跳过审计，不能重复产生交易信号。GitHub Actions 页面仍可用 Run
+  workflow 手动选择 `auto`、`morning` 或 `afternoon`。每个连续监控时段正常约
   60 秒取一次基础实时行情；A 股使用腾讯批量行情，港股在配置 Longbridge 凭据后
   优先使用带最新成交时间戳的授权 L1 批量行情。港股连接建立时验证 OpenAPI 港股
   个股实时权限，每轮验证本次快照拉取和逐只提供方时间戳；最新成交时间超过交易新鲜度
@@ -20,6 +22,13 @@
   盘中 Actions 都会强制执行 Longbridge、PRIMARY、交易日历和 PushPlus 严格验收，
   证据不完整即失败；A/H 均休市时生成 `market_closed` 审计报告并正常结束，不启动
   行情循环和扫描 watchdog。
+- `03-intraday-supervisor.yml`：独立于分钟监控的顶层轻量 watchdog。北京时间
+  09:28/12:58 检查相应 `01` 是否已 queued、running 或 completed；安全补跑窗口内
+  没有对应任务时，以 `trigger_source=supervisor` 自动 dispatch。10:16/13:46 再做
+  过时检查；超过上午10:15或下午13:45绝不补交易信号，只发送一次可重试且去重的
+  PushPlus `SYSTEM` 调度故障告警。GitHub Actions 查询或 dispatch 失败同样写入完整
+  诊断并主动告警。它负责保证 `01` 活着，而 `01` 内现有 `market_scan_watchdog.py`
+  继续保证 `02` 活着，形成两层容灾。
 - `02-market-scan.yml`：北京时间 10:30、14:30 和 19:15 分层扫描 A 股全市场与
   港股通成分。全市场阶段不调用模型；只对规则短名单加载历史，再让通义千问和
   DeepSeek 独立复核。A 股快照按东财、Sina 双源重试和降级；港股通成分接口异常时，
@@ -41,13 +50,19 @@
 - `04-longbridge-preflight.yml`：手动、只读检查 Longbridge OAuth 行情包与港股
   提供方时间戳；该工作流不注入 PushPlus，不创建交易上下文，也不下单。
 
+既有 cron-job.org 请求只传 `session` 与 `max_cycles` 也保持兼容，不要求改 URL、时间
+或 Token；若要让 Actions 标题明确显示来源，可在上午/下午两个 JSON body 中分别追加
+`"trigger_source":"cron_job_org"`。`trade_date` 保持省略或 `auto`，不要写死日期。
+
 外部触发和 GitHub runner 仍可能排队，因此这些时间不是交易所级低延迟保证。任何
 超过
 90 秒、缺少时间戳或关键字段不完整的最新成交价，都不能触发交易类人工复核提醒。
 Longbridge 官方字段中的 `timestamp` 是“最新价格时间”而不是响应生成时间；已验证
 实时权限且本次成功返回的快照，若只是因为标的没有近期成交而超过 90 秒，会单独
 记录为“无近期成交快照”，不冒充可交易新鲜价，也不误计为行情接口降级。
-若 dispatch 到达时原定交易时段已经结束，系统会保留上午/下午的原始审计身份、
+若 dispatch 到达时超过对应安全补跑窗口，入口会先于私密状态恢复、行情抓取和信号
+生成执行 fail-closed 跳过；若已启动的旧入口直到原定交易时段结束后才进入分钟脚本，
+系统仍会保留上午/下午的原始审计身份、
 保留最近有效状态、记录 `late_schedule_skipped`，并通过可重试 outbox 发送该时段的
 能力提醒；不会把迟到的上午任务改写成下午任务，也不会回填或伪造已经错过的盘中
 行情。GitHub 任务摘要会明确标记“未执行”。触发迟到不能被解释为盘中监控成功；
@@ -295,4 +310,5 @@ OpenAPI（不是 App/PC/Web）的港股行情权限；账户确有实时包却�
 模型密钥和 PushPlus Token 使用既有 `LLM_DASHSCOPE_API_KEY`、
 `LLM_DEEPSEEK_API_KEY` 与 `PUSHPLUS_TOKEN` secrets。停用新增能力时，在
 GitHub Actions 页面分别 Disable `01-intraday-session.yml` 和
-`02-market-scan.yml`；原有 20 日模拟仍可独立继续。
+`03-intraday-supervisor.yml`，并按需 Disable `02-market-scan.yml`；原有 20 日模拟仍可
+独立继续。
