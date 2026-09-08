@@ -1,0 +1,205 @@
+name: 盘中调度顶层 Supervisor
+
+run-name: >-
+  supervisor | session=${{ inputs.session ||
+  (github.event.schedule == '28 1 * * 1-5' && 'morning') ||
+  (github.event.schedule == '16 2 * * 1-5' && 'morning') ||
+  (github.event.schedule == '58 4 * * 1-5' && 'afternoon') ||
+  (github.event.schedule == '46 5 * * 1-5' && 'afternoon') || 'auto' }} |
+  source=${{ inputs.trigger_source || github.event_name }}
+
+on:
+  schedule:
+    - cron: '28 1 * * 1-5'  # 北京时间 09:28，上午主触发漏跑检查
+    - cron: '16 2 * * 1-5'  # 北京时间 10:16，上午过时故障检查
+    - cron: '58 4 * * 1-5'  # 北京时间 12:58，下午主触发漏跑检查
+    - cron: '46 5 * * 1-5'  # 北京时间 13:46，下午过时故障检查
+  workflow_dispatch:
+    inputs:
+      session:
+        description: '检查时段'
+        required: false
+        default: auto
+        type: choice
+        options:
+          - auto
+          - morning
+          - afternoon
+      trigger_source:
+        description: '触发来源，仅用于审计'
+        required: false
+        default: manual_supervisor
+        type: string
+
+concurrency:
+  group: intraday-supervisor-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  supervise:
+    runs-on: ubuntu-latest
+    environment: STOCK_LIST
+    timeout-minutes: 12
+    env:
+      PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
+      PUSHPLUS_TOPIC: ${{ vars.PUSHPLUS_TOPIC || secrets.PUSHPLUS_TOPIC }}
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v5
+
+      - name: 设置 Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: 安装轻量交易日依赖
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install 'exchange-calendars>=4.13.0'
+
+      - name: 恢复 Supervisor 状态缓存
+        id: restore_state
+        continue-on-error: true
+        uses: actions/cache/restore@v4
+        with:
+          path: data/scheduler/intraday_supervisor_state.json
+          key: intraday-supervisor-state-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            intraday-supervisor-state-
+
+      - name: 缓存缺失时恢复最新 Supervisor 状态备份
+        if: steps.restore_state.outcome != 'success' || steps.restore_state.outputs.cache-matched-key == ''
+        continue-on-error: true
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          STATE_BRANCH: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          mkdir -p data/scheduler
+          TMP_DIR="$(mktemp -d)"
+          gh api --method GET \
+            -H "Accept: application/vnd.github+json" \
+            "/repos/${GITHUB_REPOSITORY}/actions/artifacts?name=intraday-supervisor-state&per_page=100" \
+            > "$TMP_DIR/artifacts.json"
+          ARTIFACT_ID="$(
+            python3 - "$TMP_DIR/artifacts.json" "$STATE_BRANCH" <<'PY'
+          import json
+          import sys
+
+          path, branch = sys.argv[1:3]
+          with open(path, encoding="utf-8") as handle:
+              artifacts = json.load(handle).get("artifacts", [])
+          matches = [
+              item
+              for item in artifacts
+              if not item.get("expired")
+              and item.get("name") == "intraday-supervisor-state"
+              and (item.get("workflow_run") or {}).get("head_branch") == branch
+          ]
+          matches.sort(key=lambda item: item.get("created_at", ""), reverse=True)
+          print(matches[0]["id"] if matches else "")
+          PY
+          )"
+          if [ -z "$ARTIFACT_ID" ]; then
+            echo "ℹ️ 尚无 Supervisor 状态，按首次运行处理"
+            exit 0
+          fi
+          gh api \
+            -H "Accept: application/vnd.github+json" \
+            "/repos/${GITHUB_REPOSITORY}/actions/artifacts/${ARTIFACT_ID}/zip" \
+            > "$TMP_DIR/state.zip"
+          python3 - "$TMP_DIR/state.zip" <<'PY'
+          import json
+          import sys
+          import zipfile
+          from pathlib import Path, PurePosixPath
+
+          archive_path = Path(sys.argv[1])
+          target_name = "data/scheduler/intraday_supervisor_state.json"
+          with zipfile.ZipFile(archive_path) as archive:
+              matches = []
+              for item in archive.infolist():
+                  path = PurePosixPath(item.filename)
+                  if path.is_absolute() or ".." in path.parts:
+                      raise SystemExit(f"unsafe supervisor artifact: {item.filename}")
+                  if path.as_posix() == target_name:
+                      matches.append(item)
+              if len(matches) != 1:
+                  raise SystemExit("supervisor artifact state is missing or duplicated")
+              raw = archive.read(matches[0])
+          payload = json.loads(raw.decode("utf-8"))
+          if not isinstance(payload, dict) or payload.get("schema_version") != 1:
+              raise SystemExit("supervisor artifact state is invalid")
+          target = Path(target_name)
+          target.parent.mkdir(parents=True, exist_ok=True)
+          target.write_bytes(raw)
+          PY
+          echo "✅ 已恢复最新 Supervisor 状态备份"
+
+      - name: 检查并补救盘中任务
+        id: supervisor
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED_SESSION: ${{ inputs.session || 'auto' }}
+          EVENT_SCHEDULE: ${{ github.event.schedule }}
+        run: |
+          set +e
+          mkdir -p data/scheduler reports
+          python3 scripts/intraday_supervisor.py \
+            --repo "$GITHUB_REPOSITORY" \
+            --ref "$GITHUB_REF_NAME" \
+            --workflow 01-intraday-session.yml \
+            --event-name "$GITHUB_EVENT_NAME" \
+            --event-schedule "${EVENT_SCHEDULE:-}" \
+            --session "${REQUESTED_SESSION:-auto}" \
+            --state data/scheduler/intraday_supervisor_state.json \
+            --report reports/intraday_supervisor.json \
+            --github-output "$GITHUB_OUTPUT"
+          STATUS=$?
+          echo "SUPERVISOR_EXIT_CODE=$STATUS" >> "$GITHUB_ENV"
+          exit 0
+
+      - name: 上传 Supervisor 审计报告
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: intraday-supervisor-report-${{ github.run_number }}-${{ github.run_attempt }}
+          path: reports/intraday_supervisor.json
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: 上传固定名 Supervisor 状态备份
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: intraday-supervisor-state
+          path: data/scheduler/intraday_supervisor_state.json
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: 保存 Supervisor 状态缓存
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: data/scheduler/intraday_supervisor_state.json
+          key: intraday-supervisor-state-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: 强制暴露调度故障
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          STATUS="${SUPERVISOR_EXIT_CODE:-3}"
+          if [ "$STATUS" -ne 0 ]; then
+            echo "::error::Supervisor 发现调度故障；SYSTEM 告警结果见审计报告"
+            exit "$STATUS"
+          fi
+          echo "✅ Supervisor 检查通过"

@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 > For user-friendly release highlights, see the [GitHub Releases](https://github.com/ZhuLinsen/daily_stock_analysis/releases) page.
 
 ## [Unreleased]
+- [修复] 新增独立顶层盘中 Supervisor：cron-job.org 继续作为09:20/12:50主要精准触发源，GitHub 原生 schedule 作为辅助兜底；Supervisor 在安全窗口内自动补发缺失的上午/下午 `01`，过时、GitHub API 或 dispatch 故障只发去重可重试的 PushPlus SYSTEM 告警，绝不补造交易信号。`01` 新增 `trade_date + session` 不可变缓存占位和迟到前置门，三源重复触发只能有一个有效任务；原有 `01 -> 02` 扫描 watchdog 及全部行情、策略和人工确认安全门保持不变。
+- [测试] 覆盖外部 cron 上午/下午漏触发、GitHub schedule 严重迟到、三源重复、queued/running/completed、过时与非交易日、GitHub API/dispatch/PushPlus 故障、Supervisor 重复运行，以及既有 market-scan watchdog 双层容灾接线。
 - [改进] 全市场扫描在最终12只进入千问/DeepSeek复核前逐只补取可获得的基本面与事件/新闻证据，并结构化标明来源和缺口；仅当一方通过、另一方明确因非关键数据缺失观察且无任何reject/硬风险时，才强制以普通机会2.5%最低档进入人工复核，其余原有新鲜行情、买入区、止损、扣费后风险收益、现金和人工确认硬门禁保持不变。
 - [修复] 上午/下午扫描 watchdog 在同一盘中 runner 内等待并安全同步当前时段固定名状态产物，校验模拟契约、时段与生成时间后原子替换候选文件；分钟循环按时间戳和内容指纹热加载，拒绝旧版本与重复内容，可信零候选或更新后的损坏/不可信文件会 fail-closed 清除旧扫描候选及待发买入事件。
 - [测试] 覆盖补证据先于双模型、条件性2.5%复核、reject/硬风险一票否决、artifact 路径与时段校验、候选热加载、旧时间戳去重及零候选清理。

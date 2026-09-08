@@ -1,6 +1,16 @@
 name: 分钟级盘中模拟监控
 
+run-name: >-
+  intraday | session=${{ inputs.session ||
+  (github.event.schedule == '20 1 * * 1-5' && 'morning') ||
+  (github.event.schedule == '50 4 * * 1-5' && 'afternoon') || 'auto' }} |
+  date=${{ inputs.trade_date || 'auto' }} |
+  source=${{ inputs.trigger_source || github.event_name }}
+
 on:
+  schedule:
+    - cron: '20 1 * * 1-5'  # 北京时间 09:20；cron-job.org 仍为主要精准触发源
+    - cron: '50 4 * * 1-5'  # 北京时间 12:50；本 schedule 仅作辅助兜底
   workflow_dispatch:
     inputs:
       session:
@@ -12,6 +22,16 @@ on:
           - auto
           - morning
           - afternoon
+      trade_date:
+        description: '目标交易日；supervisor 显式传入，其他触发保持 auto'
+        required: false
+        default: auto
+        type: string
+      trigger_source:
+        description: '触发来源，仅用于审计'
+        required: false
+        default: external_dispatch
+        type: string
       max_cycles:
         description: '测试轮数；0 表示运行到该时段绝对结束时间'
         required: false
@@ -49,21 +69,134 @@ jobs:
 
       - name: 创建目录并确定时段
         shell: bash
+        env:
+          REQUESTED_SESSION_INPUT: ${{ inputs.session || 'auto' }}
+          REQUESTED_TRADE_DATE_INPUT: ${{ inputs.trade_date || 'auto' }}
+          TRIGGER_SOURCE_INPUT: ${{ inputs.trigger_source || github.event_name }}
+          MAX_CYCLES_INPUT: ${{ inputs.max_cycles || '0' }}
         run: |
           set -euo pipefail
-          mkdir -p data/intraday reports logs
-          SESSION="${{ github.event.inputs.session || 'auto' }}"
-          MAX_CYCLES="${{ github.event.inputs.max_cycles || '0' }}"
+          mkdir -p data/intraday data/scheduler/claims reports logs
+          REQUESTED_SESSION="$REQUESTED_SESSION_INPUT"
+          REQUESTED_TRADE_DATE="$REQUESTED_TRADE_DATE_INPUT"
+          TRIGGER_SOURCE="$TRIGGER_SOURCE_INPUT"
+          MAX_CYCLES="$MAX_CYCLES_INPUT"
           # 外部 cron-job.org 使用 workflow_dispatch；如果排队到目标时段之后，
           # 必须安全跳过且不得补造盘中信号。手动运行同样遵守这一边界。
           LATE_START_POLICY="skip"
-          echo "SESSION=$SESSION" >> "$GITHUB_ENV"
+          echo "REQUESTED_SESSION=$REQUESTED_SESSION" >> "$GITHUB_ENV"
+          echo "REQUESTED_TRADE_DATE=$REQUESTED_TRADE_DATE" >> "$GITHUB_ENV"
+          echo "TRIGGER_SOURCE=$TRIGGER_SOURCE" >> "$GITHUB_ENV"
           echo "MAX_CYCLES=$MAX_CYCLES" >> "$GITHUB_ENV"
           echo "LATE_START_POLICY=$LATE_START_POLICY" >> "$GITHUB_ENV"
-          echo "监控时段: $SESSION；测试轮数: $MAX_CYCLES；迟到策略: $LATE_START_POLICY"
+          echo "请求时段: $REQUESTED_SESSION；目标交易日: $REQUESTED_TRADE_DATE；触发源: $TRIGGER_SOURCE"
+
+      - name: 校验交易日、目标时段与安全补跑窗口
+        id: session_guard
+        shell: bash
+        env:
+          EVENT_SCHEDULE: ${{ github.event.schedule }}
+        run: |
+          set -euo pipefail
+          python3 scripts/intraday_slot_guard.py \
+            --event-name "$GITHUB_EVENT_NAME" \
+            --event-schedule "${EVENT_SCHEDULE:-}" \
+            --requested-session "$REQUESTED_SESSION" \
+            --requested-trade-date "$REQUESTED_TRADE_DATE" \
+            --trigger-source "$TRIGGER_SOURCE" \
+            --report reports/intraday_slot_guard.json \
+            --github-output "$GITHUB_OUTPUT"
+
+      - name: 恢复交易日与时段幂等占位
+        id: session_claim
+        if: steps.session_guard.outputs.should_run == 'true'
+        continue-on-error: true
+        uses: actions/cache/restore@v4
+        with:
+          path: data/scheduler/claims/${{ steps.session_guard.outputs.claim_key }}.json
+          key: intraday-session-claim-${{ steps.session_guard.outputs.claim_key }}
+
+      - name: 确认唯一有效盘中任务
+        id: execution_gate
+        if: always()
+        shell: bash
+        env:
+          GUARD_SHOULD_RUN: ${{ steps.session_guard.outputs.should_run }}
+          GUARD_SKIP_REASON: ${{ steps.session_guard.outputs.skip_reason }}
+          CLAIM_KEY: ${{ steps.session_guard.outputs.claim_key }}
+          CLAIM_CACHE_HIT: ${{ steps.session_claim.outputs.cache-hit }}
+          CLAIM_RESTORE_OUTCOME: ${{ steps.session_claim.outcome }}
+          RESOLVED_SESSION: ${{ steps.session_guard.outputs.session }}
+          RESOLVED_TRADE_DATE: ${{ steps.session_guard.outputs.trade_date }}
+        run: |
+          set -euo pipefail
+          EXECUTE=false
+          REASON="${GUARD_SKIP_REASON:-guard_unavailable}"
+          if [ "$GUARD_SHOULD_RUN" = "true" ]; then
+            if [ "$CLAIM_RESTORE_OUTCOME" != "success" ]; then
+              REASON="claim_restore_failed"
+            elif [ "$CLAIM_CACHE_HIT" = "true" ]; then
+              REASON="duplicate_session_claim"
+            else
+              EXECUTE=true
+              REASON=""
+              CLAIM_PATH="data/scheduler/claims/${CLAIM_KEY}.json"
+              python3 - "$CLAIM_PATH" "$RESOLVED_TRADE_DATE" "$RESOLVED_SESSION" "$TRIGGER_SOURCE" <<'PY'
+          import json
+          import sys
+          from datetime import datetime
+          from pathlib import Path
+          from zoneinfo import ZoneInfo
+
+          path, trade_date, session, source = sys.argv[1:5]
+          target = Path(path)
+          target.parent.mkdir(parents=True, exist_ok=True)
+          payload = {
+              "schema_version": 1,
+              "trade_date": trade_date,
+              "session": session,
+              "session_key": f"{trade_date}:{session}",
+              "claimed_at": datetime.now(ZoneInfo("Asia/Shanghai")).isoformat(timespec="seconds"),
+              "run_id": "${{ github.run_id }}",
+              "run_attempt": "${{ github.run_attempt }}",
+              "trigger_source": source,
+          }
+          target.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+          PY
+            fi
+          fi
+          echo "execute=$EXECUTE" >> "$GITHUB_OUTPUT"
+          echo "reason=$REASON" >> "$GITHUB_OUTPUT"
+          echo "SESSION=$RESOLVED_SESSION" >> "$GITHUB_ENV"
+          echo "TRADE_DATE=$RESOLVED_TRADE_DATE" >> "$GITHUB_ENV"
+          echo "盘中入口判定: execute=$EXECUTE；reason=${REASON:-none}；trade_date=$RESOLVED_TRADE_DATE；session=$RESOLVED_SESSION"
+
+      - name: 保存交易日与时段幂等占位
+        if: steps.execution_gate.outputs.execute == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: data/scheduler/claims/${{ steps.session_guard.outputs.claim_key }}.json
+          key: intraday-session-claim-${{ steps.session_guard.outputs.claim_key }}
+
+      - name: 记录调度安全跳过
+        if: steps.execution_gate.outputs.execute != 'true'
+        shell: bash
+        run: |
+          {
+            echo "# 分钟级盘中模拟监控"
+            echo
+            echo "本轮在交易日、时段、迟到或幂等入口被安全拦截；未恢复私密状态、未拉取行情、未生成买卖建议。"
+            echo
+            echo "- 交易日：${{ steps.session_guard.outputs.trade_date }}"
+            echo "- 时段：${{ steps.session_guard.outputs.session }}"
+            echo "- 触发源：${{ steps.session_guard.outputs.trigger_source }}"
+            echo "- 状态：${{ steps.execution_gate.outputs.reason }}"
+            echo "- 安全性：未补造盘中信号、未下单"
+          } > reports/intraday_session.md
 
       - name: 检查 A股/港股交易日
         id: market_calendar
+        if: steps.execution_gate.outputs.execute == 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -72,7 +205,7 @@ jobs:
             --report reports/market_session_gate.json
 
       - name: 记录休市安全跳过
-        if: steps.market_calendar.outputs.should_run != 'true'
+        if: steps.execution_gate.outputs.execute == 'true' && steps.market_calendar.outputs.should_run != 'true'
         shell: bash
         run: |
           {
@@ -573,7 +706,7 @@ jobs:
         # 定时与手动盘中运行都必须留下同一份严格契约证据；即使前序步骤
         # 失败，只要任务未取消也要执行并明确报出缺失/不完整状态。双市场
         # 休市时保留步骤级审计，但不得把“未运行”误判成集成故障。
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.execution_gate.outputs.execute == 'true' }}
         shell: bash
         env:
           MARKET_CALENDAR_SHOULD_RUN: ${{ steps.market_calendar.outputs.should_run }}
@@ -687,9 +820,32 @@ jobs:
           path: |
             reports/intraday_session.md
             reports/intraday_state_missing.md
+            reports/intraday_slot_guard.json
             reports/market_session_gate.json
             reports/market_scan_watchdog_*.json
             reports/longbridge_oauth_*.json
+            data/scheduler/claims/*.json
             data/intraday/session_state.json
           if-no-files-found: warn
           retention-days: 30
+
+      - name: 强制暴露盘中入口调度故障
+        if: ${{ always() && steps.execution_gate.outputs.execute != 'true' }}
+        shell: bash
+        env:
+          ENTRY_REASON: ${{ steps.execution_gate.outputs.reason }}
+        run: |
+          set -euo pipefail
+          case "$ENTRY_REASON" in
+            claim_restore_failed)
+              echo "::error::盘中 trade_date + session 幂等占位无法读取；已 fail-closed 停止本轮，未生成交易信号"
+              exit 1
+              ;;
+            session_too_late|stale_trade_date)
+              echo "::error::盘中任务已过安全执行日期或窗口；本轮未补造交易信号，等待顶层 Supervisor SYSTEM 告警"
+              exit 1
+              ;;
+            *)
+              echo "ℹ️ 盘中入口安全跳过：${ENTRY_REASON:-unknown}"
+              ;;
+          esac
