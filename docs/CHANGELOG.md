@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 > For user-friendly release highlights, see the [GitHub Releases](https://github.com/ZhuLinsen/daily_stock_analysis/releases) page.
 
 ## [Unreleased]
+- [修复] 扫描 watchdog 下载 Actions 产物时不再跨重定向转发 GitHub 鉴权头，避免签名存储地址返回401；有界重试、当前时段校验和原子热加载保留，上游扫描失败诊断包含 run ID 和结论。
+- [修复] 千问与 DeepSeek 独立复核改为每批最多4只、同模型有限重试及整轮预算控制，记录实际请求诊断；鉴权、格式、截断、缺失或重复代码仍失败关闭，任何未完成批次均不能作为完整复核或进入受限2.5%档，既有行情、价格区、风险收益、仓位现金与人工确认门禁不变。
 - [修复] 新增独立顶层盘中 Supervisor：cron-job.org 继续作为09:20/12:50主要精准触发源，GitHub 原生 schedule 作为辅助兜底；Supervisor 在安全窗口内自动补发缺失的上午/下午 `01`，过时、GitHub API 或 dispatch 故障只发去重可重试的 PushPlus SYSTEM 告警，绝不补造交易信号。`01` 新增 `trade_date + session` 不可变缓存占位和迟到前置门，三源重复触发只能有一个有效任务；原有 `01 -> 02` 扫描 watchdog 及全部行情、策略和人工确认安全门保持不变。
 - [测试] 覆盖外部 cron 上午/下午漏触发、GitHub schedule 严重迟到、三源重复、queued/running/completed、过时与非交易日、GitHub API/dispatch/PushPlus 故障、Supervisor 重复运行，以及既有 market-scan watchdog 双层容灾接线。
 - [改进] 全市场扫描在最终12只进入千问/DeepSeek复核前逐只补取可获得的基本面与事件/新闻证据，并结构化标明来源和缺口；仅当一方通过、另一方明确因非关键数据缺失观察且无任何reject/硬风险时，才强制以普通机会2.5%最低档进入人工复核，其余原有新鲜行情、买入区、止损、扣费后风险收益、现金和人工确认硬门禁保持不变。

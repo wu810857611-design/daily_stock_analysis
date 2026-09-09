@@ -10,6 +10,7 @@ import os
 import re
 import sys
 import tempfile
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, Mapping, Optional, Sequence
@@ -36,6 +37,11 @@ from src.services.market_scan_service import (  # noqa: E402
 DEFAULT_REPORT_PATH = Path("reports/market_scan.md")
 DEFAULT_RESULT_PATH = Path("reports/market_scan.json")
 DEFAULT_STATE_DIR = Path("data/market_scan")
+REVIEW_BATCH_SIZE = 4
+REVIEW_MAX_ATTEMPTS = 2
+REVIEW_REQUEST_TIMEOUT_SECONDS = 120.0
+REVIEW_TOTAL_TIMEOUT_SECONDS = 480.0
+REVIEW_RETRY_BACKOFF_SECONDS = 2.0
 
 Notifier = Callable[[str, str], Any]
 SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
@@ -304,13 +310,17 @@ def _json_object_from_text(text: str) -> Mapping[str, Any]:
 
 
 def build_litellm_reviewer(label: str) -> Optional[Callable[[Sequence[Mapping[str, Any]]], Any]]:
-    """Create one explicit single-model reviewer without any fallback route."""
+    """Review bounded batches, retrying transport errors with the same model."""
 
     settings = _reviewer_settings(label)
     if settings is None:
         return None
 
-    def review(candidates: Sequence[Mapping[str, Any]]) -> Mapping[str, Any]:
+    diagnostics: Dict[str, Any] = {}
+
+    def request_batch(
+        candidates: Sequence[Mapping[str, Any]], timeout_seconds: float
+    ) -> Mapping[str, Any]:
         import litellm
 
         user_prompt = json.dumps(
@@ -329,8 +339,9 @@ def build_litellm_reviewer(label: str) -> Optional[Callable[[Sequence[Mapping[st
                 {"role": "user", "content": user_prompt},
             ],
             "temperature": 0.1,
-            "timeout": 120,
-            "num_retries": 1,
+            "timeout": timeout_seconds,
+            # Retry here so per-request retries cannot multiply the total budget.
+            "num_retries": 0,
             "response_format": {"type": "json_object"},
             "stream": False,
         }
@@ -371,9 +382,97 @@ def build_litellm_reviewer(label: str) -> Optional[Callable[[Sequence[Mapping[st
             content = message.get("content")
         if not str(content or "").strip():
             raise ValueError(f"{label} reviewer returned empty content")
-        return _json_object_from_text(str(content or ""))
+        payload = _json_object_from_text(str(content or ""))
+        reviews = payload.get("reviews")
+        expected_codes = {str(candidate["code"]) for candidate in candidates}
+        if not isinstance(reviews, list) or any(
+            not isinstance(item, Mapping) for item in reviews
+        ):
+            raise ValueError(f"{label} reviewer returned invalid reviews")
+        codes = [str(item.get("code") or "") for item in reviews]
+        if len(codes) != len(expected_codes) or set(codes) != expected_codes:
+            raise ValueError(f"{label} reviewer returned missing, duplicate or unexpected codes")
+        if any(item.get("verdict") not in {"pass", "watch", "reject"} for item in reviews):
+            raise ValueError(f"{label} reviewer returned invalid verdict")
+        return payload
+
+    def review(candidates: Sequence[Mapping[str, Any]]) -> Mapping[str, Any]:
+        started = time.monotonic()
+        deadline = started + REVIEW_TOTAL_TIMEOUT_SECONDS
+        diagnostics.clear()
+        diagnostics.update({
+            "model": settings["model"],
+            "status": "running",
+            "candidate_count": len(candidates),
+            "completed_candidate_count": 0,
+            "requests": [],
+        })
+        merged: list[Mapping[str, Any]] = []
+        try:
+            codes = [str(candidate["code"]) for candidate in candidates]
+            if any(not code for code in codes) or len(set(codes)) != len(codes):
+                raise ValueError("review candidate codes must be nonempty and unique")
+            for offset in range(0, len(candidates), REVIEW_BATCH_SIZE):
+                batch = candidates[offset:offset + REVIEW_BATCH_SIZE]
+                for attempt in range(1, REVIEW_MAX_ATTEMPTS + 1):
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError(f"{label} reviewer total budget exhausted")
+                    record = {
+                        "batch": offset // REVIEW_BATCH_SIZE + 1,
+                        "attempt": attempt,
+                        "candidate_count": len(batch),
+                        "status": "running",
+                    }
+                    diagnostics["requests"].append(record)
+                    try:
+                        payload = request_batch(
+                            batch, min(REVIEW_REQUEST_TIMEOUT_SECONDS, remaining)
+                        )
+                    except Exception as exc:  # noqa: BLE001 - retry only transport failures.
+                        record.update(status="failed", error=type(exc).__name__)
+                        if not _transient_review_error(exc) or attempt == REVIEW_MAX_ATTEMPTS:
+                            raise
+                        remaining = deadline - time.monotonic()
+                        if remaining <= REVIEW_RETRY_BACKOFF_SECONDS:
+                            raise TimeoutError(f"{label} reviewer total budget exhausted") from exc
+                        time.sleep(REVIEW_RETRY_BACKOFF_SECONDS)
+                        continue
+                    # A late response never becomes a usable review, even if the
+                    # SDK exceeded its request timeout before returning.
+                    if time.monotonic() >= deadline:
+                        record.update(status="failed", error="total_budget_exhausted")
+                        raise TimeoutError(f"{label} reviewer total budget exhausted")
+                    record["status"] = "completed"
+                    merged.extend(payload["reviews"])
+                    diagnostics["completed_candidate_count"] = len(merged)
+                    break
+            diagnostics["status"] = "completed"
+            return {"reviews": merged}
+        except Exception as exc:
+            diagnostics.update(status="failed", error=type(exc).__name__)
+            # Never return a partial successful batch as a complete model vote.
+            raise
+        finally:
+            diagnostics["request_count"] = len(diagnostics["requests"])
+            diagnostics["elapsed_seconds"] = round(time.monotonic() - started, 3)
+
+    review.diagnostics = diagnostics
 
     return review
+
+
+def _transient_review_error(exc: Exception) -> bool:
+    """Retry availability failures, never authentication/schema/verdict failures."""
+    status = getattr(exc, "status_code", None)
+    return (
+        isinstance(exc, (TimeoutError, ConnectionError))
+        or status in {408, 429, 500, 502, 503, 504}
+        or type(exc).__name__ in {
+            "Timeout", "APITimeoutError", "APIConnectionError", "RateLimitError",
+            "ServiceUnavailableError", "InternalServerError",
+        }
+    )
 
 
 def _atomic_write_text(path: Path, content: str) -> None:

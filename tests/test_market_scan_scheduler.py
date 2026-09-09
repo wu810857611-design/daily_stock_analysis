@@ -8,7 +8,9 @@ import tarfile
 import zipfile
 from datetime import datetime
 from pathlib import Path
+from email.message import Message
 from typing import Any, Mapping
+from urllib import parse, request, response
 from zoneinfo import ZoneInfo
 
 import yaml
@@ -22,6 +24,7 @@ from scripts.market_scan_slot_guard import (
     resolve_slot,
 )
 from scripts.market_scan_watchdog import (
+    GitHubActionsClient,
     _read_market_scan_latest_from_artifact,
     _validate_synced_market_scan,
     existing_run_covers_slot,
@@ -31,6 +34,108 @@ from scripts.market_scan_watchdog import (
 
 TZ = ZoneInfo("Asia/Shanghai")
 ROOT = Path(__file__).resolve().parents[1]
+
+
+@pytest.mark.parametrize("expired_first_url", [False, True])
+def test_watchdog_real_redirect_handler_does_not_forward_github_auth(
+    tmp_path: Path, expired_first_url: bool,
+) -> None:
+    """Exercise urllib's actual 302 handler, artifact decoding and atomic sync."""
+    now = datetime(2026, 9, 9, 10, 55, tzinfo=TZ)
+    payload = {
+        "generated_at": "2026-09-09T10:43:08+08:00",
+        "simulation_only": True,
+        "auto_order_enabled": False,
+        "human_confirmation_required": True,
+        "scheduler": {"slot": "morning"},
+        "candidates": [],
+    }
+    archive = _market_scan_artifact(payload)
+    signed_url_count = 0
+    storage_calls = []
+
+    class OfflineHTTPS(request.HTTPSHandler):
+        def https_open(self, req):
+            nonlocal signed_url_count
+            url = parse.urlsplit(req.full_url)
+            headers = Message()
+            status = 200
+            if url.hostname == "api.github.com":
+                assert req.get_header("Authorization") == "Bearer offline-secret"
+                if url.path.endswith("/runs"):
+                    body = json.dumps({"workflow_runs": [{
+                        "id": 88, "created_at": "2026-09-09T02:42:00Z",
+                        "status": "completed", "conclusion": "success",
+                    }]}).encode()
+                elif url.path.endswith("/artifacts"):
+                    body = json.dumps({"artifacts": [{
+                        "id": 99, "name": "market-scan-state", "expired": False,
+                    }]}).encode()
+                else:
+                    assert url.path.endswith("/artifacts/99/zip")
+                    signed_url_count += 1
+                    headers["Location"] = (
+                        "https://storage.example/artifact.zip?sig=a%2Fb%2Bc"
+                        f"&generation={signed_url_count}"
+                    )
+                    status, body = 302, b""
+            else:
+                assert url.hostname == "storage.example"
+                assert not req.has_header("Authorization")
+                assert "sig=a%2Fb%2Bc" in url.query
+                storage_calls.append(req.full_url)
+                if expired_first_url and len(storage_calls) == 1:
+                    status, body = 401, b"expired signed URL"
+                else:
+                    body = archive
+            result = response.addinfourl(io.BytesIO(body), headers, req.full_url, status)
+            result.msg = {200: "OK", 302: "Found", 401: "Unauthorized"}[status]
+            return result
+
+    client = GitHubActionsClient(
+        repo="example/repo", token="offline-secret",
+        opener=request.build_opener(OfflineHTTPS()).open,
+    )
+    target = tmp_path / "latest.json"
+    result = run_watchdog(
+        slot="morning", now_fn=lambda: now, sleep_fn=lambda _seconds: None,
+        client=client, workflow="02-market-scan.yml", ref="main",
+        sync_latest_path=target, sync_timeout_seconds=15,
+    )
+    assert result["sync"]["status"] == "synced"
+    assert result["sync"]["attempts"] == (2 if expired_first_url else 1)
+    assert signed_url_count == len(storage_calls) == result["sync"]["attempts"]
+    assert json.loads(target.read_text()) == payload
+    assert result["sync"]["content_fingerprint"]
+    assert "offline-secret" not in json.dumps(result)
+
+
+def test_watchdog_timeout_reports_upstream_failure_and_keeps_previous_file(tmp_path: Path) -> None:
+    calls = []
+
+    class Client:
+        def recent_runs(self, *_args):
+            calls.append("query")
+            return [{
+                "id": 88, "created_at": "2026-09-09T06:42:00Z",
+                "status": "in_progress" if len(calls) == 1 else "completed",
+                "conclusion": None if len(calls) == 1 else "failure",
+            }]
+
+        def dispatch(self, *_args):
+            pytest.fail("already running scan must not be dispatched")
+
+    target = tmp_path / "latest.json"
+    target.write_text("previous validated snapshot")
+    result = run_watchdog(
+        slot="afternoon", now_fn=lambda: datetime(2026, 9, 9, 14, 50, tzinfo=TZ),
+        sleep_fn=lambda _seconds: pytest.fail("zero-budget sync must not sleep"),
+        client=Client(), workflow="02-market-scan.yml", ref="main",
+        sync_latest_path=target, sync_timeout_seconds=0,
+    )
+    assert result["sync"]["status"] == "timeout"
+    assert result["sync"]["error"] == "market_scan_run_failed:failure:run=88"
+    assert target.read_text() == "previous validated snapshot"
 
 
 def _market_scan_artifact(payload: Mapping[str, Any], *, member_name: str = "data/market_scan/latest.json") -> bytes:
