@@ -17,6 +17,7 @@ import pytest
 import yaml
 
 from scripts import market_scan_reviewer_smoke
+from scripts import market_scan
 from scripts.market_scan import (
     MARKET_SCAN_REVIEW_SYSTEM_PROMPT,
     build_litellm_reviewer,
@@ -1719,7 +1720,7 @@ def test_structured_reviewers_disable_thinking_and_avoid_json_truncation(
     assert deepseek_kwargs["max_tokens"] == 12_000
     assert qwen_kwargs["response_format"] == {"type": "json_object"}
     assert deepseek_kwargs["response_format"] == {"type": "json_object"}
-    assert qwen_kwargs["num_retries"] == deepseek_kwargs["num_retries"] == 1
+    assert qwen_kwargs["num_retries"] == deepseek_kwargs["num_retries"] == 0
 
 
 @pytest.mark.parametrize(
@@ -1799,3 +1800,149 @@ def test_reviewer_smoke_is_isolated_from_scan_state_and_notifications(
     assert result["notification_sent"] is False
     assert result["auto_order_enabled"] is False
     assert set(result["checks"]) == {"qwen", "deepseek"}
+
+
+def _install_review_completion(monkeypatch: Any, completion: Any) -> None:
+    monkeypatch.setitem(sys.modules, "litellm", SimpleNamespace(completion=completion))
+    monkeypatch.setenv("MARKET_SCAN_QWEN_MODEL", "test-qwen")
+    monkeypatch.setenv("LLM_DASHSCOPE_API_KEY", "offline-qwen-secret")
+    monkeypatch.setenv("MARKET_SCAN_DEEPSEEK_MODEL", "test-deepseek")
+    monkeypatch.setenv("LLM_DEEPSEEK_API_KEY", "offline-deepseek-secret")
+    monkeypatch.setattr(market_scan.time, "sleep", lambda _seconds: None)
+
+
+def _review_response(batch: Any, *, verdict: str = "pass") -> Any:
+    return {"choices": [{"finish_reason": "stop", "message": {"content": json.dumps({
+        "reviews": [{
+            "code": item["code"], "verdict": verdict, "confidence": 0.9,
+            "hard_risk": verdict == "reject", "watch_reason_code": "passed",
+        } for item in batch],
+    })}}]}
+
+
+@pytest.mark.parametrize("transient_status", [None, 429, 503])
+def test_reviewer_small_batches_recover_same_model_and_keep_both_votes(
+    monkeypatch: Any, transient_status: Any,
+) -> None:
+    calls = []
+    candidates = [{"code": str(600001 + i), "evidence": {"source": "fixture"}} for i in range(12)]
+
+    def completion(**kwargs):
+        batch = json.loads(kwargs["messages"][1]["content"])["candidates"]
+        calls.append((kwargs, batch))
+        if len(calls) == 1:
+            exc = TimeoutError("temporary outage") if transient_status is None else RuntimeError("busy")
+            exc.status_code = transient_status
+            raise exc
+        return _review_response(batch, verdict="reject" if batch[0]["code"] == "600001" else "pass")
+
+    _install_review_completion(monkeypatch, completion)
+    qwen, deepseek = build_litellm_reviewer("qwen"), build_litellm_reviewer("deepseek")
+    qwen_result, deepseek_result = qwen(candidates), deepseek(candidates)
+    assert len(calls) == 7  # Three batches per model, plus one Qwen retry.
+    assert [len(batch) for _, batch in calls] == [4] * 7
+    assert all(kwargs["num_retries"] == 0 for kwargs, _ in calls)
+    assert all(0 < kwargs["timeout"] <= 120 for kwargs, _ in calls)
+    assert [kwargs["model"] for kwargs, _ in calls[:4]] == ["openai/test-qwen"] * 4
+    assert [kwargs["model"] for kwargs, _ in calls[4:]] == ["deepseek/test-deepseek"] * 3
+    for result in (qwen_result, deepseek_result):
+        assert [item["code"] for item in result["reviews"]] == [item["code"] for item in candidates]
+        assert result["reviews"][0]["verdict"] == "reject"
+        assert result["reviews"][0]["hard_risk"] is True
+    assert calls[0][1] == calls[1][1] == candidates[:4]
+    assert qwen.diagnostics["request_count"] == 4
+    assert qwen.diagnostics["completed_candidate_count"] == 12
+    assert "offline-qwen-secret" not in json.dumps(qwen.diagnostics)
+
+
+def test_reviewer_timeout_exhaustion_keeps_scan_failed_with_independent_sibling(
+    monkeypatch: Any, tmp_path: Path,
+) -> None:
+    calls = []
+
+    def completion(**kwargs):
+        calls.append(kwargs["model"])
+        if kwargs["model"] == "openai/test-qwen":
+            raise TimeoutError("provider unavailable")
+        batch = json.loads(kwargs["messages"][1]["content"])["candidates"]
+        return _review_response(batch)
+
+    _install_review_completion(monkeypatch, completion)
+    result = _service(
+        tmp_path, qwen=build_litellm_reviewer("qwen"),
+        deepseek=build_litellm_reviewer("deepseek"),
+    ).run()
+    assert calls.count("openai/test-qwen") == 2
+    assert "deepseek/test-deepseek" in calls
+    assert result["safe_to_push"] is False
+    assert result["operational_status"] == "failed"
+    assert result["review_errors"]["qwen"] == "qwen_review_failed:TimeoutError"
+    assert not any(c["eligible_for_intraday_review"] for c in result["candidates"])
+    assert not any(c["conditional_review"] for c in result["candidates"])
+    assert result["diagnostics"]["reviewer_requests"]["qwen"]["request_count"] == 2
+
+
+def test_reviewer_does_not_return_partial_batches_or_retry_reject(monkeypatch: Any) -> None:
+    calls = []
+
+    def completion(**kwargs):
+        batch = json.loads(kwargs["messages"][1]["content"])["candidates"]
+        calls.append([item["code"] for item in batch])
+        if len(calls) > 1:
+            raise TimeoutError("second batch unavailable")
+        return _review_response(batch, verdict="reject")
+
+    _install_review_completion(monkeypatch, completion)
+    reviewer = build_litellm_reviewer("qwen")
+    with pytest.raises(TimeoutError):
+        reviewer([{"code": str(600001 + i)} for i in range(8)])
+    assert len(calls) == 3
+    assert calls[0] != calls[1] == calls[2]
+    assert reviewer.diagnostics["status"] == "failed"
+    assert reviewer.diagnostics["completed_candidate_count"] == 4
+
+
+@pytest.mark.parametrize("status", [400, 401, 403])
+def test_reviewer_fatal_api_errors_are_not_retried(monkeypatch: Any, status: int) -> None:
+    def completion(**_kwargs):
+        exc = RuntimeError("configuration or authorization failure")
+        exc.status_code = status
+        raise exc
+
+    _install_review_completion(monkeypatch, completion)
+    reviewer = build_litellm_reviewer("qwen")
+    with pytest.raises(RuntimeError):
+        reviewer([{"code": "600001"}])
+    assert reviewer.diagnostics["request_count"] == 1
+
+
+@pytest.mark.parametrize("codes", [["600001"], ["600001", "600001"], ["600001", "600999"]])
+def test_reviewer_missing_duplicate_or_foreign_codes_fail_closed(monkeypatch: Any, codes: list) -> None:
+    _install_review_completion(monkeypatch, lambda **_kwargs: _review_response([{"code": c} for c in codes]))
+    reviewer = build_litellm_reviewer("qwen")
+    with pytest.raises(ValueError, match="missing, duplicate or unexpected"):
+        reviewer([{"code": "600001"}, {"code": "600002"}])
+    assert reviewer.diagnostics["request_count"] == 1
+
+
+def test_reviewer_total_deadline_rejects_late_valid_response(monkeypatch: Any) -> None:
+    clock = [0.0]
+    timeouts = []
+
+    def completion(**kwargs):
+        timeouts.append(kwargs["timeout"])
+        clock[0] += 3
+        if len(timeouts) == 1:
+            raise TimeoutError("temporary timeout")
+        return _review_response([{"code": "600001"}])
+
+    _install_review_completion(monkeypatch, completion)
+    monkeypatch.setattr(market_scan.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(market_scan.time, "sleep", lambda seconds: clock.__setitem__(0, clock[0] + seconds))
+    monkeypatch.setattr(market_scan, "REVIEW_TOTAL_TIMEOUT_SECONDS", 6)
+    reviewer = build_litellm_reviewer("qwen")
+    with pytest.raises(TimeoutError, match="total budget exhausted"):
+        reviewer([{"code": "600001"}])
+    assert timeouts == [6, 1]
+    assert reviewer.diagnostics["status"] == "failed"
+    assert reviewer.diagnostics["completed_candidate_count"] == 0

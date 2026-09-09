@@ -2045,6 +2045,17 @@ class MarketScanService:
                     "qwen": 1 if ranked and self.qwen_reviewer is not None else 0,
                     "deepseek": 1 if ranked and self.deepseek_reviewer is not None else 0,
                 },
+                # llm_calls counts logical reviews; these are actual batch/retry
+                # requests, with no credentials, prompts or provider error bodies.
+                "reviewer_requests": {
+                    label: copy.deepcopy(dict(details))
+                    for label, reviewer in (
+                        ("qwen", self.qwen_reviewer),
+                        ("deepseek", self.deepseek_reviewer),
+                    )
+                    if isinstance(details := getattr(reviewer, "diagnostics", None), Mapping)
+                    and ranked
+                },
                 "buy_funnel": buy_funnel,
             },
             "candidates": candidates,

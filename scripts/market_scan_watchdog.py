@@ -124,7 +124,6 @@ class GitHubActionsClient:
     ) -> tuple[int, bytes]:
         headers = {
             "Accept": "application/vnd.github+json",
-            "Authorization": f"Bearer {self.token}",
             "X-GitHub-Api-Version": "2022-11-28",
             "User-Agent": "daily-stock-analysis/market-scan-watchdog",
         }
@@ -138,6 +137,10 @@ class GitHubActionsClient:
             headers=headers,
             method=method,
         )
+        # GitHub artifact downloads redirect to signed object-storage URLs.
+        # urllib copies ordinary headers across hosts; sending a GitHub bearer
+        # token there overrides the signed URL's authentication (Azure 401).
+        outgoing.add_unredirected_header("Authorization", f"Bearer {self.token}")
         try:
             with self.opener(outgoing, timeout=20) as response:
                 return int(getattr(response, "status", 200)), response.read()
@@ -370,6 +373,16 @@ def _sync_successful_slot_artifact(
                         }
                 except Exception as exc:  # noqa: BLE001
                     last_error = f"{type(exc).__name__}:{exc}:run={run_id}"
+            if runs and not successful_runs and all(
+                str(run.get("status") or "") == "completed" for run in runs
+            ):
+                failed = runs[0]
+                # A just-dispatched replacement can take time to appear in the
+                # API. Keep the bounded polling but report the actual failure.
+                last_error = (
+                    f"market_scan_run_failed:{failed.get('conclusion')}:"
+                    f"run={failed.get('id')}"
+                )
         except Exception as exc:  # noqa: BLE001 - retry bounded transient artifact state.
             last_error = f"{type(exc).__name__}:{exc}"
         if attempt < attempts:
