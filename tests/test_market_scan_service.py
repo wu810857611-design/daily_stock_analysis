@@ -40,6 +40,7 @@ from src.services.market_scan_service import (
     validate_trade_plan,
 )
 from src.services.position_sizing_policy import classify_opportunity
+from src.services.tencent_market_snapshot import load_fresh_hk_membership_snapshot
 
 
 NOW = datetime(2026, 7, 28, 14, 30, tzinfo=ZoneInfo("Asia/Shanghai"))
@@ -160,6 +161,7 @@ def _service(
     a_loader: Any = _a_snapshot,
     hk_loader: Any = _hk_snapshot,
     hk_all_loader: Any = None,
+    hk_membership_loader: Any = None,
     config_overrides: Mapping[str, Any] | None = None,
     clock: Any = None,
     research_loader: Any = None,
@@ -168,6 +170,7 @@ def _service(
         a_snapshot_loader=a_loader,
         hk_connect_snapshot_loader=hk_loader,
         hk_all_snapshot_loader=hk_all_loader,
+        hk_membership_snapshot_loader=hk_membership_loader,
         history_loader=history_loader,
         qwen_reviewer=qwen,
         deepseek_reviewer=deepseek,
@@ -429,6 +432,9 @@ def test_default_full_market_loaders_use_independent_fallbacks(monkeypatch: Any)
         "akshare",
         SimpleNamespace(
             stock_zh_a_spot_em=broken_a,
+            stock_zh_a_spot_tx=lambda: (_ for _ in ()).throw(
+                TimeoutError("tencent unavailable")
+            ),
             stock_zh_a_spot=sina_a,
             stock_hk_spot_em=broken_hk,
             stock_hk_spot=sina_hk,
@@ -444,6 +450,218 @@ def test_default_full_market_loaders_use_independent_fallbacks(monkeypatch: Any)
     assert hk_payload["source"] == "akshare.stock_hk_spot"
     assert a_payload["provider_errors"]
     assert hk_payload["provider_errors"]
+
+
+def test_default_a_snapshot_uses_tencent_before_sina(monkeypatch: Any) -> None:
+    calls: list[str] = []
+
+    def broken_eastmoney() -> Any:
+        calls.append("eastmoney")
+        raise TimeoutError("eastmoney unavailable")
+
+    def tencent() -> pd.DataFrame:
+        calls.append("tencent")
+        return pd.DataFrame(
+            [{"code": "sh600001", "name": "甲公司", "price": 10, "volume": 1, "amount": 1}]
+        )
+
+    monkeypatch.setitem(
+        sys.modules,
+        "akshare",
+        SimpleNamespace(
+            stock_zh_a_spot_em=broken_eastmoney,
+            stock_zh_a_spot_tx=tencent,
+            stock_zh_a_spot=lambda: calls.append("sina"),
+        ),
+    )
+
+    payload = default_a_snapshot_loader()
+
+    assert calls == ["eastmoney", "tencent"]
+    assert payload["source"] == "akshare.stock_zh_a_spot_tx"
+
+
+def _tencent_quote_line(
+    symbol: str,
+    *,
+    timestamp: str,
+    price: str = "100.00",
+    amount_ten_thousand: str = "3000.00",
+) -> str:
+    fields = [""] * 38
+    fields[1] = "腾讯控股"
+    fields[3] = price
+    fields[4] = "99.00"
+    fields[6] = "1000000"
+    fields[30] = timestamp
+    fields[32] = "1.01"
+    fields[37] = amount_ten_thousand
+    return f'v_{symbol}="{"~".join(fields)}";'
+
+
+def test_tencent_hk_membership_fallback_keeps_only_fresh_timestamped_quotes() -> None:
+    class FakeResponse:
+        def __init__(self, body: str):
+            self.body = body.encode("gbk")
+
+        def __enter__(self) -> "FakeResponse":
+            return self
+
+        def __exit__(self, *_args: Any) -> None:
+            return None
+
+        def read(self) -> bytes:
+            return self.body
+
+    body = "\n".join(
+        [
+            _tencent_quote_line("hk00700", timestamp="20260728142940"),
+            _tencent_quote_line("hk00981", timestamp="20260728142500"),
+        ]
+    )
+    calls: list[str] = []
+
+    def opener(outgoing: Any, *, timeout: float) -> FakeResponse:
+        calls.append(outgoing.full_url)
+        assert timeout == 8.0
+        return FakeResponse(body)
+
+    payload = load_fresh_hk_membership_snapshot(
+        ["HK00700", "HK00981"],
+        now=NOW,
+        opener=opener,
+        endpoints=("https://example.test/q=",),
+    )
+
+    assert len(calls) == 1
+    assert payload["requested_count"] == 2
+    assert payload["fresh_count"] == 1
+    assert payload["records"] == [
+        {
+            "code": "HK00700",
+            "name": "腾讯控股",
+            "price": 100.0,
+            "change_pct": 1.01,
+            "volume": 1_000_000.0,
+            "amount": 30_000_000.0,
+            "provider_timestamp": "2026-07-28T14:29:40+08:00",
+            "is_connect": True,
+        }
+    ]
+
+
+def test_tencent_hk_membership_fallback_uses_alternate_route() -> None:
+    class FakeResponse:
+        def __enter__(self) -> "FakeResponse":
+            return self
+
+        def __exit__(self, *_args: Any) -> None:
+            return None
+
+        def read(self) -> bytes:
+            return _tencent_quote_line(
+                "hk00700", timestamp="20260728142940"
+            ).encode("gbk")
+
+    def opener(outgoing: Any, *, timeout: float) -> FakeResponse:
+        assert timeout == 8.0
+        if outgoing.full_url.startswith("https://primary.test"):
+            raise TimeoutError("primary unavailable")
+        return FakeResponse()
+
+    payload = load_fresh_hk_membership_snapshot(
+        ["HK00700"],
+        now=NOW,
+        opener=opener,
+        endpoints=("https://primary.test/q=", "https://alternate.test/q="),
+    )
+
+    assert payload["fresh_count"] == 1
+    assert payload["provider_errors"] == [
+        "primary:TimeoutError:primary unavailable"
+    ]
+    assert payload["route_stats"][-1] == {
+        "route": "alternate",
+        "requested": 1,
+        "fresh": 1,
+        "failed": False,
+    }
+
+
+def test_tencent_hk_membership_fallback_rejects_all_stale_quotes() -> None:
+    class FakeResponse:
+        def __enter__(self) -> "FakeResponse":
+            return self
+
+        def __exit__(self, *_args: Any) -> None:
+            return None
+
+        def read(self) -> bytes:
+            return _tencent_quote_line(
+                "hk00700", timestamp="20260728142500"
+            ).encode("gbk")
+
+    with pytest.raises(RuntimeError, match="no fresh timestamped quotes"):
+        load_fresh_hk_membership_snapshot(
+            ["HK00700"],
+            now=NOW,
+            opener=lambda *_args, **_kwargs: FakeResponse(),
+            endpoints=("https://primary.test/q=",),
+        )
+
+
+def test_hk_cached_membership_uses_fresh_targeted_quotes_before_all_market(
+    tmp_path: Path,
+) -> None:
+    _service(tmp_path, qwen=ReviewRecorder(), deepseek=ReviewRecorder()).run_l1()
+    calls: list[str] = []
+
+    def broken_connect_loader() -> Any:
+        raise TimeoutError("connect endpoint unavailable")
+
+    def membership_loader(codes: Sequence[str]) -> Mapping[str, Any]:
+        calls.append("membership")
+        assert set(codes) == {"HK00700", "HK00981"}
+        return {
+            "source": "tencent.hk_membership_batch",
+            "as_of": (NOW + timedelta(hours=1)).isoformat(),
+            "is_connect_universe": True,
+            "requested_count": 2,
+            "fresh_count": 1,
+            "route_stats": [{"route": "primary", "requested": 2, "fresh": 1}],
+            "records": [
+                {
+                    "code": "HK00700",
+                    "name": "腾讯控股",
+                    "price": 101,
+                    "change_pct": 1,
+                    "volume": 1_000,
+                    "amount": 1_000,
+                }
+            ],
+        }
+
+    def all_hk_loader() -> Any:
+        calls.append("all_hk")
+        raise AssertionError("targeted membership quotes should win")
+
+    result = _service(
+        tmp_path,
+        qwen=ReviewRecorder(),
+        deepseek=ReviewRecorder(),
+        hk_loader=broken_connect_loader,
+        hk_membership_loader=membership_loader,
+        hk_all_loader=all_hk_loader,
+        clock=lambda: NOW + timedelta(hours=1),
+        config_overrides={"hk_cache_max_age_hours": 0.1},
+    ).run_l1()
+
+    assert calls == ["membership"]
+    assert result.hk_safe_halt is False
+    assert result.diagnostics["hk_snapshot_source"] == "tencent.hk_membership_batch"
+    assert result.diagnostics["hk_quote_requested_count"] == 2
+    assert result.diagnostics["hk_quote_fresh_count"] == 1
+    assert {item["code"] for item in result.hk_candidates} == {"HK00700"}
 
 
 def test_snapshot_retry_uses_bounded_backoff_before_recovery(tmp_path: Path) -> None:

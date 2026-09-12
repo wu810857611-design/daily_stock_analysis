@@ -45,6 +45,7 @@ INITIAL_POSITION_FRACTION = 0.025
 HK_MEMBERSHIP_WARNING_THRESHOLDS = (168.0, 72.0, 24.0)
 
 SnapshotLoader = Callable[[], Any]
+MembershipSnapshotLoader = Callable[[Sequence[str]], Any]
 HistoryLoader = Callable[[str, int], Any]
 Reviewer = Callable[[Sequence[Mapping[str, Any]]], Any]
 ResearchEvidenceLoader = Callable[[Mapping[str, Any]], Any]
@@ -1015,6 +1016,7 @@ class MarketScanService:
         deepseek_reviewer: Optional[Reviewer],
         research_evidence_loader: Optional[ResearchEvidenceLoader] = None,
         hk_all_snapshot_loader: Optional[SnapshotLoader] = None,
+        hk_membership_snapshot_loader: Optional[MembershipSnapshotLoader] = None,
         config: Optional[MarketScanConfig] = None,
         clock: Clock = _now_shanghai,
         sleeper: Sleeper = time.sleep,
@@ -1022,6 +1024,7 @@ class MarketScanService:
         self.a_snapshot_loader = a_snapshot_loader
         self.hk_connect_snapshot_loader = hk_connect_snapshot_loader
         self.hk_all_snapshot_loader = hk_all_snapshot_loader
+        self.hk_membership_snapshot_loader = hk_membership_snapshot_loader
         self.history_loader = history_loader
         self.qwen_reviewer = qwen_reviewer
         self.deepseek_reviewer = deepseek_reviewer
@@ -1108,6 +1111,9 @@ class MarketScanService:
                 "hk_snapshot_fetched_at": hk_metadata.get("fetched_at") or "",
                 "a_snapshot_provider_errors": a_metadata.get("provider_errors") or [],
                 "hk_snapshot_provider_errors": hk_metadata.get("provider_errors") or [],
+                "hk_quote_requested_count": hk_metadata.get("requested_count"),
+                "hk_quote_fresh_count": hk_metadata.get("fresh_count"),
+                "hk_quote_route_stats": hk_metadata.get("route_stats") or [],
                 "hk_membership_age_hours": hk_metadata.get("membership_age_hours"),
                 "hk_membership_source": hk_metadata.get("membership_source") or "",
                 "hk_membership_remaining_hours": hk_metadata.get(
@@ -1248,6 +1254,78 @@ class MarketScanService:
                 provider_errors.append(f"connect:{type(exc).__name__}:{exc}")
 
         membership = self._read_hk_membership_cache(now)
+        if membership is not None and self.hk_membership_snapshot_loader is not None:
+            membership_codes, membership_metadata = membership
+            for attempt in range(self.config.snapshot_retries):
+                if attempt:
+                    self._wait_before_snapshot_retry(attempt - 1)
+                try:
+                    raw = self.hk_membership_snapshot_loader(sorted(membership_codes))
+                    frame_raw, metadata = _coerce_snapshot_payload(raw, now=now)
+                    if not bool(metadata.get("is_connect_universe")):
+                        raise MarketScanError(
+                            "HK membership quote fallback lost membership provenance"
+                        )
+                    frame = _normalise_snapshot(frame_raw, market=MARKET_HK, now=now)
+                    frame = frame[frame["code"].isin(membership_codes)].copy()
+                    if frame.empty:
+                        raise MarketScanError(
+                            "HK membership quote fallback returned no fresh constituents"
+                        )
+                    frame["is_connect"] = True
+                    provider_errors.extend(
+                        str(item) for item in (metadata.get("provider_errors") or [])
+                    )
+                    quote_source = str(
+                        metadata.get("source") or "hk_membership_quote_provider"
+                    )
+                    cache_payload = {
+                        "schema_version": SCHEMA_VERSION,
+                        "saved_at": _iso_datetime(now),
+                        "as_of": metadata["as_of"],
+                        "fetched_at": metadata["fetched_at"],
+                        "membership_fetched_at": membership_metadata[
+                            "membership_fetched_at"
+                        ],
+                        "source": quote_source,
+                        "membership_source": membership_metadata[
+                            "membership_source"
+                        ],
+                        "provider_errors": provider_errors,
+                        "is_connect_universe": True,
+                        "membership_codes": sorted(membership_codes),
+                        "records": frame.to_dict(orient="records"),
+                    }
+                    _atomic_write_json(self.config.hk_cache_path, cache_payload)
+                    metadata.update(
+                        {
+                            "source": quote_source,
+                            "provider_errors": provider_errors,
+                            "membership_age_hours": membership_metadata[
+                                "membership_age_hours"
+                            ],
+                            "membership_source": membership_metadata[
+                                "membership_source"
+                            ],
+                            "membership_remaining_hours": membership_metadata[
+                                "membership_remaining_hours"
+                            ],
+                            "membership_warning_level": membership_metadata[
+                                "membership_warning_level"
+                            ],
+                            "membership_warning_threshold_hours": (
+                                membership_metadata[
+                                    "membership_warning_threshold_hours"
+                                ]
+                            ),
+                        }
+                    )
+                    return frame.reset_index(drop=True), metadata, False, ""
+                except Exception as exc:  # noqa: BLE001 - bounded provider fallback.
+                    provider_errors.append(
+                        f"membership_quotes:{type(exc).__name__}:{exc}"
+                    )
+
         if membership is not None and self.hk_all_snapshot_loader is not None:
             membership_codes, membership_metadata = membership
             for attempt in range(self.config.snapshot_retries):
@@ -2165,12 +2243,16 @@ class MarketScanService:
 
 
 def default_a_snapshot_loader() -> Mapping[str, Any]:
-    """Load a full A-share snapshot through independent AkShare routes."""
+    """Load a full A-share snapshot through three independent AkShare routes."""
 
     import akshare as ak
 
     provider_errors: List[str] = []
-    for provider_name in ("stock_zh_a_spot_em", "stock_zh_a_spot"):
+    for provider_name in (
+        "stock_zh_a_spot_em",
+        "stock_zh_a_spot_tx",
+        "stock_zh_a_spot",
+    ):
         try:
             frame = getattr(ak, provider_name)()
             if not isinstance(frame, pd.DataFrame) or frame.empty:
@@ -2222,6 +2304,18 @@ def default_hk_all_snapshot_loader() -> Mapping[str, Any]:
         except Exception as exc:  # noqa: BLE001 - explicit independent provider chain.
             provider_errors.append(f"{provider_name}:{type(exc).__name__}:{exc}")
     raise MarketScanError("; ".join(provider_errors) or "HK providers unavailable")
+
+
+def default_hk_membership_snapshot_loader(
+    symbols: Sequence[str],
+) -> Mapping[str, Any]:
+    """Load fresh Tencent quotes for a verified cached Connect membership."""
+
+    from src.services.tencent_market_snapshot import (
+        load_fresh_hk_membership_snapshot,
+    )
+
+    return load_fresh_hk_membership_snapshot(symbols)
 
 
 def default_history_loader(stock_code: str, lookback_days: int) -> Any:

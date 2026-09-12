@@ -563,7 +563,12 @@ def test_workflows_wire_active_watchdogs_and_slot_guard() -> None:
     assert "steps.market_calendar.outputs.should_run == 'true'" in intraday_text
     assert "market_scan_watchdog.py" in intraday_text
     assert "--sync-latest-path" in intraday_text
-    assert 'exit "$WATCHDOG_STATUS"' in intraday_text
+    assert "market_scan_subchain_status.py" in intraday_text
+    assert "market_scan_subchain_state.json" in intraday_text
+    assert "全市场买入子链已独立降级" in intraday_text
+    assert "全市场买入子链状态落盘或通知失败" in intraday_text
+    assert 'exit "$WATCHDOG_STATUS"' not in intraday_text
+    assert 'exit "$MONITOR_STATUS"' in intraday_text
 
     daily_text = (ROOT / ".github/workflows/00-daily-analysis.yml").read_text(
         encoding="utf-8"

@@ -305,6 +305,25 @@ def test_litellm_legacy_key_infers_runtime_model_for_smoke_config() -> None:
     assert _CapturingAnalyzer.configs[-1].litellm_model == "gemini/gemini-3.1-pro-preview"
 
 
+def test_litellm_deepseek_key_infers_v4_flash_for_smoke_config() -> None:
+    _CapturingAnalyzer.configs = []
+    service = GenerationBackendStatusService(
+        effective_map={
+            "GENERATION_BACKEND": "litellm",
+            "DEEPSEEK_API_KEY": "secret-key-value",
+        },
+        analyzer_factory=lambda config: _CapturingAnalyzer(config),
+    )
+
+    payload = service.smoke_test(mode="json")
+
+    assert payload["success"] is True
+    assert (
+        _CapturingAnalyzer.configs[-1].litellm_model
+        == "deepseek/deepseek-v4-flash"
+    )
+
+
 def test_litellm_validation_issues_are_not_available() -> None:
     service = GenerationBackendStatusService(
         effective_map={
