@@ -42,14 +42,14 @@ model_list:
       api_base: https://aihubmix.com/v1
 
   # --- DeepSeek 官方 API (原生 provider，自动解析 base_url) ---
-  - model_name: deepseek/deepseek-chat
+  - model_name: deepseek/deepseek-v4-flash
     litellm_params:
-      model: deepseek/deepseek-chat
+      model: deepseek/deepseek-v4-flash
       api_key: "os.environ/DEEPSEEK_API_KEY"
 
-  - model_name: deepseek/deepseek-reasoner
+  - model_name: deepseek/deepseek-v4-pro
     litellm_params:
-      model: deepseek/deepseek-reasoner
+      model: deepseek/deepseek-v4-pro
       api_key: "os.environ/DEEPSEEK_API_KEY"
 
   # --- Google Gemini (原生，多 Key 负载均衡) ---

@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 > For user-friendly release highlights, see the [GitHub Releases](https://github.com/ZhuLinsen/daily_stock_analysis/releases) page.
 
 ## [Unreleased]
+- [修复] 仅配置 DeepSeek 官方 API Key 时的隐式主模型从已过时的 `deepseek/deepseek-chat` 迁移到 `deepseek/deepseek-v4-flash`，并同步设置诊断与示例；显式指定的旧模型仍保持原值，市场扫描已配置的 `deepseek-v4-pro` 不受影响。
+- [修复] 全市场扫描的 A 股快照 fallback 扩为东财→腾讯→Sina；港股通成分接口失败时优先用仍有效的独立成员缓存批量获取带提供方时间戳且90秒内的新鲜腾讯报价，再尝试全港报价和最后良好快照。陈旧/缺时间戳行情仍被排除，成员缓存寿命不因报价刷新延长，A/H 跨市场隔离与全部建仓硬门禁保持不变。
+- [修复] 盘中 `01` 将扫描 watchdog/`02` 视为独立买入子链：子链失败会保留降级状态、影响范围及去重故障/恢复通知，但不再把已通过严格行情与 PushPlus 验收的分钟主监控误判为失败；候选热加载仍 fail-closed，所有交易安全门保持不变。
 - [修复] 扫描 watchdog 下载 Actions 产物时不再跨重定向转发 GitHub 鉴权头，避免签名存储地址返回401；有界重试、当前时段校验和原子热加载保留，上游扫描失败诊断包含 run ID 和结论。
 - [修复] 千问与 DeepSeek 独立复核改为每批最多4只、同模型有限重试及整轮预算控制，记录实际请求诊断；鉴权、格式、截断、缺失或重复代码仍失败关闭，任何未完成批次均不能作为完整复核或进入受限2.5%档，既有行情、价格区、风险收益、仓位现金与人工确认门禁不变。
 - [修复] 新增独立顶层盘中 Supervisor：cron-job.org 继续作为09:20/12:50主要精准触发源，GitHub 原生 schedule 作为辅助兜底；Supervisor 在安全窗口内自动补发缺失的上午/下午 `01`，过时、GitHub API 或 dispatch 故障只发去重可重试的 PushPlus SYSTEM 告警，绝不补造交易信号。`01` 新增 `trade_date + session` 不可变缓存占位和迟到前置门，三源重复触发只能有一个有效任务；原有 `01 -> 02` 扫描 watchdog 及全部行情、策略和人工确认安全门保持不变。

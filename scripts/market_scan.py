@@ -29,6 +29,7 @@ from src.services.market_scan_service import (  # noqa: E402
     default_a_snapshot_loader,
     default_history_loader,
     default_hk_all_snapshot_loader,
+    default_hk_membership_snapshot_loader,
     default_hk_connect_snapshot_loader,
     render_market_scan_markdown,
 )
@@ -962,6 +963,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         a_snapshot_loader=default_a_snapshot_loader,
         hk_connect_snapshot_loader=default_hk_connect_snapshot_loader,
         hk_all_snapshot_loader=default_hk_all_snapshot_loader,
+        hk_membership_snapshot_loader=default_hk_membership_snapshot_loader,
         history_loader=default_history_loader,
         qwen_reviewer=build_litellm_reviewer("qwen"),
         deepseek_reviewer=build_litellm_reviewer("deepseek"),

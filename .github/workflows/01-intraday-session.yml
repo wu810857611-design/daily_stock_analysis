@@ -677,14 +677,26 @@ jobs:
             wait "$WATCHDOG_PID"
             WATCHDOG_STATUS=$?
             set -e
+            set +e
+            python3 scripts/market_scan_subchain_status.py \
+              --watchdog-report "reports/market_scan_watchdog_${SESSION}.json" \
+              --state data/intraday/market_scan_subchain_state.json \
+              --output "reports/market_scan_subchain_${SESSION}.json" \
+              --watchdog-exit-code "$WATCHDOG_STATUS" \
+              --session "$SESSION"
+            SUBCHAIN_REPORT_STATUS=$?
+            set -e
+            if [ "$SUBCHAIN_REPORT_STATUS" -ne 0 ]; then
+              echo "::warning::全市场买入子链状态落盘或通知失败；不改变盘中主监控结论"
+            fi
             if [ "$WATCHDOG_STATUS" -ne 0 ]; then
-              echo "::error::全市场扫描漏跑兜底执行失败；盘中监控证据仍保留并继续严格验收"
+              echo "::warning::全市场买入子链已独立降级；盘中主监控及严格验收状态不受影响"
             fi
           fi
           if [ "$MONITOR_STATUS" -ne 0 ]; then
             exit "$MONITOR_STATUS"
           fi
-          exit "$WATCHDOG_STATUS"
+          exit 0
 
       - name: 保存 Longbridge OAuth 刷新状态
         if: ${{ always() && steps.market_calendar.outputs.should_run == 'true' }}
@@ -823,6 +835,7 @@ jobs:
             reports/intraday_slot_guard.json
             reports/market_session_gate.json
             reports/market_scan_watchdog_*.json
+            reports/market_scan_subchain_*.json
             reports/longbridge_oauth_*.json
             data/scheduler/claims/*.json
             data/intraday/session_state.json

@@ -46,6 +46,13 @@ class SystemConfigServiceTestCase(unittest.TestCase):
         self.manager = ConfigManager(env_path=self.env_path)
         self.service = SystemConfigService(manager=self.manager)
 
+    def test_deepseek_key_infers_v4_flash_for_setup(self) -> None:
+        inferred = SystemConfigService._infer_setup_legacy_primary_model(
+            {"DEEPSEEK_API_KEY": "secret-key-value"}
+        )
+
+        self.assertEqual(inferred, "deepseek/deepseek-v4-flash")
+
     def tearDown(self) -> None:
         Config.reset_instance()
         os.environ.pop("ENV_FILE", None)
