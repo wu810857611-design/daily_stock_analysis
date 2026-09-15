@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 > For user-friendly release highlights, see the [GitHub Releases](https://github.com/ZhuLinsen/daily_stock_analysis/releases) page.
 
 ## [Unreleased]
+- [修复] 全市场扫描双模型复核对超时、限流、连接、临时服务错误、LiteLLM响应转换及结构化输出异常按失败批次有限重试，并允许同提供方配置列表中的一个备用模型接力；研究数据缺口与模型技术故障分开记账，任一批次最终不完整仍失败关闭。
+- [测试] 覆盖双模型完整复核、单模型超时、候选代码缺失/重复、非法JSON、单批失败后恢复、持续失败、同通道备用模型及研究数据缺失但复核完整等场景。
 - [修复] 仅配置 DeepSeek 官方 API Key 时的隐式主模型从已过时的 `deepseek/deepseek-chat` 迁移到 `deepseek/deepseek-v4-flash`，并同步设置诊断与示例；显式指定的旧模型仍保持原值，市场扫描已配置的 `deepseek-v4-pro` 不受影响。
 - [修复] 全市场扫描的 A 股快照 fallback 扩为东财→腾讯→Sina；港股通成分接口失败时优先用仍有效的独立成员缓存批量获取带提供方时间戳且90秒内的新鲜腾讯报价，再尝试全港报价和最后良好快照。陈旧/缺时间戳行情仍被排除，成员缓存寿命不因报价刷新延长，A/H 跨市场隔离与全部建仓硬门禁保持不变。
 - [修复] 盘中 `01` 将扫描 watchdog/`02` 视为独立买入子链：子链失败会保留降级状态、影响范围及去重故障/恢复通知，但不再把已通过严格行情与 PushPlus 验收的分钟主监控误判为失败；候选热加载仍 fail-closed，所有交易安全门保持不变。

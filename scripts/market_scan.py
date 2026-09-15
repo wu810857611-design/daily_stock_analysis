@@ -11,6 +11,7 @@ import re
 import sys
 import tempfile
 import time
+from collections import Counter
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, Mapping, Optional, Sequence
@@ -40,6 +41,7 @@ DEFAULT_RESULT_PATH = Path("reports/market_scan.json")
 DEFAULT_STATE_DIR = Path("data/market_scan")
 REVIEW_BATCH_SIZE = 4
 REVIEW_MAX_ATTEMPTS = 2
+REVIEW_MAX_FALLBACK_MODELS = 1
 REVIEW_REQUEST_TIMEOUT_SECONDS = 120.0
 REVIEW_TOTAL_TIMEOUT_SECONDS = 480.0
 REVIEW_RETRY_BACKOFF_SECONDS = 2.0
@@ -245,6 +247,25 @@ def _first_csv_value(value: str) -> str:
     return next((item.strip() for item in str(value or "").split(",") if item.strip()), "")
 
 
+def _review_models(primary: str, configured: str, *, prefix: str) -> list[str]:
+    """Return one primary plus at most one same-channel configured fallback."""
+
+    def normalise(value: str) -> str:
+        return value if "/" in value else f"{prefix}/{value}"
+
+    models = [normalise(primary)]
+    for item in str(configured or "").split(","):
+        candidate = item.strip()
+        if not candidate:
+            continue
+        candidate = normalise(candidate)
+        if candidate not in models:
+            models.append(candidate)
+        if len(models) >= 1 + REVIEW_MAX_FALLBACK_MODELS:
+            break
+    return models
+
+
 def _parse_extra_headers(value: str) -> Dict[str, str]:
     if not value:
         return {}
@@ -260,19 +281,20 @@ def _parse_extra_headers(value: str) -> Dict[str, str]:
 def _reviewer_settings(label: str) -> Optional[Dict[str, Any]]:
     if label == "qwen":
         model = _first_env("MARKET_SCAN_QWEN_MODEL")
+        configured_models = _first_env("LLM_DASHSCOPE_MODELS")
         if not model:
-            model = _first_csv_value(_first_env("LLM_DASHSCOPE_MODELS"))
+            model = _first_csv_value(configured_models)
         key = _first_env("LLM_DASHSCOPE_API_KEY")
         if not key:
             key = _first_csv_value(_first_env("LLM_DASHSCOPE_API_KEYS"))
         base_url = _first_env("LLM_DASHSCOPE_BASE_URL")
         extra_headers = _first_env("LLM_DASHSCOPE_EXTRA_HEADERS")
-        if model and "/" not in model:
-            model = f"openai/{model}"
+        model_prefix = "openai"
     else:
         model = _first_env("MARKET_SCAN_DEEPSEEK_MODEL")
+        configured_models = _first_env("LLM_DEEPSEEK_MODELS")
         if not model:
-            model = _first_csv_value(_first_env("LLM_DEEPSEEK_MODELS"))
+            model = _first_csv_value(configured_models)
         key = _first_env("LLM_DEEPSEEK_API_KEY", "DEEPSEEK_API_KEY")
         if not key:
             key = _first_csv_value(
@@ -280,16 +302,45 @@ def _reviewer_settings(label: str) -> Optional[Dict[str, Any]]:
             )
         base_url = _first_env("LLM_DEEPSEEK_BASE_URL")
         extra_headers = _first_env("LLM_DEEPSEEK_EXTRA_HEADERS")
-        if model and "/" not in model:
-            model = f"deepseek/{model}"
+        model_prefix = "deepseek"
     if not model or not key:
         return None
+    models = _review_models(model, configured_models, prefix=model_prefix)
     return {
-        "model": model,
+        "model": models[0],
+        "models": models,
         "api_key": key,
         "api_base": base_url,
         "extra_headers": _parse_extra_headers(extra_headers),
     }
+
+
+class ReviewResponseError(ValueError):
+    """Safe, classified model-output failure that may recover on one retry."""
+
+    def __init__(self, reason_code: str, **details: Any) -> None:
+        super().__init__(reason_code)
+        self.reason_code = reason_code
+        self.retryable = True
+        self.details = details
+
+
+class ReviewProviderError(RuntimeError):
+    """Sanitised provider failure without response bodies or credentials."""
+
+    def __init__(
+        self,
+        reason_code: str,
+        *,
+        retryable: bool,
+        status_code: Optional[int] = None,
+        provider_error_type: str = "",
+    ) -> None:
+        super().__init__(reason_code)
+        self.reason_code = reason_code
+        self.retryable = retryable
+        self.status_code = status_code
+        self.provider_error_type = provider_error_type
 
 
 def _json_object_from_text(text: str) -> Mapping[str, Any]:
@@ -299,19 +350,80 @@ def _json_object_from_text(text: str) -> Mapping[str, Any]:
         cleaned = fenced.group(1).strip()
     try:
         payload = json.loads(cleaned)
-    except json.JSONDecodeError:
+    except json.JSONDecodeError as exc:
         start = cleaned.find("{")
         end = cleaned.rfind("}")
         if start < 0 or end <= start:
-            raise ValueError("reviewer returned no JSON object")
-        payload = json.loads(cleaned[start : end + 1])
+            raise ReviewResponseError("response_json_missing") from exc
+        try:
+            payload = json.loads(cleaned[start : end + 1])
+        except json.JSONDecodeError as nested_exc:
+            raise ReviewResponseError("response_json_invalid") from nested_exc
     if not isinstance(payload, Mapping):
-        raise ValueError("reviewer response must be a JSON object")
+        raise ReviewResponseError("response_json_not_object")
     return payload
 
 
+def _provider_review_error(exc: Exception) -> ReviewProviderError:
+    status = getattr(exc, "status_code", None)
+    try:
+        status_code = int(status) if status is not None else None
+    except (TypeError, ValueError):
+        status_code = None
+    error_type = type(exc).__name__
+    if status_code in {400, 401, 403, 404, 422}:
+        return ReviewProviderError(
+            f"provider_http_{status_code}", retryable=False,
+            status_code=status_code, provider_error_type=error_type,
+        )
+    if status_code == 408 or isinstance(exc, TimeoutError) or error_type in {
+        "Timeout", "APITimeoutError",
+    }:
+        reason_code = "provider_timeout"
+    elif status_code == 429 or error_type == "RateLimitError":
+        reason_code = "provider_rate_limited"
+    elif status_code in {500, 502, 503, 504} or error_type in {
+        "ServiceUnavailableError", "InternalServerError",
+    }:
+        reason_code = "provider_server_error"
+    elif isinstance(exc, ConnectionError) or error_type == "APIConnectionError":
+        reason_code = "provider_connection_error"
+    elif isinstance(exc, ValueError):
+        # LiteLLM can surface provider-side response conversion failures as a
+        # plain ValueError.  Run 34814558622 hit exactly this path after one
+        # successful Qwen batch, so it is safe to retry only that batch.
+        reason_code = "provider_value_error"
+    else:
+        return ReviewProviderError(
+            "provider_request_failed", retryable=False,
+            status_code=status_code, provider_error_type=error_type,
+        )
+    return ReviewProviderError(
+        reason_code, retryable=True, status_code=status_code,
+        provider_error_type=error_type,
+    )
+
+
+def _review_error_record(exc: Exception) -> Dict[str, Any]:
+    record: Dict[str, Any] = {
+        "error": type(exc).__name__,
+        "error_code": str(getattr(exc, "reason_code", "review_failed")),
+        "retryable": bool(getattr(exc, "retryable", False)),
+    }
+    status_code = getattr(exc, "status_code", None)
+    if status_code is not None:
+        record["status_code"] = status_code
+    provider_error_type = str(getattr(exc, "provider_error_type", "") or "")
+    if provider_error_type:
+        record["provider_error_type"] = provider_error_type
+    details = getattr(exc, "details", None)
+    if isinstance(details, Mapping):
+        record.update({str(key): value for key, value in details.items()})
+    return record
+
+
 def build_litellm_reviewer(label: str) -> Optional[Callable[[Sequence[Mapping[str, Any]]], Any]]:
-    """Review bounded batches, retrying transport errors with the same model."""
+    """Review bounded batches with classified, same-channel recovery."""
 
     settings = _reviewer_settings(label)
     if settings is None:
@@ -320,7 +432,7 @@ def build_litellm_reviewer(label: str) -> Optional[Callable[[Sequence[Mapping[st
     diagnostics: Dict[str, Any] = {}
 
     def request_batch(
-        candidates: Sequence[Mapping[str, Any]], timeout_seconds: float
+        candidates: Sequence[Mapping[str, Any]], timeout_seconds: float, model: str
     ) -> Mapping[str, Any]:
         import litellm
 
@@ -333,7 +445,7 @@ def build_litellm_reviewer(label: str) -> Optional[Callable[[Sequence[Mapping[st
             separators=(",", ":"),
         )
         kwargs: Dict[str, Any] = {
-            "model": settings["model"],
+            "model": model,
             "api_key": settings["api_key"],
             "messages": [
                 {"role": "system", "content": MARKET_SCAN_REVIEW_SYSTEM_PROMPT},
@@ -361,19 +473,23 @@ def build_litellm_reviewer(label: str) -> Optional[Callable[[Sequence[Mapping[st
             kwargs["api_base"] = settings["api_base"]
         if settings["extra_headers"]:
             kwargs["extra_headers"] = settings["extra_headers"]
-        response = litellm.completion(**kwargs)
+        try:
+            response = litellm.completion(**kwargs)
+        except Exception as exc:  # noqa: BLE001 - classified without raw provider body.
+            raise _provider_review_error(exc) from exc
         choices = getattr(response, "choices", None)
         if choices is None and isinstance(response, Mapping):
             choices = response.get("choices")
         if not choices:
-            raise ValueError(f"{label} reviewer returned no choices")
+            raise ReviewResponseError("response_no_choices")
         choice = choices[0]
         finish_reason = getattr(choice, "finish_reason", None)
         if finish_reason is None and isinstance(choice, Mapping):
             finish_reason = choice.get("finish_reason")
         if str(finish_reason or "").strip().lower() != "stop":
-            raise ValueError(
-                f"{label} reviewer did not finish cleanly: {finish_reason}"
+            raise ReviewResponseError(
+                "response_finish_reason",
+                finish_reason=str(finish_reason or "unknown")[:32],
             )
         message = getattr(choice, "message", None)
         if message is None and isinstance(choice, Mapping):
@@ -382,19 +498,32 @@ def build_litellm_reviewer(label: str) -> Optional[Callable[[Sequence[Mapping[st
         if content is None and isinstance(message, Mapping):
             content = message.get("content")
         if not str(content or "").strip():
-            raise ValueError(f"{label} reviewer returned empty content")
+            raise ReviewResponseError("response_empty_content")
         payload = _json_object_from_text(str(content or ""))
         reviews = payload.get("reviews")
         expected_codes = {str(candidate["code"]) for candidate in candidates}
         if not isinstance(reviews, list) or any(
             not isinstance(item, Mapping) for item in reviews
         ):
-            raise ValueError(f"{label} reviewer returned invalid reviews")
+            raise ReviewResponseError("response_reviews_invalid")
         codes = [str(item.get("code") or "") for item in reviews]
-        if len(codes) != len(expected_codes) or set(codes) != expected_codes:
-            raise ValueError(f"{label} reviewer returned missing, duplicate or unexpected codes")
-        if any(item.get("verdict") not in {"pass", "watch", "reject"} for item in reviews):
-            raise ValueError(f"{label} reviewer returned invalid verdict")
+        code_counts = Counter(codes)
+        missing_codes = sorted(expected_codes - set(codes))
+        duplicate_codes = sorted(code for code, count in code_counts.items() if count > 1)
+        unexpected_codes = sorted(set(codes) - expected_codes)
+        if missing_codes or duplicate_codes or unexpected_codes or len(codes) != len(expected_codes):
+            raise ReviewResponseError(
+                "response_code_mismatch", missing_codes=missing_codes,
+                duplicate_codes=duplicate_codes, unexpected_codes=unexpected_codes,
+            )
+        invalid_verdict_codes = sorted(
+            str(item.get("code") or "") for item in reviews
+            if item.get("verdict") not in {"pass", "watch", "reject"}
+        )
+        if invalid_verdict_codes:
+            raise ReviewResponseError(
+                "response_verdict_invalid", invalid_codes=invalid_verdict_codes,
+            )
         return payload
 
     def review(candidates: Sequence[Mapping[str, Any]]) -> Mapping[str, Any]:
@@ -403,10 +532,12 @@ def build_litellm_reviewer(label: str) -> Optional[Callable[[Sequence[Mapping[st
         diagnostics.clear()
         diagnostics.update({
             "model": settings["model"],
+            "configured_models": list(settings["models"]),
             "status": "running",
             "candidate_count": len(candidates),
             "completed_candidate_count": 0,
             "requests": [],
+            "batches": [],
         })
         merged: list[Mapping[str, Any]] = []
         try:
@@ -415,43 +546,112 @@ def build_litellm_reviewer(label: str) -> Optional[Callable[[Sequence[Mapping[st
                 raise ValueError("review candidate codes must be nonempty and unique")
             for offset in range(0, len(candidates), REVIEW_BATCH_SIZE):
                 batch = candidates[offset:offset + REVIEW_BATCH_SIZE]
-                for attempt in range(1, REVIEW_MAX_ATTEMPTS + 1):
+                batch_number = offset // REVIEW_BATCH_SIZE + 1
+                batch_summary: Dict[str, Any] = {
+                    "batch": batch_number,
+                    "candidate_count": len(batch),
+                    "status": "running",
+                    "attempt_count": 0,
+                    "fallback_used": False,
+                }
+                diagnostics["batches"].append(batch_summary)
+                completed = False
+                last_error: Optional[Exception] = None
+                attempt_plan = [
+                    (model, model_index, attempt)
+                    for model_index, model in enumerate(settings["models"])
+                    for attempt in range(
+                        1,
+                        (REVIEW_MAX_ATTEMPTS if model_index == 0 else 1) + 1,
+                    )
+                ]
+                for batch_attempt, (model, model_index, attempt) in enumerate(
+                    attempt_plan, start=1
+                ):
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
-                        raise TimeoutError(f"{label} reviewer total budget exhausted")
+                        raise ReviewProviderError(
+                            "total_budget_exhausted", retryable=False,
+                            provider_error_type="TimeoutError",
+                        )
                     record = {
-                        "batch": offset // REVIEW_BATCH_SIZE + 1,
+                        "batch": batch_number,
                         "attempt": attempt,
+                        "batch_attempt": batch_attempt,
+                        "model": model,
+                        "model_role": "primary" if model_index == 0 else "fallback",
                         "candidate_count": len(batch),
                         "status": "running",
                     }
                     diagnostics["requests"].append(record)
+                    batch_summary["attempt_count"] = batch_attempt
                     try:
                         payload = request_batch(
-                            batch, min(REVIEW_REQUEST_TIMEOUT_SECONDS, remaining)
+                            batch, min(REVIEW_REQUEST_TIMEOUT_SECONDS, remaining), model
                         )
-                    except Exception as exc:  # noqa: BLE001 - retry only transport failures.
-                        record.update(status="failed", error=type(exc).__name__)
-                        if not _transient_review_error(exc) or attempt == REVIEW_MAX_ATTEMPTS:
+                    except Exception as exc:  # noqa: BLE001 - bounded and classified.
+                        last_error = exc
+                        record.update(status="failed", **_review_error_record(exc))
+                        batch_summary.setdefault("failure_codes", []).append(
+                            record["error_code"]
+                        )
+                        batch_summary.update(
+                            status="retrying", error_code=record["error_code"]
+                        )
+                        retryable = bool(getattr(exc, "retryable", False))
+                        has_next_attempt = batch_attempt < len(attempt_plan)
+                        if not retryable or not has_next_attempt:
                             raise
                         remaining = deadline - time.monotonic()
                         if remaining <= REVIEW_RETRY_BACKOFF_SECONDS:
-                            raise TimeoutError(f"{label} reviewer total budget exhausted") from exc
+                            raise ReviewProviderError(
+                                "total_budget_exhausted", retryable=False,
+                                provider_error_type="TimeoutError",
+                            ) from exc
                         time.sleep(REVIEW_RETRY_BACKOFF_SECONDS)
                         continue
                     # A late response never becomes a usable review, even if the
                     # SDK exceeded its request timeout before returning.
                     if time.monotonic() >= deadline:
-                        record.update(status="failed", error="total_budget_exhausted")
-                        raise TimeoutError(f"{label} reviewer total budget exhausted")
+                        record.update(
+                            status="failed", error="ReviewProviderError",
+                            error_code="total_budget_exhausted", retryable=False,
+                            provider_error_type="TimeoutError",
+                        )
+                        raise ReviewProviderError(
+                            "total_budget_exhausted", retryable=False,
+                            provider_error_type="TimeoutError",
+                        )
                     record["status"] = "completed"
                     merged.extend(payload["reviews"])
                     diagnostics["completed_candidate_count"] = len(merged)
+                    batch_summary.pop("error_code", None)
+                    batch_summary.update(
+                        status="completed", model=model,
+                        fallback_used=model_index > 0,
+                    )
+                    completed = True
                     break
+                if not completed:
+                    if last_error is not None:
+                        raise last_error
+                    raise RuntimeError(f"{label} reviewer batch did not complete")
             diagnostics["status"] = "completed"
             return {"reviews": merged}
         except Exception as exc:
-            diagnostics.update(status="failed", error=type(exc).__name__)
+            if diagnostics["batches"]:
+                last_batch = diagnostics["batches"][-1]
+                if last_batch.get("status") != "completed":
+                    last_batch.update(
+                        status="failed",
+                        error_code=str(
+                            getattr(exc, "reason_code", "review_failed")
+                        ),
+                    )
+            diagnostics.update(
+                status="failed", error=type(exc).__name__,
+                error_code=str(getattr(exc, "reason_code", "review_failed")),
+            )
             # Never return a partial successful batch as a complete model vote.
             raise
         finally:
@@ -461,19 +661,6 @@ def build_litellm_reviewer(label: str) -> Optional[Callable[[Sequence[Mapping[st
     review.diagnostics = diagnostics
 
     return review
-
-
-def _transient_review_error(exc: Exception) -> bool:
-    """Retry availability failures, never authentication/schema/verdict failures."""
-    status = getattr(exc, "status_code", None)
-    return (
-        isinstance(exc, (TimeoutError, ConnectionError))
-        or status in {408, 429, 500, 502, 503, 504}
-        or type(exc).__name__ in {
-            "Timeout", "APITimeoutError", "APIConnectionError", "RateLimitError",
-            "ServiceUnavailableError", "InternalServerError",
-        }
-    )
 
 
 def _atomic_write_text(path: Path, content: str) -> None:
