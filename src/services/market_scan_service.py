@@ -2195,7 +2195,14 @@ class MarketScanService:
             raw = reviewer(copy.deepcopy(list(payload)))
             reviews = _normalise_review_payload(raw, candidates, market_by_code)
         except Exception as exc:  # noqa: BLE001 - model failure becomes a safe watch result.
-            return {}, f"{label}_review_failed:{type(exc).__name__}"
+            reason_code = str(
+                getattr(exc, "reason_code", "")
+                or type(exc).__name__
+            )
+            diagnostics = getattr(reviewer, "diagnostics", None)
+            if isinstance(diagnostics, Mapping):
+                reason_code = str(diagnostics.get("error_code") or reason_code)
+            return {}, f"{label}_review_failed:{reason_code}"
         missing = [code for code in market_by_code if code not in reviews]
         if missing:
             return reviews, f"{label}_review_missing:{','.join(missing)}"
