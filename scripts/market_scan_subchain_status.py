@@ -65,6 +65,8 @@ def classify_watchdog(
     error = _safe_error(sync.get("error")) if isinstance(sync, Mapping) else ""
     if exit_code == 0 and (not sync_status or sync_status == "synced"):
         return "healthy", "", False
+    if sync_status == "in_progress":
+        return "pending", error or "market_scan_in_progress", False
     reason = error or (
         "watchdog_report_missing"
         if not payload
@@ -193,6 +195,8 @@ def reconcile_subchain_status(
         "impact": (
             "none"
             if status == "healthy"
+            else "new_buy_candidate_hot_reload_pending"
+            if status == "pending"
             else "new_buy_candidate_hot_reload_unavailable"
         ),
         "main_intraday_health_affected": False,

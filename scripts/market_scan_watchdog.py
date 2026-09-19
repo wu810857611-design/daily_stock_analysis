@@ -303,7 +303,11 @@ def _sync_successful_slot_artifact(
     poll_seconds: float,
 ) -> dict[str, Any]:
     attempts = max(1, int(max(timeout_seconds, 0.0) / max(poll_seconds, 1.0)) + 1)
-    last_error = "successful_current_slot_run_not_ready"
+    last_state: dict[str, Any] = {
+        "status": "missing",
+        "run_id": None,
+        "error": "market_scan_missing",
+    }
     for attempt in range(1, attempts + 1):
         try:
             runs = _runs_for_slot(
@@ -332,9 +336,11 @@ def _sync_successful_slot_artifact(
                         and not item.get("expired")
                     ]
                     if not state_artifacts:
-                        last_error = (
-                            f"market_scan_state_artifact_not_ready:run={run_id}"
-                        )
+                        last_state = {
+                            "status": "artifact_not_ready",
+                            "run_id": run_id,
+                            "error": f"market_scan_state_artifact_not_ready:run={run_id}",
+                        }
                         continue
                     for artifact in state_artifacts:
                         artifact_id = int(artifact.get("id") or 0)
@@ -353,10 +359,15 @@ def _sync_successful_slot_artifact(
                                 observed_at=observed_at,
                             )
                         except Exception as exc:  # noqa: BLE001
-                            last_error = (
-                                f"{type(exc).__name__}:{exc}:"
-                                f"run={run_id}:artifact={artifact_id}"
-                            )
+                            last_state = {
+                                "status": "artifact_not_ready",
+                                "run_id": run_id,
+                                "error": (
+                                    f"market_scan_state_artifact_invalid:"
+                                    f"{type(exc).__name__}:{exc}:"
+                                    f"run={run_id}:artifact={artifact_id}"
+                                ),
+                            }
                             continue
                         _atomic_write(target_path, raw_latest)
                         return {
@@ -372,30 +383,70 @@ def _sync_successful_slot_artifact(
                             "error": "",
                         }
                 except Exception as exc:  # noqa: BLE001
-                    last_error = f"{type(exc).__name__}:{exc}:run={run_id}"
-            if runs and not successful_runs and all(
-                str(run.get("status") or "") == "completed" for run in runs
-            ):
-                failed = runs[0]
-                # A just-dispatched replacement can take time to appear in the
-                # API. Keep the bounded polling but report the actual failure.
-                last_error = (
-                    f"market_scan_run_failed:{failed.get('conclusion')}:"
-                    f"run={failed.get('id')}"
-                )
+                    last_state = {
+                        "status": "artifact_not_ready",
+                        "run_id": run_id,
+                        "error": f"market_scan_artifact_api_error:{type(exc).__name__}:{exc}:run={run_id}",
+                    }
+            if runs:
+                latest = runs[0]
+                latest_status = str(latest.get("status") or "")
+                latest_conclusion = str(latest.get("conclusion") or "")
+                latest_run_id = int(latest.get("id") or 0) or None
+                if latest_status in {"queued", "in_progress", "waiting", "pending"}:
+                    last_state = {
+                        "status": "in_progress",
+                        "run_id": latest_run_id,
+                        "error": f"market_scan_in_progress:run={latest_run_id}",
+                    }
+                terminal_failures = [
+                    run
+                    for run in runs
+                    if str(run.get("status") or "") == "completed"
+                    and str(run.get("conclusion") or "") != "success"
+                ]
+                if terminal_failures:
+                    # A later guard-skipped workflow may itself conclude success
+                    # without ever producing market-scan-state.  It is not a
+                    # recovery and must not hide the closest real scan failure.
+                    failed = terminal_failures[0]
+                    failed_conclusion = str(failed.get("conclusion") or "")
+                    failed_run_id = int(failed.get("id") or 0) or None
+                    if failed_conclusion == "cancelled":
+                        error_code = "market_scan_run_cancelled"
+                    elif failed_conclusion == "timed_out":
+                        error_code = "market_scan_run_timeout"
+                    else:
+                        error_code = (
+                            f"market_scan_run_failed:{failed_conclusion or 'unknown'}"
+                        )
+                    return {
+                        "status": "failed",
+                        "attempts": attempt,
+                        "run_id": failed_run_id,
+                        "artifact_id": None,
+                        "generated_at": "",
+                        "content_fingerprint": "",
+                        "path": str(target_path),
+                        "error": f"{error_code}:run={failed_run_id}",
+                    }
         except Exception as exc:  # noqa: BLE001 - retry bounded transient artifact state.
-            last_error = f"{type(exc).__name__}:{exc}"
+            last_state = {
+                "status": "api_error",
+                "run_id": None,
+                "error": f"market_scan_watchdog_api_error:{type(exc).__name__}:{exc}",
+            }
         if attempt < attempts:
             sleep_fn(max(poll_seconds, 1.0))
     return {
-        "status": "timeout",
+        "status": last_state["status"],
         "attempts": attempts,
-        "run_id": None,
+        "run_id": last_state.get("run_id"),
         "artifact_id": None,
         "generated_at": "",
         "content_fingerprint": "",
         "path": str(target_path),
-        "error": last_error,
+        "error": last_state["error"],
     }
 
 
@@ -409,8 +460,9 @@ def run_watchdog(
     ref: str,
     session_gate: Callable[[datetime], Mapping[str, Any]] = evaluate_market_sessions,
     sync_latest_path: Path | None = None,
-    sync_timeout_seconds: float = 2400.0,
-    sync_poll_seconds: float = 15.0,
+    sync_timeout_seconds: float = 120.0,
+    sync_poll_seconds: float = 10.0,
+    observe_only: bool = False,
 ) -> dict[str, Any]:
     now = now_fn().astimezone(SHANGHAI_TZ)
     resolved_slot = resolve_slot(slot, now)
@@ -428,7 +480,7 @@ def run_watchdog(
     while now < target:
         sleep_fn(min(60.0, (target - now).total_seconds()))
         now = now_fn().astimezone(SHANGHAI_TZ)
-    if now > latest:
+    if now > latest and not observe_only:
         return {
             "status": "skipped_late",
             "slot": resolved_slot,
@@ -437,21 +489,40 @@ def run_watchdog(
             "active_markets": list(calendar.get("active_markets") or []),
         }
     runs = client.recent_runs(workflow, ref)
-    covered = existing_run_covers_slot(
-        runs, slot=resolved_slot, session_date=now.date()
-    )
-    if covered:
+    slot_runs = _runs_for_slot(runs, slot=resolved_slot, session_date=now.date())
+    covered = existing_run_covers_slot(runs, slot=resolved_slot, session_date=now.date())
+    if slot_runs:
+        latest = slot_runs[0]
+        latest_status = str(latest.get("status") or "")
+        latest_conclusion = str(latest.get("conclusion") or "")
         result = {
-            "status": "already_covered",
+            "status": (
+                "already_covered"
+                if covered
+                else "already_failed"
+            ),
+            "slot": resolved_slot,
+            "observed_at": now.isoformat(timespec="seconds"),
+            "calendar_status": calendar.get("status") or "unknown",
+            "active_markets": list(calendar.get("active_markets") or []),
+            "observed_run": {
+                "run_id": latest.get("id"),
+                "status": latest_status,
+                "conclusion": latest_conclusion,
+            },
+        }
+    elif not observe_only:
+        client.dispatch(workflow, ref, resolved_slot)
+        result = {
+            "status": "dispatched",
             "slot": resolved_slot,
             "observed_at": now.isoformat(timespec="seconds"),
             "calendar_status": calendar.get("status") or "unknown",
             "active_markets": list(calendar.get("active_markets") or []),
         }
     else:
-        client.dispatch(workflow, ref, resolved_slot)
         result = {
-            "status": "dispatched",
+            "status": "missing",
             "slot": resolved_slot,
             "observed_at": now.isoformat(timespec="seconds"),
             "calendar_status": calendar.get("status") or "unknown",
@@ -480,8 +551,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--workflow", default="02-market-scan.yml")
     parser.add_argument("--output", type=Path)
     parser.add_argument("--sync-latest-path", type=Path)
-    parser.add_argument("--sync-timeout-seconds", type=float, default=2400.0)
-    parser.add_argument("--sync-poll-seconds", type=float, default=15.0)
+    parser.add_argument("--sync-timeout-seconds", type=float, default=120.0)
+    parser.add_argument("--sync-poll-seconds", type=float, default=10.0)
+    parser.add_argument(
+        "--observe-only",
+        action="store_true",
+        help="inspect the current slot without ever dispatching a replacement",
+    )
     return parser
 
 
@@ -501,6 +577,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         sync_latest_path=args.sync_latest_path,
         sync_timeout_seconds=args.sync_timeout_seconds,
         sync_poll_seconds=args.sync_poll_seconds,
+        observe_only=args.observe_only,
     )
     serialised = json.dumps(result, ensure_ascii=False)
     print(serialised)
@@ -508,7 +585,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(serialised + "\n", encoding="utf-8")
     sync = result.get("sync")
-    return 1 if isinstance(sync, Mapping) and sync.get("status") != "synced" else 0
+    return (
+        1
+        if isinstance(sync, Mapping)
+        and sync.get("status") not in {"synced", "in_progress"}
+        else 0
+    )
 
 
 if __name__ == "__main__":

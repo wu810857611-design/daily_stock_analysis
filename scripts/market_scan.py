@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import re
+import signal
 import sys
 import tempfile
 import time
@@ -26,6 +27,7 @@ from src.services.market_scan_service import (  # noqa: E402
     MARKET_A,
     MARKET_HK,
     MarketScanConfig,
+    MarketScanDeadlineExceeded,
     MarketScanService,
     default_a_snapshot_loader,
     default_history_loader,
@@ -1122,6 +1124,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--hk-membership-cache-max-age-hours", type=float, default=840.0)
     parser.add_argument("--snapshot-retry-backoff-seconds", type=float, default=1.0)
     parser.add_argument("--min-actionable-data-quality", type=float, default=0.70)
+    parser.add_argument("--snapshot-provider-timeout-seconds", type=float, default=150.0)
+    parser.add_argument("--snapshot-stage-timeout-seconds", type=float, default=480.0)
+    parser.add_argument("--history-symbol-timeout-seconds", type=float, default=45.0)
+    parser.add_argument("--history-stage-timeout-seconds", type=float, default=900.0)
+    parser.add_argument("--research-symbol-timeout-seconds", type=float, default=30.0)
+    parser.add_argument("--research-stage-timeout-seconds", type=float, default=300.0)
+    parser.add_argument("--total-timeout-seconds", type=float, default=1800.0)
     parser.add_argument("--markets", default="cn,hk")
     parser.add_argument("--calendar-status", default="manual")
     parser.add_argument("--slot", default="manual")
@@ -1141,10 +1150,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         hk_membership_cache_max_age_hours=args.hk_membership_cache_max_age_hours,
         snapshot_retry_backoff_seconds=args.snapshot_retry_backoff_seconds,
         min_actionable_data_quality=args.min_actionable_data_quality,
+        snapshot_provider_timeout_seconds=args.snapshot_provider_timeout_seconds,
+        snapshot_stage_timeout_seconds=args.snapshot_stage_timeout_seconds,
+        history_symbol_timeout_seconds=args.history_symbol_timeout_seconds,
+        history_stage_timeout_seconds=args.history_stage_timeout_seconds,
+        research_symbol_timeout_seconds=args.research_symbol_timeout_seconds,
+        research_stage_timeout_seconds=args.research_stage_timeout_seconds,
+        total_timeout_seconds=args.total_timeout_seconds,
         enabled_markets=_parse_enabled_markets(args.markets),
         a_cache_path=args.state_dir / "a_share_snapshot.json",
         hk_cache_path=args.state_dir / "hk_connect_snapshot.json",
         hk_membership_cache_path=args.state_dir / "hk_connect_membership.json",
+        runtime_state_path=args.state_dir / "runtime.json",
     )
     service = MarketScanService(
         a_snapshot_loader=default_a_snapshot_loader,
@@ -1157,7 +1174,58 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         research_evidence_loader=default_research_evidence_loader,
         config=config,
     )
-    result = service.run()
+
+    def record_termination(signum: int, _frame: Any) -> None:
+        service.record_termination(f"signal:{signum}")
+        raise SystemExit(128 + signum)
+
+    for termination_signal in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(termination_signal, record_termination)
+
+    try:
+        result = service.run()
+    except Exception as exc:  # noqa: BLE001 - persist fail-closed diagnostic output.
+        if isinstance(exc, MarketScanDeadlineExceeded):
+            failure_code = (
+                f"market_scan_{exc.scope}_timeout:{exc.stage_name}:"
+                f"item={exc.item_or_symbol}:provider={exc.provider}"
+            )
+        else:
+            failure_code = "market_scan_unhandled_exception"
+            service.record_termination(f"{type(exc).__name__}:{exc}")
+        result = {
+            "schema_version": 1,
+            "generated_at": datetime.now(SHANGHAI_TZ).isoformat(timespec="seconds"),
+            "simulation_only": True,
+            "auto_order_enabled": False,
+            "human_confirmation_required": True,
+            "safe_to_push": False,
+            "push_block_reasons": [
+                "全市场扫描未在应用层预算内完整完成，已停止主动推荐推送"
+            ],
+            "review_complete": False,
+            "operational_status": "failed",
+            "operational_failures": [failure_code],
+            "operational_warnings": [],
+            "market_operational_status": {
+                MARKET_A: "blocked",
+                MARKET_HK: "blocked",
+            },
+            "diagnostics": {
+                "runtime": service.runtime_diagnostics(),
+                "failure": {
+                    "code": failure_code,
+                    "error_class": type(exc).__name__,
+                    "error": str(exc)[:1000],
+                },
+                "buy_funnel": {},
+            },
+            "candidates": [],
+            "disclaimer": (
+                "仅用于模拟研究；本轮扫描不完整，未生成主动建仓候选，"
+                "不连接券商且不会自动下单。"
+            ),
+        }
     result["scheduler"] = {
         "slot": str(args.slot or "manual"),
         "trigger_source": str(args.trigger_source or "manual"),
