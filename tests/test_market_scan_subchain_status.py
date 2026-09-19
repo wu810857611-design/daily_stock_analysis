@@ -116,3 +116,34 @@ def test_missing_watchdog_report_is_a_nonfatal_degradation(tmp_path: Path):
     assert result["reason"] == "watchdog_report_missing"
     assert result["notification"]["status"] == "pending"
     assert result["main_intraday_health_affected"] is False
+
+
+def test_in_progress_scan_is_pending_without_notification(tmp_path: Path):
+    report = tmp_path / "watchdog.json"
+    calls = []
+    _write(
+        report,
+        {
+            "status": "already_covered",
+            "sync": {
+                "status": "in_progress",
+                "run_id": 141,
+                "error": "market_scan_in_progress:run=141",
+            },
+        },
+    )
+    result = reconcile_subchain_status(
+        watchdog_report=report,
+        state_path=tmp_path / "state.json",
+        output_path=tmp_path / "result.json",
+        exit_code=0,
+        session="afternoon",
+        now=datetime(2026, 9, 18, 16, 2, tzinfo=TZ),
+        sender=lambda **kwargs: calls.append(kwargs) or True,
+    )
+    assert result["operational_status"] == "pending"
+    assert result["reason"] == "market_scan_in_progress:run=141"
+    assert result["impact"] == "new_buy_candidate_hot_reload_pending"
+    assert result["main_intraday_health_affected"] is False
+    assert result["notification"]["status"] == "not_required"
+    assert calls == []

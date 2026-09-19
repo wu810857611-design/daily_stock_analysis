@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 > For user-friendly release highlights, see the [GitHub Releases](https://github.com/ZhuLinsen/daily_stock_analysis/releases) page.
 
 ## [Unreleased]
+- [修复] 全市场扫描为第三方快照、单标的历史/研究、阶段及整轮增加分层硬截止时间；AkShare 新浪港股99页备用改为逐页 connect/read/total timeout 和结构化定位，Efinance 无内置超时调用改用不会阻塞解释器退出的 daemon 边界；关键阶段超时继续失败关闭并在 Actions 75分钟硬杀前主动落盘最后阶段、标的与 provider。
+- [修复] 盘中 market-scan watchdog 的同步等待从40分钟收敛到120秒；在途扫描记为 pending 且不重复派发、不阻塞盘中主监控，主监控收尾时再做一次零等待且禁止派发的最终复查，取消、平台超时、失败、产物未就绪与完全缺失保留独立语义和 run ID，故障/恢复通知继续去重。
+- [测试] 覆盖永久挂起 provider、单标的超时、主源超时后备用成功、非关键研究超时降级、关键快照失败关闭、阶段/整轮预算、watchdog 在途不重派、取消/超时/失败归因、产物未就绪和非阻塞收尾。
 - [修复] 全市场扫描双模型复核对超时、限流、连接、临时服务错误、LiteLLM响应转换及结构化输出异常按失败批次有限重试，并允许同提供方配置列表中的一个备用模型接力；研究数据缺口与模型技术故障分开记账，任一批次最终不完整仍失败关闭。
 - [测试] 覆盖双模型完整复核、单模型超时、候选代码缺失/重复、非法JSON、单批失败后恢复、持续失败、同通道备用模型及研究数据缺失但复核完整等场景。
 - [修复] 仅配置 DeepSeek 官方 API Key 时的隐式主模型从已过时的 `deepseek/deepseek-chat` 迁移到 `deepseek/deepseek-v4-flash`，并同步设置诊断与示例；显式指定的旧模型仍保持原值，市场扫描已配置的 `deepseek-v4-pro` 不受影响。

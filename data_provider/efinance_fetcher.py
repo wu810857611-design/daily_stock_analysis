@@ -22,10 +22,12 @@ EfinanceFetcher - 优先数据源 (Priority 0)
 
 import logging
 import os
+import queue
 import random
 import re
+import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
+from concurrent.futures import TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Optional, Dict, Any, List, Tuple
@@ -202,15 +204,30 @@ def _ef_call_with_timeout(func, *args, timeout=None, **kwargs):
     """
     if timeout is None:
         timeout = _EF_CALL_TIMEOUT
-    # Do NOT use 'with ThreadPoolExecutor(...)' here: the context manager calls
-    # shutdown(wait=True) on __exit__, which would re-block on the hung thread.
-    executor = ThreadPoolExecutor(max_workers=1)
-    try:
-        future = executor.submit(func, *args, **kwargs)
-        return future.result(timeout=timeout)
-    finally:
-        # wait=False: calling thread returns immediately; worker cleans up later
-        executor.shutdown(wait=False)
+    outcome = queue.Queue(maxsize=1)
+
+    def invoke():
+        try:
+            outcome.put((True, func(*args, **kwargs)))
+        except BaseException as exc:  # noqa: BLE001 - transported to caller.
+            outcome.put((False, exc))
+
+    # ThreadPoolExecutor registers non-daemon workers for interpreter shutdown;
+    # shutdown(wait=False) therefore still lets a hung SDK call pin process exit.
+    # A raw daemon preserves the caller deadline all the way through shutdown.
+    worker = threading.Thread(
+        target=invoke,
+        name="efinance-bounded-call",
+        daemon=True,
+    )
+    worker.start()
+    worker.join(max(0.001, float(timeout)))
+    if worker.is_alive():
+        raise FuturesTimeoutError()
+    succeeded, value = outcome.get_nowait()
+    if not succeeded:
+        raise value
+    return value
 
 
 def _classify_eastmoney_error(exc: Exception) -> Tuple[str, str]:

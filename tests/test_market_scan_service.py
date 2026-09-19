@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import sys
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -33,12 +34,14 @@ from src.services.market_scan_service import (
     MARKET_A,
     MARKET_HK,
     MarketScanConfig,
+    MarketScanDeadlineExceeded,
     MarketScanService,
     default_a_snapshot_loader,
     default_hk_all_snapshot_loader,
     render_market_scan_markdown,
     validate_trade_plan,
 )
+import src.services.market_scan_service as market_scan_service_module
 from src.services.position_sizing_policy import classify_opportunity
 from src.services.tencent_market_snapshot import load_fresh_hk_membership_snapshot
 
@@ -147,6 +150,7 @@ def _config(tmp_path: Path, **overrides: Any) -> MarketScanConfig:
         "a_cache_path": tmp_path / "a_share.json",
         "hk_cache_path": tmp_path / "hk_connect.json",
         "hk_membership_cache_path": tmp_path / "hk_connect_membership.json",
+        "runtime_state_path": tmp_path / "runtime.json",
     }
     values.update(overrides)
     return MarketScanConfig(**values)
@@ -210,6 +214,165 @@ def test_l1_is_vectorised_and_makes_zero_history_or_llm_calls(tmp_path: Path) ->
     assert result.diagnostics[MARKET_A]["filtered"]["suspended_or_zero_turnover"] >= 1
     assert result.diagnostics[MARKET_A]["filtered"]["extreme_chase"] == 1
     assert result.diagnostics[MARKET_A]["filtered"]["new_listing_name"] == 1
+
+
+def test_default_snapshot_provider_timeout_falls_through_to_next_source(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+    frame = pd.DataFrame(_a_snapshot()["records"])
+    fake_akshare = SimpleNamespace(
+        stock_zh_a_spot_em=lambda: frame,
+        stock_zh_a_spot_tx=lambda: frame,
+        stock_zh_a_spot=lambda: frame,
+    )
+
+    def bounded_call(callback, **kwargs):
+        provider = str(kwargs["provider"])
+        calls.append(provider)
+        if provider.endswith("stock_zh_a_spot_em"):
+            raise MarketScanDeadlineExceeded(
+                stage_name="a_share_snapshot_provider",
+                item_or_symbol=MARKET_A,
+                provider=provider,
+                timeout_budget=0.01,
+                scope="call",
+            )
+        return callback()
+
+    monkeypatch.setitem(sys.modules, "akshare", fake_akshare)
+    monkeypatch.setattr(
+        market_scan_service_module, "_call_with_hard_timeout", bounded_call
+    )
+    payload = default_a_snapshot_loader()
+    assert payload["source"] == "akshare.stock_zh_a_spot_tx"
+    assert calls == ["akshare.stock_zh_a_spot_em", "akshare.stock_zh_a_spot_tx"]
+    assert "MarketScanDeadlineExceeded" in payload["provider_errors"][0]
+
+
+def test_critical_snapshot_timeout_fails_closed_without_cache(tmp_path: Path) -> None:
+    def hanging_snapshot() -> Any:
+        time.sleep(0.2)
+        return _a_snapshot()
+
+    result = _service(
+        tmp_path,
+        qwen=ReviewRecorder(),
+        deepseek=ReviewRecorder(),
+        a_loader=hanging_snapshot,
+        config_overrides={
+            "enabled_markets": (MARKET_A,),
+            "snapshot_retries": 1,
+            "snapshot_provider_timeout_seconds": 0.01,
+            "snapshot_stage_timeout_seconds": 0.1,
+        },
+    ).run()
+    assert result["market_operational_status"][MARKET_A] == "blocked"
+    assert result["operational_status"] == "failed"
+    assert result["safe_to_push"] is False
+    assert result["candidates"] == []
+
+
+def test_one_history_timeout_does_not_block_other_symbols(tmp_path: Path) -> None:
+    calls: list[str] = []
+
+    def sometimes_hanging(code: str, days: int) -> Any:
+        calls.append(code)
+        if len(calls) == 1:
+            time.sleep(0.2)
+        return _history(code, days)
+
+    result = _service(
+        tmp_path,
+        qwen=ReviewRecorder(),
+        deepseek=ReviewRecorder(),
+        history_loader=sometimes_hanging,
+        config_overrides={"history_symbol_timeout_seconds": 0.01},
+    ).run()
+    assert len(calls) == 3
+    assert "history_timeout" in result["diagnostics"]["history_rejections"].values()
+    assert result["diagnostics"]["history_accepted_count"] >= 1
+
+
+def test_history_stage_deadline_ends_batch_and_marks_scan_failed(tmp_path: Path) -> None:
+    def hanging_history(code: str, days: int) -> Any:
+        time.sleep(0.2)
+        return _history(code, days)
+
+    result = _service(
+        tmp_path,
+        qwen=ReviewRecorder(),
+        deepseek=ReviewRecorder(),
+        history_loader=hanging_history,
+        config_overrides={
+            "history_symbol_timeout_seconds": 0.02,
+            "history_stage_timeout_seconds": 0.025,
+        },
+    ).run()
+    assert "market_scan_stage_timeout:history" in result["operational_failures"]
+    assert "history_stage_timeout" in result["diagnostics"]["history_rejections"].values()
+    assert result["operational_status"] == "failed"
+    assert result["safe_to_push"] is False
+
+
+def test_total_budget_exits_before_external_runner_timeout(tmp_path: Path) -> None:
+    def hanging_history(code: str, days: int) -> Any:
+        time.sleep(0.3)
+        return _history(code, days)
+
+    service = _service(
+        tmp_path,
+        qwen=ReviewRecorder(),
+        deepseek=ReviewRecorder(),
+        history_loader=hanging_history,
+        config_overrides={
+            "enabled_markets": (MARKET_A,),
+            "history_symbol_timeout_seconds": 1.0,
+            "total_timeout_seconds": 0.1,
+        },
+    )
+    started = time.monotonic()
+    with pytest.raises(MarketScanDeadlineExceeded) as exc_info:
+        service.run()
+    assert exc_info.value.scope == "total"
+    assert time.monotonic() - started < 0.5
+    runtime = json.loads((tmp_path / "runtime.json").read_text(encoding="utf-8"))
+    assert runtime["status"] == "timeout"
+    assert runtime["last_stage_event"]["item_or_symbol"].endswith("600001")
+
+
+def test_noncritical_research_timeout_keeps_complete_model_review(
+    tmp_path: Path,
+) -> None:
+    def hanging_research(_candidate: Mapping[str, Any]) -> Mapping[str, Any]:
+        time.sleep(0.2)
+        return {"status": "available", "fundamentals": {"pe": 12}}
+
+    result = _service(
+        tmp_path,
+        qwen=ReviewRecorder(),
+        deepseek=ReviewRecorder(),
+        research_loader=hanging_research,
+        config_overrides={"research_symbol_timeout_seconds": 0.01},
+    ).run()
+    assert result["review_complete"] is True
+    assert result["operational_status"] == "healthy"
+    assert result["diagnostics"]["research_evidence_errors"]
+    assert all(
+        errors == ["research_evidence_timeout"]
+        for errors in result["diagnostics"]["research_evidence_errors"].values()
+    )
+
+
+def test_efinance_timeout_uses_daemon_worker_and_returns_promptly() -> None:
+    from concurrent.futures import TimeoutError as FuturesTimeoutError
+
+    from data_provider.efinance_fetcher import _ef_call_with_timeout
+
+    started = time.monotonic()
+    with pytest.raises(FuturesTimeoutError):
+        _ef_call_with_timeout(lambda: time.sleep(0.2), timeout=0.01)
+    assert time.monotonic() - started < 0.1
 
 
 def test_closed_market_is_not_loaded_and_open_market_remains_healthy(
@@ -1906,6 +2069,9 @@ def test_market_scan_workflow_is_independent_simulation_with_fixed_state_artifac
     assert "actions/artifacts?name=market-scan-state" in text
     assert "unsafe market-scan entry" in text
     assert "scripts/market_scan.py" in text
+    assert "MARKET_SCAN_TOTAL_TIMEOUT_SECONDS" in job["env"]
+    assert "--history-symbol-timeout-seconds" in text
+    assert "data/market_scan/runtime.json" in text
     assert "严格确认买入链路健康" in text
     assert "SCAN_EXIT_CODE" in text
     assert "00-daily-analysis.yml" not in text

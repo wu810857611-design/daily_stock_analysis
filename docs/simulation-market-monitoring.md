@@ -273,6 +273,17 @@ Level-2 只允许使用交易所授权、持牌数据商或用户本人账户已
 | `MARKET_SCAN_HK_MEMBERSHIP_CACHE_MAX_AGE_HOURS` | `840` | 港股通成员集合最多复用35天；刷新报价不延长成员有效期 |
 | `MARKET_SCAN_SNAPSHOT_RETRY_BACKOFF_SECONDS` | `1.0` | A/H 主备快照重试的指数退避基数（秒） |
 | `MARKET_SCAN_MIN_ACTIONABLE_DATA_QUALITY` | `0.70` | 可进入盘中买入区复核的最低数据质量 |
+| `MARKET_SCAN_SNAPSHOT_PROVIDER_TIMEOUT_SECONDS` | `150` | 单个全市场快照 loader 的硬截止时间；库内无超时请求也不能拖死整轮 |
+| `MARKET_SCAN_SNAPSHOT_STAGE_TIMEOUT_SECONDS` | `480` | 单市场快照主备与缓存阶段总预算 |
+| `MARKET_SCAN_HISTORY_SYMBOL_TIMEOUT_SECONDS` | `45` | 单只候选历史行情与交易计划调用预算 |
+| `MARKET_SCAN_HISTORY_STAGE_TIMEOUT_SECONDS` | `900` | 历史候选批次总预算；耗尽后整轮失败关闭 |
+| `MARKET_SCAN_RESEARCH_SYMBOL_TIMEOUT_SECONDS` | `30` | 单只候选非关键研究补证预算；超时只记数据缺口 |
+| `MARKET_SCAN_RESEARCH_STAGE_TIMEOUT_SECONDS` | `300` | 最终候选研究补证批次总预算 |
+| `MARKET_SCAN_TOTAL_TIMEOUT_SECONDS` | `1800` | 应用层整轮预算（30分钟），必须早于 Actions 75分钟硬超时与盘中迟到边界 |
+
+扫描会把当前阶段、序号/标的、provider、开始时间、耗时、尝试次数、预算、结果和异常类型写入结构化日志，并持续原子更新 `data/market_scan/runtime.json`。单个 provider 或标的超时会进入既有 fallback、数据缺口或安全排除；关键阶段或整轮预算耗尽时主动以失败关闭并保留最后执行上下文，不把缺失数据当成通过。
+
+盘中 `01` 的扫描 watchdog 最多同步等待120秒。当前时段 `02` 仍在运行时记录为 `pending` 后立即结束观察，不阻塞健康的分钟主监控；分钟主监控收尾时只做一次零等待、禁止派发的最终复查。最终取消、超时、失败及产物未就绪分别保留真实 run ID 和故障码，后续成功同步才发送一次恢复通知。
 
 港股实时监控也兼容 Legacy `LONGBRIDGE_APP_KEY`、`LONGBRIDGE_APP_SECRET`、
 `LONGBRIDGE_ACCESS_TOKEN` 三件套；OAuth 与 Legacy 均未配置或认证失败时，港股行情

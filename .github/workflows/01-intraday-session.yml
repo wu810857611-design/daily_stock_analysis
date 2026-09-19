@@ -641,6 +641,8 @@ jobs:
               --slot "$SESSION" \
               --repo "$GITHUB_REPOSITORY" \
               --ref "$GITHUB_REF_NAME" \
+              --sync-timeout-seconds 120 \
+              --sync-poll-seconds 10 \
               --sync-latest-path "$INTRADAY_CANDIDATE_PLANS_PATH" \
               --output "reports/market_scan_watchdog_${SESSION}.json" &
             WATCHDOG_PID=$!
@@ -675,8 +677,18 @@ jobs:
           if [ -n "$WATCHDOG_PID" ]; then
             set +e
             wait "$WATCHDOG_PID"
+            WATCHDOG_BACKGROUND_STATUS=$?
+            python3 scripts/market_scan_watchdog.py \
+              --slot "$SESSION" \
+              --repo "$GITHUB_REPOSITORY" \
+              --ref "$GITHUB_REF_NAME" \
+              --observe-only \
+              --sync-timeout-seconds 0 \
+              --sync-latest-path "$INTRADAY_CANDIDATE_PLANS_PATH" \
+              --output "reports/market_scan_watchdog_${SESSION}.json"
             WATCHDOG_STATUS=$?
             set -e
+            echo "ℹ️ 扫描 watchdog 后台状态=${WATCHDOG_BACKGROUND_STATUS}，收尾复查状态=${WATCHDOG_STATUS}"
             set +e
             python3 scripts/market_scan_subchain_status.py \
               --watchdog-report "reports/market_scan_watchdog_${SESSION}.json" \

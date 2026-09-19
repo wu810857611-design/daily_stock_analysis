@@ -18,8 +18,10 @@ import copy
 import json
 import math
 import os
+import queue
 import re
 import tempfile
+import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -67,6 +69,101 @@ FULL_CONSENSUS_MODE = "full_dual_pass"
 
 class MarketScanError(RuntimeError):
     """Raised when a scan cannot satisfy its safety contract."""
+
+
+class MarketScanDeadlineExceeded(MarketScanError):
+    """Raised when a bounded scan operation exhausts its deadline."""
+
+    def __init__(
+        self,
+        *,
+        stage_name: str,
+        item_or_symbol: str,
+        provider: str,
+        timeout_budget: float,
+        scope: str,
+    ) -> None:
+        self.stage_name = stage_name
+        self.item_or_symbol = item_or_symbol
+        self.provider = provider
+        self.timeout_budget = float(timeout_budget)
+        self.scope = scope
+        super().__init__(
+            f"{scope}_timeout:stage={stage_name}:item={item_or_symbol}:"
+            f"provider={provider}:budget={timeout_budget:.3f}s"
+        )
+
+
+def _call_with_hard_timeout(
+    callback: Callable[[], Any],
+    *,
+    timeout_seconds: float,
+    stage_name: str,
+    item_or_symbol: str,
+    provider: str,
+    attempt: int = 1,
+) -> Any:
+    """Run an untrusted blocking SDK call behind a daemon-thread deadline."""
+
+    started_monotonic = time.monotonic()
+    started_at = _now_shanghai().isoformat(timespec="seconds")
+    outcome: queue.Queue[Tuple[str, Any]] = queue.Queue(maxsize=1)
+
+    def invoke() -> None:
+        try:
+            outcome.put(("ok", callback()))
+        except BaseException as exc:  # noqa: BLE001 - transported to caller.
+            outcome.put(("error", exc))
+
+    thread = threading.Thread(
+        target=invoke,
+        name=f"market-scan-{stage_name}-{provider}"[:80],
+        daemon=True,
+    )
+    event = {
+        "event": "market_scan_stage",
+        "stage_name": stage_name,
+        "item_or_symbol": item_or_symbol,
+        "provider": provider,
+        "started_at": started_at,
+        "elapsed": 0.0,
+        "attempt": int(attempt),
+        "timeout_budget": round(float(timeout_seconds), 3),
+        "result": "started",
+        "error_class": "",
+    }
+    print(json.dumps(event, ensure_ascii=False, sort_keys=True), flush=True)
+    thread.start()
+    thread.join(max(0.001, float(timeout_seconds)))
+    elapsed = time.monotonic() - started_monotonic
+    if thread.is_alive():
+        event.update(
+            {
+                "elapsed": round(elapsed, 3),
+                "result": "timeout",
+                "error_class": "MarketScanDeadlineExceeded",
+            }
+        )
+        print(json.dumps(event, ensure_ascii=False, sort_keys=True), flush=True)
+        raise MarketScanDeadlineExceeded(
+            stage_name=stage_name,
+            item_or_symbol=item_or_symbol,
+            provider=provider,
+            timeout_budget=timeout_seconds,
+            scope="call",
+        )
+    kind, value = outcome.get_nowait()
+    event.update(
+        {
+            "elapsed": round(elapsed, 3),
+            "result": "success" if kind == "ok" else "error",
+            "error_class": "" if kind == "ok" else type(value).__name__,
+        }
+    )
+    print(json.dumps(event, ensure_ascii=False, sort_keys=True), flush=True)
+    if kind == "error":
+        raise value
+    return value
 
 
 def _membership_cache_warning(
@@ -125,11 +222,21 @@ class MarketScanConfig:
     enabled_markets: Tuple[str, ...] = (MARKET_A, MARKET_HK)
     snapshot_retries: int = 2
     snapshot_retry_backoff_seconds: float = 0.0
+    snapshot_provider_timeout_seconds: float = 150.0
+    snapshot_stage_timeout_seconds: float = 480.0
+    history_symbol_timeout_seconds: float = 45.0
+    history_stage_timeout_seconds: float = 900.0
+    research_symbol_timeout_seconds: float = 30.0
+    research_stage_timeout_seconds: float = 300.0
+    reviewer_timeout_seconds: float = 540.0
+    reviewer_stage_timeout_seconds: float = 1100.0
+    total_timeout_seconds: float = 1800.0
     a_cache_path: Path = Path("data/market_scan/a_share_snapshot.json")
     hk_cache_path: Path = Path("data/market_scan/hk_connect_snapshot.json")
     hk_membership_cache_path: Path = Path(
         "data/market_scan/hk_connect_membership.json"
     )
+    runtime_state_path: Path = Path("data/market_scan/runtime.json")
 
     def __post_init__(self) -> None:
         if self.top_a_history < 1 or self.top_hk_history < 1:
@@ -144,6 +251,21 @@ class MarketScanConfig:
             raise ValueError("snapshot_retries must be between 1 and 5")
         if self.snapshot_retry_backoff_seconds < 0:
             raise ValueError("snapshot_retry_backoff_seconds cannot be negative")
+        timeout_fields = (
+            self.snapshot_provider_timeout_seconds,
+            self.snapshot_stage_timeout_seconds,
+            self.history_symbol_timeout_seconds,
+            self.history_stage_timeout_seconds,
+            self.research_symbol_timeout_seconds,
+            self.research_stage_timeout_seconds,
+            self.reviewer_timeout_seconds,
+            self.reviewer_stage_timeout_seconds,
+            self.total_timeout_seconds,
+        )
+        if any(value <= 0 for value in timeout_fields):
+            raise ValueError("market scan timeout budgets must be positive")
+        if self.total_timeout_seconds >= 75 * 60:
+            raise ValueError("total_timeout_seconds must remain below GitHub's 75m limit")
         if self.hk_membership_cache_max_age_hours <= 0:
             raise ValueError("hk_membership_cache_max_age_hours must be positive")
         if not 0.70 <= self.min_actionable_data_quality <= 1:
@@ -1020,6 +1142,7 @@ class MarketScanService:
         config: Optional[MarketScanConfig] = None,
         clock: Clock = _now_shanghai,
         sleeper: Sleeper = time.sleep,
+        monotonic: Callable[[], float] = time.monotonic,
     ):
         self.a_snapshot_loader = a_snapshot_loader
         self.hk_connect_snapshot_loader = hk_connect_snapshot_loader
@@ -1032,6 +1155,173 @@ class MarketScanService:
         self.config = config or MarketScanConfig()
         self.clock = clock
         self.sleeper = sleeper
+        self.monotonic = monotonic
+        self._scan_started_monotonic: Optional[float] = None
+        self._scan_started_at = ""
+        self._total_deadline: Optional[float] = None
+        self._stage_deadline: Optional[float] = None
+        self._stage_name = "initializing"
+        self._runtime_failures: List[str] = []
+        self._last_stage_event: Dict[str, Any] = {}
+
+    def _start_scan_budget(self) -> None:
+        if self._scan_started_monotonic is not None:
+            return
+        self._scan_started_monotonic = self.monotonic()
+        self._scan_started_at = _iso_datetime(self.clock())
+        self._total_deadline = (
+            self._scan_started_monotonic + self.config.total_timeout_seconds
+        )
+        self._write_runtime_state(status="running")
+
+    def _begin_stage(self, stage_name: str, budget_seconds: float) -> None:
+        self._start_scan_budget()
+        now = self.monotonic()
+        self._stage_name = stage_name
+        self._stage_deadline = min(
+            float(self._total_deadline or now), now + float(budget_seconds)
+        )
+
+    def _remaining_call_budget(self, requested: float) -> Tuple[float, str]:
+        now = self.monotonic()
+        total_remaining = float(self._total_deadline or now) - now
+        stage_remaining = float(self._stage_deadline or now) - now
+        budget = min(float(requested), total_remaining, stage_remaining)
+        if budget <= 0:
+            scope = "total" if total_remaining <= 0 else "stage"
+            failure = f"market_scan_{scope}_timeout:{self._stage_name}"
+            if scope == "total":
+                self._runtime_failures.append(failure)
+                self._write_runtime_state(status="timeout", error=failure)
+            raise MarketScanDeadlineExceeded(
+                stage_name=self._stage_name,
+                item_or_symbol="",
+                provider="budget_guard",
+                timeout_budget=max(0.0, budget),
+                scope=scope,
+            )
+        scope = (
+            "total"
+            if total_remaining <= min(float(requested), stage_remaining)
+            else "stage"
+            if stage_remaining <= float(requested)
+            else "call"
+        )
+        return budget, scope
+
+    def _write_runtime_state(self, *, status: str, error: str = "") -> None:
+        started = self._scan_started_monotonic
+        payload = {
+            "schema_version": 1,
+            "status": status,
+            "scan_started_at": self._scan_started_at,
+            "updated_at": _iso_datetime(self.clock()),
+            "elapsed_seconds": round(
+                max(0.0, self.monotonic() - started) if started is not None else 0.0,
+                3,
+            ),
+            "stage_name": self._stage_name,
+            "last_stage_event": _json_safe(self._last_stage_event),
+            "operational_failures": list(dict.fromkeys(self._runtime_failures)),
+            "error": str(error or "")[:1000],
+            "simulation_only": True,
+            "auto_order_enabled": False,
+        }
+        _atomic_write_json(self.config.runtime_state_path, payload)
+
+    def record_termination(self, reason: str) -> None:
+        """Persist the last active call when the runner receives termination."""
+
+        self._runtime_failures.append("market_scan_terminated")
+        self._write_runtime_state(status="terminated", error=reason)
+
+    def runtime_diagnostics(self) -> Dict[str, Any]:
+        try:
+            payload = json.loads(
+                self.config.runtime_state_path.read_text(encoding="utf-8")
+            )
+        except (FileNotFoundError, OSError, json.JSONDecodeError):
+            return {}
+        return dict(payload) if isinstance(payload, Mapping) else {}
+
+    def _timed_call(
+        self,
+        callback: Callable[[], Any],
+        *,
+        timeout_seconds: float,
+        item_or_symbol: str,
+        provider: str,
+        attempt: int = 1,
+    ) -> Any:
+        budget, limiting_scope = self._remaining_call_budget(timeout_seconds)
+        started_monotonic = self.monotonic()
+        started_at = _iso_datetime(self.clock())
+        outcome: queue.Queue[Tuple[str, Any]] = queue.Queue(maxsize=1)
+
+        def invoke() -> None:
+            try:
+                outcome.put(("ok", callback()))
+            except BaseException as exc:  # noqa: BLE001 - transported to caller.
+                outcome.put(("error", exc))
+
+        event = {
+            "event": "market_scan_stage",
+            "stage_name": self._stage_name,
+            "item_or_symbol": item_or_symbol,
+            "provider": provider,
+            "started_at": started_at,
+            "elapsed": 0.0,
+            "attempt": int(attempt),
+            "timeout_budget": round(budget, 3),
+            "result": "started",
+            "error_class": "",
+        }
+        self._last_stage_event = dict(event)
+        self._write_runtime_state(status="running")
+        print(json.dumps(event, ensure_ascii=False, sort_keys=True), flush=True)
+        thread = threading.Thread(
+            target=invoke,
+            name=f"market-scan-{self._stage_name}-{provider}"[:80],
+            daemon=True,
+        )
+        thread.start()
+        thread.join(max(0.001, budget))
+        elapsed = self.monotonic() - started_monotonic
+        if thread.is_alive():
+            event.update(
+                {
+                    "elapsed": round(elapsed, 3),
+                    "result": "timeout",
+                    "error_class": "MarketScanDeadlineExceeded",
+                }
+            )
+            self._last_stage_event = dict(event)
+            failure = f"market_scan_{limiting_scope}_timeout:{self._stage_name}"
+            if limiting_scope == "total":
+                self._runtime_failures.append(failure)
+            self._write_runtime_state(status="timeout", error=failure)
+            print(json.dumps(event, ensure_ascii=False, sort_keys=True), flush=True)
+            raise MarketScanDeadlineExceeded(
+                stage_name=self._stage_name,
+                item_or_symbol=item_or_symbol,
+                provider=provider,
+                timeout_budget=budget,
+                scope=limiting_scope,
+            )
+        kind, value = outcome.get_nowait()
+        event.update(
+            {
+                "elapsed": round(elapsed, 3),
+                "result": "success" if kind == "ok" else "error",
+                "error_class": "" if kind == "ok" else type(value).__name__,
+            }
+        )
+        self._last_stage_event = dict(event)
+        self._write_runtime_state(status="running")
+        print(json.dumps(event, ensure_ascii=False, sort_keys=True), flush=True)
+        if kind == "error":
+            raise value
+        return value
 
     def _wait_before_snapshot_retry(self, attempt: int) -> None:
         """Apply bounded exponential backoff between provider attempts."""
@@ -1143,12 +1433,21 @@ class MarketScanService:
         self,
         now: datetime,
     ) -> Tuple[pd.DataFrame, Dict[str, Any], bool, str]:
+        self._begin_stage("a_share_snapshot", self.config.snapshot_stage_timeout_seconds)
         provider_errors: List[str] = []
         for attempt in range(self.config.snapshot_retries):
             if attempt:
                 self._wait_before_snapshot_retry(attempt - 1)
             try:
-                raw = self.a_snapshot_loader()
+                raw = self._timed_call(
+                    self.a_snapshot_loader,
+                    timeout_seconds=self.config.snapshot_provider_timeout_seconds,
+                    item_or_symbol=MARKET_A,
+                    provider=getattr(
+                        self.a_snapshot_loader, "__name__", "a_snapshot_loader"
+                    ),
+                    attempt=attempt + 1,
+                )
                 frame_raw, metadata = _coerce_snapshot_payload(raw, now=now)
                 if not bool(metadata.get("is_full_a_universe")):
                     raise MarketScanError("A-share provider did not prove full-market coverage")
@@ -1173,6 +1472,8 @@ class MarketScanService:
                 metadata["provider_errors"] = cache_payload["provider_errors"]
                 return frame.reset_index(drop=True), metadata, False, ""
             except Exception as exc:  # noqa: BLE001 - bounded retries precede cache fallback.
+                if isinstance(exc, MarketScanDeadlineExceeded) and exc.scope == "total":
+                    raise
                 provider_errors.append(f"attempt_{attempt + 1}:{type(exc).__name__}:{exc}")
 
         cached = self._read_snapshot_cache(
@@ -1207,12 +1508,25 @@ class MarketScanService:
         self,
         now: datetime,
     ) -> Tuple[pd.DataFrame, Dict[str, Any], bool, str]:
+        self._begin_stage(
+            "hk_connect_snapshot", self.config.snapshot_stage_timeout_seconds
+        )
         provider_errors: List[str] = []
         for attempt in range(self.config.snapshot_retries):
             if attempt:
                 self._wait_before_snapshot_retry(attempt - 1)
             try:
-                raw = self.hk_connect_snapshot_loader()
+                raw = self._timed_call(
+                    self.hk_connect_snapshot_loader,
+                    timeout_seconds=self.config.snapshot_provider_timeout_seconds,
+                    item_or_symbol=MARKET_HK,
+                    provider=getattr(
+                        self.hk_connect_snapshot_loader,
+                        "__name__",
+                        "hk_connect_snapshot_loader",
+                    ),
+                    attempt=attempt + 1,
+                )
                 frame_raw, metadata = _coerce_snapshot_payload(raw, now=now)
                 if not bool(metadata.get("is_connect_universe")):
                     raise MarketScanError("HK provider did not prove Stock Connect membership")
@@ -1251,6 +1565,8 @@ class MarketScanService:
                 )
                 return frame.reset_index(drop=True), metadata, False, ""
             except Exception as exc:  # noqa: BLE001 - bounded retries precede cache fallback.
+                if isinstance(exc, MarketScanDeadlineExceeded) and exc.scope == "total":
+                    raise
                 provider_errors.append(f"connect:{type(exc).__name__}:{exc}")
 
         membership = self._read_hk_membership_cache(now)
@@ -1260,7 +1576,19 @@ class MarketScanService:
                 if attempt:
                     self._wait_before_snapshot_retry(attempt - 1)
                 try:
-                    raw = self.hk_membership_snapshot_loader(sorted(membership_codes))
+                    raw = self._timed_call(
+                        lambda: self.hk_membership_snapshot_loader(
+                            sorted(membership_codes)
+                        ),
+                        timeout_seconds=self.config.snapshot_provider_timeout_seconds,
+                        item_or_symbol=f"{len(membership_codes)}_connect_symbols",
+                        provider=getattr(
+                            self.hk_membership_snapshot_loader,
+                            "__name__",
+                            "hk_membership_snapshot_loader",
+                        ),
+                        attempt=attempt + 1,
+                    )
                     frame_raw, metadata = _coerce_snapshot_payload(raw, now=now)
                     if not bool(metadata.get("is_connect_universe")):
                         raise MarketScanError(
@@ -1322,6 +1650,8 @@ class MarketScanService:
                     )
                     return frame.reset_index(drop=True), metadata, False, ""
                 except Exception as exc:  # noqa: BLE001 - bounded provider fallback.
+                    if isinstance(exc, MarketScanDeadlineExceeded) and exc.scope == "total":
+                        raise
                     provider_errors.append(
                         f"membership_quotes:{type(exc).__name__}:{exc}"
                     )
@@ -1332,7 +1662,17 @@ class MarketScanService:
                 if attempt:
                     self._wait_before_snapshot_retry(attempt - 1)
                 try:
-                    raw = self.hk_all_snapshot_loader()
+                    raw = self._timed_call(
+                        self.hk_all_snapshot_loader,
+                        timeout_seconds=self.config.snapshot_provider_timeout_seconds,
+                        item_or_symbol="all_hk_quotes",
+                        provider=getattr(
+                            self.hk_all_snapshot_loader,
+                            "__name__",
+                            "hk_all_snapshot_loader",
+                        ),
+                        attempt=attempt + 1,
+                    )
                     frame_raw, metadata = _coerce_snapshot_payload(raw, now=now)
                     if not bool(metadata.get("is_full_hk_universe")):
                         raise MarketScanError("HK quote fallback did not prove full-market coverage")
@@ -1392,6 +1732,8 @@ class MarketScanService:
                     )
                     return frame.reset_index(drop=True), metadata, False, ""
                 except Exception as exc:  # noqa: BLE001 - bounded provider fallback.
+                    if isinstance(exc, MarketScanDeadlineExceeded) and exc.scope == "total":
+                        raise
                     provider_errors.append(f"all_hk:{type(exc).__name__}:{exc}")
 
         cached = self._read_snapshot_cache(
@@ -1596,14 +1938,26 @@ class MarketScanService:
     def run(self) -> Dict[str, Any]:
         """Run all stages and return a JSON-serialisable result."""
 
+        self._start_scan_budget()
         generated_at = _iso_datetime(self.clock())
         l1 = self.run_l1()
         history_candidates: List[Dict[str, Any]] = []
         history_rejections: Dict[str, str] = {}
-        for candidate in [*l1.a_candidates, *l1.hk_candidates]:
+        history_inputs = [*l1.a_candidates, *l1.hk_candidates]
+        self._begin_stage("history_and_trade_plan", self.config.history_stage_timeout_seconds)
+        for index, candidate in enumerate(history_inputs):
             code = str(candidate.get("code") or "")
             try:
-                raw_history = self.history_loader(code, self.config.history_lookback_days)
+                raw_history = self._timed_call(
+                    lambda candidate_code=code: self.history_loader(
+                        candidate_code, self.config.history_lookback_days
+                    ),
+                    timeout_seconds=self.config.history_symbol_timeout_seconds,
+                    item_or_symbol=f"{index + 1}/{len(history_inputs)}:{code}",
+                    provider=getattr(
+                        self.history_loader, "__name__", "history_loader"
+                    ),
+                )
                 history, source = _normalise_history(raw_history)
                 enriched, rejection = _history_features(
                     candidate,
@@ -1611,6 +1965,16 @@ class MarketScanService:
                     source=source,
                     config=self.config,
                 )
+            except MarketScanDeadlineExceeded as exc:
+                if exc.scope == "total":
+                    raise
+                if exc.scope == "stage":
+                    self._runtime_failures.append("market_scan_stage_timeout:history")
+                    for remaining in history_inputs[index:]:
+                        remaining_code = str(remaining.get("code") or "")
+                        history_rejections[remaining_code] = "history_stage_timeout"
+                    break
+                enriched, rejection = None, "history_timeout"
             except Exception as exc:  # noqa: BLE001 - one symbol must not abort the scan.
                 enriched, rejection = None, f"history_error:{type(exc).__name__}"
             if enriched is None:
@@ -1630,29 +1994,64 @@ class MarketScanService:
         research_available_count = 0
         research_errors: Dict[str, List[str]] = {}
         review_payload = []
-        for candidate in ranked:
+        self._begin_stage(
+            "research_enrichment", self.config.research_stage_timeout_seconds
+        )
+        research_stage_exhausted = False
+        for index, candidate in enumerate(ranked):
             code = str(candidate.get("code") or "")
             research_evidence: Dict[str, Any] = {}
             if self.research_evidence_loader is not None:
                 research_requested_count += 1
-                try:
-                    raw_research = self.research_evidence_loader(copy.deepcopy(candidate))
-                    if isinstance(raw_research, Mapping):
-                        research_evidence = dict(raw_research)
-                    else:
-                        research_evidence = {
-                            "attempted": True,
-                            "status": "unavailable",
-                            "errors": ["research_evidence_invalid_payload"],
-                        }
-                except Exception as exc:  # noqa: BLE001 - one symbol must not abort review.
+                if research_stage_exhausted:
                     research_evidence = {
                         "attempted": True,
                         "status": "unavailable",
-                        "errors": [
-                            f"research_evidence_error:{type(exc).__name__}"
-                        ],
+                        "errors": ["research_stage_timeout"],
                     }
+                else:
+                    try:
+                        raw_research = self._timed_call(
+                            lambda candidate_value=copy.deepcopy(candidate): (
+                                self.research_evidence_loader(candidate_value)
+                            ),
+                            timeout_seconds=self.config.research_symbol_timeout_seconds,
+                            item_or_symbol=f"{index + 1}/{len(ranked)}:{code}",
+                            provider=getattr(
+                                self.research_evidence_loader,
+                                "__name__",
+                                "research_evidence_loader",
+                            ),
+                        )
+                        if isinstance(raw_research, Mapping):
+                            research_evidence = dict(raw_research)
+                        else:
+                            research_evidence = {
+                                "attempted": True,
+                                "status": "unavailable",
+                                "errors": ["research_evidence_invalid_payload"],
+                            }
+                    except MarketScanDeadlineExceeded as exc:
+                        if exc.scope == "total":
+                            raise
+                        research_stage_exhausted = exc.scope == "stage"
+                        research_evidence = {
+                            "attempted": True,
+                            "status": "unavailable",
+                            "errors": [
+                                "research_stage_timeout"
+                                if research_stage_exhausted
+                                else "research_evidence_timeout"
+                            ],
+                        }
+                    except Exception as exc:  # noqa: BLE001 - one symbol must not abort review.
+                        research_evidence = {
+                            "attempted": True,
+                            "status": "unavailable",
+                            "errors": [
+                                f"research_evidence_error:{type(exc).__name__}"
+                            ],
+                        }
                 research_evidence["attempted"] = True
                 research_attempted_count += 1
                 if str(research_evidence.get("status") or "").lower() in {
@@ -1699,6 +2098,7 @@ class MarketScanService:
                 "human_confirmation_required": True,
             }
             review_payload.append(payload)
+        self._begin_stage("dual_model_review", self.config.reviewer_stage_timeout_seconds)
         qwen_reviews, qwen_error = self._call_reviewer(
             "qwen",
             self.qwen_reviewer,
@@ -1987,8 +2387,13 @@ class MarketScanService:
             push_block_reasons.append("通义或 DeepSeek 独立复核未完成，已停止主动推荐推送")
         if not candidates:
             push_block_reasons.append("没有通过数据、趋势和风险回报护栏的候选")
+        if any(
+            reason.startswith(("market_scan_stage_timeout", "market_scan_total_timeout"))
+            for reason in self._runtime_failures
+        ):
+            push_block_reasons.append("全市场扫描阶段预算耗尽，结果不完整，已停止主动推荐推送")
 
-        operational_failures: List[str] = []
+        operational_failures: List[str] = list(dict.fromkeys(self._runtime_failures))
         operational_warnings: List[str] = []
         if l1.a_safe_halt:
             operational_failures.append("a_share_full_market_snapshot_unavailable")
@@ -2017,7 +2422,12 @@ class MarketScanService:
         any_active_market_blocked = any(
             active_snapshot_halts[market] for market in enabled_markets
         )
-        if all_active_markets_blocked:
+        if any(
+            reason.startswith(("market_scan_stage_timeout", "market_scan_total_timeout"))
+            for reason in operational_failures
+        ):
+            operational_status = "failed"
+        elif all_active_markets_blocked:
             operational_status = "failed"
         elif ranked and not review_complete:
             operational_status = "failed"
@@ -2114,6 +2524,7 @@ class MarketScanService:
             },
             "diagnostics": {
                 **l1.diagnostics,
+                "runtime": self.runtime_diagnostics(),
                 "history_requested_count": len(l1.a_candidates) + len(l1.hk_candidates),
                 "history_accepted_count": len(history_candidates),
                 "history_rejections": history_rejections,
@@ -2146,6 +2557,9 @@ class MarketScanService:
                 "最终是否执行仍由用户人工决定。"
             ),
         }
+        self._stage_name = "completed"
+        self._write_runtime_state(status="completed")
+        result["diagnostics"]["runtime"] = self.runtime_diagnostics()
         return _json_safe(result)
 
     @staticmethod
@@ -2176,8 +2590,8 @@ class MarketScanService:
         )
         return {field: copy.deepcopy(candidate.get(field)) for field in fields}
 
-    @staticmethod
     def _call_reviewer(
+        self,
         label: str,
         reviewer: Optional[Reviewer],
         payload: Sequence[Mapping[str, Any]],
@@ -2192,9 +2606,16 @@ class MarketScanService:
             for candidate in candidates
         }
         try:
-            raw = reviewer(copy.deepcopy(list(payload)))
+            raw = self._timed_call(
+                lambda: reviewer(copy.deepcopy(list(payload))),
+                timeout_seconds=self.config.reviewer_timeout_seconds,
+                item_or_symbol=f"{len(payload)}_candidates",
+                provider=f"{label}_reviewer",
+            )
             reviews = _normalise_review_payload(raw, candidates, market_by_code)
         except Exception as exc:  # noqa: BLE001 - model failure becomes a safe watch result.
+            if isinstance(exc, MarketScanDeadlineExceeded) and exc.scope == "total":
+                raise
             reason_code = str(
                 getattr(exc, "reason_code", "")
                 or type(exc).__name__
@@ -2261,7 +2682,13 @@ def default_a_snapshot_loader() -> Mapping[str, Any]:
         "stock_zh_a_spot",
     ):
         try:
-            frame = getattr(ak, provider_name)()
+            frame = _call_with_hard_timeout(
+                getattr(ak, provider_name),
+                timeout_seconds=45.0,
+                stage_name="a_share_snapshot_provider",
+                item_or_symbol=MARKET_A,
+                provider=f"akshare.{provider_name}",
+            )
             if not isinstance(frame, pd.DataFrame) or frame.empty:
                 raise MarketScanError("provider returned an empty full-market snapshot")
             return {
@@ -2281,13 +2708,121 @@ def default_hk_connect_snapshot_loader() -> Mapping[str, Any]:
 
     import akshare as ak
 
-    frame = ak.stock_hk_ggt_components_em()
+    frame = _call_with_hard_timeout(
+        ak.stock_hk_ggt_components_em,
+        timeout_seconds=60.0,
+        stage_name="hk_connect_membership_provider",
+        item_or_symbol=MARKET_HK,
+        provider="akshare.stock_hk_ggt_components_em",
+    )
     return {
         "records": frame,
         "fetched_at": _iso_datetime(_now_shanghai()),
         "source": "akshare.stock_hk_ggt_components_em",
         "is_connect_universe": True,
     }
+
+
+def _load_sina_hk_spot_bounded(*, total_timeout_seconds: float = 55.0) -> pd.DataFrame:
+    """Fetch Sina's paginated HK universe with per-request and total deadlines.
+
+    AkShare's public ``stock_hk_spot`` currently performs up to 99 bare
+    ``requests.get`` calls without timeouts.  Owning this narrow boundary makes
+    the exact page visible and prevents one page from pinning the whole scan.
+    """
+
+    import requests
+
+    url = (
+        "https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/"
+        "Market_Center.getHKStockData"
+    )
+    params = {
+        "page": "1",
+        "num": "60",
+        "sort": "symbol",
+        "asc": "1",
+        "node": "qbgg_hk",
+        "_s_r_a": "init",
+    }
+    started = time.monotonic()
+    frames: List[pd.DataFrame] = []
+    for page in range(1, 100):
+        elapsed = time.monotonic() - started
+        remaining = float(total_timeout_seconds) - elapsed
+        if remaining <= 0:
+            raise MarketScanDeadlineExceeded(
+                stage_name="hk_sina_pages",
+                item_or_symbol=f"page={page}/99",
+                provider="sina_hk_spot",
+                timeout_budget=total_timeout_seconds,
+                scope="stage",
+            )
+        page_started = _now_shanghai().isoformat(timespec="seconds")
+        page_event = {
+            "event": "market_scan_stage",
+            "stage_name": "hk_sina_pages",
+            "item_or_symbol": f"page={page}/99",
+            "provider": "sina_hk_spot",
+            "started_at": page_started,
+            "elapsed": round(elapsed, 3),
+            "attempt": 1,
+            "timeout_budget": round(min(remaining, 10.0), 3),
+            "result": "started",
+            "error_class": "",
+        }
+        print(json.dumps(page_event, ensure_ascii=False, sort_keys=True), flush=True)
+        params["page"] = str(page)
+        try:
+            response = requests.get(
+                url,
+                params=params,
+                timeout=(min(5.0, remaining), min(10.0, remaining)),
+            )
+            response.raise_for_status()
+            data = response.json()
+        except Exception as exc:
+            page_event.update(
+                {
+                    "elapsed": round(time.monotonic() - started, 3),
+                    "result": "error",
+                    "error_class": type(exc).__name__,
+                }
+            )
+            print(
+                json.dumps(page_event, ensure_ascii=False, sort_keys=True),
+                flush=True,
+            )
+            raise
+        page_event.update(
+            {
+                "elapsed": round(time.monotonic() - started, 3),
+                "result": "success",
+            }
+        )
+        print(json.dumps(page_event, ensure_ascii=False, sort_keys=True), flush=True)
+        if not data:
+            break
+        frames.append(pd.DataFrame(data))
+    if not frames:
+        return pd.DataFrame()
+    frame = pd.concat(frames, ignore_index=True)
+    frame.columns = [
+        "代码", "中文名称", "英文名称", "交易类型", "最新价", "昨收", "今开",
+        "最高", "最低", "成交量", "-1", "成交额", "日期时间", "买一", "卖一",
+        "-2", "-3", "-4", "-5", "-6", "涨跌额", "涨跌幅", "-7", "-8",
+    ]
+    selected = [
+        "日期时间", "代码", "中文名称", "英文名称", "交易类型", "最新价", "涨跌额",
+        "涨跌幅", "昨收", "今开", "最高", "最低", "成交量", "成交额", "买一", "卖一",
+    ]
+    frame = frame[selected]
+    for column in (
+        "最新价", "涨跌额", "涨跌幅", "昨收", "今开", "最高", "最低", "成交量",
+        "成交额", "买一", "卖一",
+    ):
+        frame[column] = pd.to_numeric(frame[column], errors="coerce")
+    return frame
 
 
 def default_hk_all_snapshot_loader() -> Mapping[str, Any]:
@@ -2298,7 +2833,21 @@ def default_hk_all_snapshot_loader() -> Mapping[str, Any]:
     provider_errors: List[str] = []
     for provider_name in ("stock_hk_spot_em", "stock_hk_spot"):
         try:
-            frame = getattr(ak, provider_name)()
+            provider_callback = getattr(ak, provider_name)
+            if (
+                provider_name == "stock_hk_spot"
+                and str(getattr(provider_callback, "__module__", "")).startswith(
+                    "akshare"
+                )
+            ):
+                provider_callback = _load_sina_hk_spot_bounded
+            frame = _call_with_hard_timeout(
+                provider_callback,
+                timeout_seconds=60.0,
+                stage_name="hk_all_snapshot_provider",
+                item_or_symbol="all_hk_quotes",
+                provider=f"akshare.{provider_name}",
+            )
             if not isinstance(frame, pd.DataFrame) or frame.empty:
                 raise MarketScanError("provider returned an empty full-market snapshot")
             return {

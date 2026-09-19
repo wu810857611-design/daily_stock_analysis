@@ -133,7 +133,7 @@ def test_watchdog_timeout_reports_upstream_failure_and_keeps_previous_file(tmp_p
         client=Client(), workflow="02-market-scan.yml", ref="main",
         sync_latest_path=target, sync_timeout_seconds=0,
     )
-    assert result["sync"]["status"] == "timeout"
+    assert result["sync"]["status"] == "failed"
     assert result["sync"]["error"] == "market_scan_run_failed:failure:run=88"
     assert target.read_text() == "previous validated snapshot"
 
@@ -333,7 +333,7 @@ def test_watchdog_dispatches_only_when_slot_is_not_covered() -> None:
             }
         ]
     )
-    dispatched = run_watchdog(
+    observed_failure = run_watchdog(
         slot="morning",
         now_fn=lambda: now,
         sleep_fn=lambda _seconds: None,
@@ -341,10 +341,195 @@ def test_watchdog_dispatches_only_when_slot_is_not_covered() -> None:
         workflow="02-market-scan.yml",
         ref="main",
     )
-    assert dispatched["status"] == "dispatched"
-    assert failed_client.dispatches == [
-        ("02-market-scan.yml", "main", "morning")
-    ]
+    assert observed_failure["status"] == "already_failed"
+    assert observed_failure["observed_run"]["conclusion"] == "failure"
+    assert failed_client.dispatches == []
+
+
+def test_watchdog_reports_in_progress_without_duplicate_dispatch(tmp_path: Path) -> None:
+    now = datetime(2026, 9, 18, 14, 44, tzinfo=TZ)
+
+    class Client:
+        def recent_runs(self, *_args):
+            return [{
+                "id": 141,
+                "created_at": "2026-09-18T06:42:00Z",
+                "status": "in_progress",
+                "conclusion": None,
+            }]
+
+        def dispatch(self, *_args):
+            pytest.fail("in-progress scan must not be dispatched twice")
+
+    result = run_watchdog(
+        slot="afternoon",
+        now_fn=lambda: now,
+        sleep_fn=lambda _seconds: None,
+        client=Client(),
+        workflow="02-market-scan.yml",
+        ref="main",
+        sync_latest_path=tmp_path / "latest.json",
+        sync_timeout_seconds=0,
+    )
+    assert result["status"] == "already_covered"
+    assert result["sync"] == {
+        "status": "in_progress",
+        "attempts": 1,
+        "run_id": 141,
+        "artifact_id": None,
+        "generated_at": "",
+        "content_fingerprint": "",
+        "path": str(tmp_path / "latest.json"),
+        "error": "market_scan_in_progress:run=141",
+    }
+
+
+@pytest.mark.parametrize(
+    ("conclusion", "expected"),
+    [
+        ("cancelled", "market_scan_run_cancelled:run=141"),
+        ("timed_out", "market_scan_run_timeout:run=141"),
+        ("failure", "market_scan_run_failed:failure:run=141"),
+    ],
+)
+def test_watchdog_preserves_terminal_run_reason(
+    tmp_path: Path, conclusion: str, expected: str
+) -> None:
+    now = datetime(2026, 9, 18, 14, 50, tzinfo=TZ)
+
+    class Client:
+        def recent_runs(self, *_args):
+            return [{
+                "id": 141,
+                "created_at": "2026-09-18T06:42:00Z",
+                "status": "completed",
+                "conclusion": conclusion,
+            }]
+
+        def dispatch(self, *_args):
+            pytest.fail("terminal current-slot scan must not be re-dispatched")
+
+    result = run_watchdog(
+        slot="afternoon",
+        now_fn=lambda: now,
+        sleep_fn=lambda _seconds: None,
+        client=Client(),
+        workflow="02-market-scan.yml",
+        ref="main",
+        sync_latest_path=tmp_path / "latest.json",
+        sync_timeout_seconds=0,
+    )
+    assert result["sync"]["status"] == "failed"
+    assert result["sync"]["run_id"] == 141
+    assert result["sync"]["error"] == expected
+
+
+def test_watchdog_distinguishes_successful_run_with_artifact_not_ready(
+    tmp_path: Path,
+) -> None:
+    now = datetime(2026, 9, 18, 14, 50, tzinfo=TZ)
+
+    class Client:
+        def recent_runs(self, *_args):
+            return [{
+                "id": 143,
+                "created_at": "2026-09-18T06:42:00Z",
+                "status": "completed",
+                "conclusion": "success",
+            }]
+
+        def dispatch(self, *_args):
+            pytest.fail("successful scan must not be dispatched twice")
+
+        def artifacts_for_run(self, _run_id):
+            return []
+
+    result = run_watchdog(
+        slot="afternoon",
+        now_fn=lambda: now,
+        sleep_fn=lambda _seconds: None,
+        client=Client(),
+        workflow="02-market-scan.yml",
+        ref="main",
+        sync_latest_path=tmp_path / "latest.json",
+        sync_timeout_seconds=0,
+    )
+    assert result["sync"]["status"] == "artifact_not_ready"
+    assert result["sync"]["error"] == "market_scan_state_artifact_not_ready:run=143"
+
+
+def test_watchdog_guard_skipped_success_does_not_hide_cancelled_scan(
+    tmp_path: Path,
+) -> None:
+    now = datetime(2026, 9, 18, 16, 2, tzinfo=TZ)
+
+    class Client:
+        def recent_runs(self, *_args):
+            return [
+                {
+                    "id": 142,
+                    "created_at": "2026-09-18T07:58:00Z",
+                    "status": "completed",
+                    "conclusion": "success",
+                },
+                {
+                    "id": 141,
+                    "created_at": "2026-09-18T06:42:00Z",
+                    "status": "completed",
+                    "conclusion": "cancelled",
+                },
+            ]
+
+        def dispatch(self, *_args):
+            pytest.fail("observe-only reconciliation must not dispatch")
+
+        def artifacts_for_run(self, run_id):
+            assert run_id == 142
+            return []
+
+    result = run_watchdog(
+        slot="afternoon",
+        now_fn=lambda: now,
+        sleep_fn=lambda _seconds: None,
+        client=Client(),
+        workflow="02-market-scan.yml",
+        ref="main",
+        observe_only=True,
+        sync_latest_path=tmp_path / "latest.json",
+        sync_timeout_seconds=0,
+    )
+
+    assert result["sync"]["status"] == "failed"
+    assert result["sync"]["run_id"] == 141
+    assert result["sync"]["error"] == "market_scan_run_cancelled:run=141"
+
+
+def test_watchdog_observe_only_never_dispatches_even_after_safe_window(
+    tmp_path: Path,
+) -> None:
+    now = datetime(2026, 9, 18, 16, 2, tzinfo=TZ)
+
+    class Client:
+        def recent_runs(self, *_args):
+            return []
+
+        def dispatch(self, *_args):
+            pytest.fail("observe-only final check must never dispatch")
+
+    result = run_watchdog(
+        slot="afternoon",
+        now_fn=lambda: now,
+        sleep_fn=lambda _seconds: None,
+        client=Client(),
+        workflow="02-market-scan.yml",
+        ref="main",
+        sync_latest_path=tmp_path / "latest.json",
+        sync_timeout_seconds=0,
+        observe_only=True,
+    )
+    assert result["status"] == "missing"
+    assert result["sync"]["status"] == "missing"
+    assert result["sync"]["error"] == "market_scan_missing"
 
 
 def test_watchdog_syncs_current_slot_artifact_atomically(tmp_path: Path) -> None:
@@ -553,6 +738,8 @@ def test_workflows_wire_active_watchdogs_and_slot_guard() -> None:
     assert "market_scan_slot_guard.py" in scan_text
     assert '--markets "${{ steps.slot_guard.outputs.active_markets }}"' in scan_text
     assert "snapshot-retry-backoff-seconds" in scan_text
+    assert "--total-timeout-seconds" in scan_text
+    assert "data/market_scan/runtime.json" in scan_text
 
     intraday_text = (ROOT / ".github/workflows/01-intraday-session.yml").read_text(
         encoding="utf-8"
@@ -562,6 +749,8 @@ def test_workflows_wire_active_watchdogs_and_slot_guard() -> None:
     assert "market_scan_calendar.py" in intraday_text
     assert "steps.market_calendar.outputs.should_run == 'true'" in intraday_text
     assert "market_scan_watchdog.py" in intraday_text
+    assert "--sync-timeout-seconds 120" in intraday_text
+    assert "--observe-only" in intraday_text
     assert "--sync-latest-path" in intraday_text
     assert "market_scan_subchain_status.py" in intraday_text
     assert "market_scan_subchain_state.json" in intraday_text
