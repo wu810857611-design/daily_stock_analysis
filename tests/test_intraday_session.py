@@ -4347,3 +4347,89 @@ class SessionLoopTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class WatchAccountSellSymmetryRegressionTests(unittest.TestCase):
+    def test_watch_target_reached_is_audit_only_without_rebalancing_context(self):
+        now = datetime(2026, 9, 23, 14, 30, tzinfo=TZ)
+        state = intraday_session_module._empty_state(now)
+        raw_event = {
+            "event_id": "target-1",
+            "symbol": "HK09988",
+            "name": "阿里巴巴",
+            "condition": "target_reached",
+            "transition": "triggered",
+            "severity": "warning",
+            "price": 112.0,
+            "payload": {
+                "data_quality": "fresh_l1",
+                "quote_time": now.isoformat(),
+            },
+        }
+        contexts = {
+            "HK09988": (
+                {
+                    "layer": "SISTER_MANAGED_WATCH",
+                    "push_prefix": "【妹妹账户】",
+                    "symbol": "HK09988",
+                    "name": "阿里巴巴",
+                    "status": "held_private_size",
+                },
+            )
+        }
+
+        created = process_watch_account_decisions(
+            state,
+            now=now,
+            raw_events=[raw_event],
+            levels={"HK09988": ReferenceLevels(target_price=111.83)},
+            contexts_by_symbol=contexts,
+        )
+
+        self.assertEqual(created, 0)
+        self.assertEqual(state["outbox"], [])
+        self.assertEqual(
+            raw_event["watch_decision_results"]["SISTER_MANAGED_WATCH"],
+            "no_operation_missing_account_rebalancing_context",
+        )
+
+    def test_watch_hard_stop_remains_actionable(self):
+        now = datetime(2026, 9, 23, 14, 30, tzinfo=TZ)
+        state = intraday_session_module._empty_state(now)
+        raw_event = {
+            "event_id": "stop-1",
+            "symbol": "HK09988",
+            "name": "阿里巴巴",
+            "condition": "stop_loss",
+            "transition": "triggered",
+            "severity": "critical",
+            "price": 90.0,
+            "payload": {
+                "data_quality": "fresh_l1",
+                "quote_time": now.isoformat(),
+            },
+        }
+        contexts = {
+            "HK09988": (
+                {
+                    "layer": "SISTER_MANAGED_WATCH",
+                    "push_prefix": "【妹妹账户】",
+                    "symbol": "HK09988",
+                    "name": "阿里巴巴",
+                    "status": "held_private_size",
+                },
+            )
+        }
+
+        created = process_watch_account_decisions(
+            state,
+            now=now,
+            raw_events=[raw_event],
+            levels={"HK09988": ReferenceLevels(stop_loss=100.0)},
+            contexts_by_symbol=contexts,
+        )
+
+        self.assertEqual(created, 1)
+        decision = state["outbox"][-1]
+        self.assertEqual(decision["payload"]["action_code"], "clear")
+        self.assertEqual(decision["payload"]["position_change"], "-100%")
