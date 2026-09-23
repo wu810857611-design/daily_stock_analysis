@@ -577,7 +577,7 @@ def test_default_full_market_loaders_use_independent_fallbacks(monkeypatch: Any)
     def sina_a() -> pd.DataFrame:
         a_calls.append("sina")
         return pd.DataFrame(
-            [{"代码": "sh600001", "名称": "甲公司", "最新价": 10, "成交量": 1, "成交额": 1}]
+            [{"代码": "sh600001", "名称": "甲公司", "最新价": 10, "涨跌幅": 1.0, "成交量": 1, "成交额": 1}]
         )
 
     def broken_hk() -> Any:
@@ -625,7 +625,7 @@ def test_default_a_snapshot_uses_tencent_before_sina(monkeypatch: Any) -> None:
     def tencent() -> pd.DataFrame:
         calls.append("tencent")
         return pd.DataFrame(
-            [{"code": "sh600001", "name": "甲公司", "price": 10, "volume": 1, "amount": 1}]
+            [{"code": "sh600001", "name": "甲公司", "price": 10, "change_pct": 1.0, "volume": 1, "amount": 1}]
         )
 
     monkeypatch.setitem(
