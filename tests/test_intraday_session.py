@@ -712,11 +712,18 @@ class AccountWatchLayerTests(unittest.TestCase):
         self.assertEqual(shadow["signal_ledger"], [])
         self.assertEqual(shadow["execution_ledger"], [])
         self.assertEqual(shadow["trades"], [])
+        # These are discretionary target-profit events on watch-only
+        # accounts.  Without durable account NAV/cash/rebalancing state they
+        # remain audit-only instead of becoming a one-way sell valve.
+        self.assertEqual(state["outbox"], [])
+        audit_results = {
+            layer
+            for event in state["event_ledger"]
+            for layer, result in (event.get("watch_decision_results") or {}).items()
+            if result == "no_operation_missing_account_rebalancing_context"
+        }
         self.assertEqual(
-            {
-                event["payload"]["account_layer"]
-                for event in state["outbox"]
-            },
+            audit_results,
             {"SECONDARY_ACCOUNT_WATCH", "SISTER_MANAGED_WATCH"},
         )
 
