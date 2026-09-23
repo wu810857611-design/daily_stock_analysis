@@ -3890,29 +3890,17 @@ def process_watch_account_decisions(
                 f"{invalidation}"
             )
         elif condition == "target_reached":
-            key_level = _positive_float(reference.target_price) or _positive_float(
-                event.get("reference_price")
+            # Watch layers intentionally have no durable NAV/cash/rebalancing
+            # state.  Emitting repeated discretionary profit-taking reductions
+            # here creates a one-way sell valve because the same layer cannot
+            # safely size replacement buys.  Keep the event in the audit ledger
+            # but do not turn it into an actionable sell alert until a durable
+            # account-level rebalancing contract exists.  Hard stop/risk exits
+            # above remain fully active.
+            event.setdefault("watch_decision_results", {})[layer] = (
+                "no_operation_missing_account_rebalancing_context"
             )
-            if key_level is None:
-                continue
-            if price >= key_level * 1.05:
-                conclusion = "建议止盈减仓1/2"
-                action = "建议卖出持仓1/2"
-                action_code = "reduce_1_2"
-                position_change = "-1/2"
-            else:
-                conclusion = "建议止盈减仓1/4"
-                action = "建议卖出持仓1/4"
-                action_code = "reduce_1_4"
-                position_change = "-1/4"
-            basis = "价格到达已有可靠目标参考位，需要人工复核是否锁定部分收益。"
-            invalidation = (
-                f"价格回落至 {key_level * 0.995:.3f} 下方后撤销本止盈建议。"
-            )
-            next_trigger = (
-                f"继续有效突破 {key_level * 1.05:.3f} 则风险收益结论升级；"
-                f"{invalidation}"
-            )
+            continue
         else:
             continue
 
