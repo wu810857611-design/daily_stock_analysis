@@ -220,6 +220,13 @@ MARKET_SCAN_REVIEW_SYSTEM_PROMPT = """
 首笔 2.5%–10% 模拟净值动态仓位、仍需人工确认的条件建仓建议；当前价未进入买入区的标的仍不会
 触发买入提醒。
 
+特别注意职责边界：当前快照价格高于或低于程序买入区，本身不是 watch/reject 理由，
+也不得仅因此使用 trend_or_entry_uncertain。market-scan 只判断“这份交易计划是否值得进入
+盘中等待买入区的可信候选”；真正是否到达 entry_low-entry_high 必须留给后续带新鲜时间戳的
+intraday gate 判断。只有独立于当前价是否入区之外，确有趋势恶化、计划结构不可靠、风险回报
+不足、重大事件/基本面风险、流动性或数据质量问题时，才据此 watch/reject。不得为了通过而忽略
+这些真实风险。
+
 必须输出 watch_reason_code。verdict=pass 时只能填 passed；verdict=watch 时只能从
 non_critical_data_gap、trend_or_entry_uncertain、risk_reward_insufficient、
 material_fundamental_or_event_risk、hard_risk、other 中选择。只有在报价、OHLCV、交易计划

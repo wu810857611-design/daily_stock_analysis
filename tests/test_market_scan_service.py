@@ -577,7 +577,7 @@ def test_default_full_market_loaders_use_independent_fallbacks(monkeypatch: Any)
     def sina_a() -> pd.DataFrame:
         a_calls.append("sina")
         return pd.DataFrame(
-            [{"代码": "sh600001", "名称": "甲公司", "最新价": 10, "成交量": 1, "成交额": 1}]
+            [{"代码": "sh600001", "名称": "甲公司", "最新价": 10, "涨跌幅": 1.0, "成交量": 1, "成交额": 1}]
         )
 
     def broken_hk() -> Any:
@@ -625,7 +625,7 @@ def test_default_a_snapshot_uses_tencent_before_sina(monkeypatch: Any) -> None:
     def tencent() -> pd.DataFrame:
         calls.append("tencent")
         return pd.DataFrame(
-            [{"code": "sh600001", "name": "甲公司", "price": 10, "volume": 1, "amount": 1}]
+            [{"code": "sh600001", "name": "甲公司", "price": 10, "change_pct": 1.0, "volume": 1, "amount": 1}]
         )
 
     monkeypatch.setitem(
@@ -2476,3 +2476,83 @@ def test_reviewer_uses_one_same_channel_fallback_after_primary_retries(
     ]
     assert reviewer.diagnostics["batches"][0]["fallback_used"] is True
     assert reviewer.diagnostics["batches"][0]["model"] == "openai/test-qwen-fallback"
+
+
+def test_default_a_snapshot_rejects_nonempty_fallback_without_l1_contract(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    complete = pd.DataFrame(_a_snapshot()["records"])
+    incomplete = complete.drop(columns=["成交额"])
+    calls: list[str] = []
+    fake_akshare = SimpleNamespace(
+        stock_zh_a_spot_em=lambda: complete,
+        stock_zh_a_spot_tx=lambda: incomplete,
+        stock_zh_a_spot=lambda: complete,
+    )
+
+    def bounded_call(callback, **kwargs):
+        provider = str(kwargs["provider"])
+        calls.append(provider)
+        if provider.endswith("stock_zh_a_spot_em"):
+            raise MarketScanDeadlineExceeded(
+                stage_name="a_share_snapshot_provider",
+                item_or_symbol=MARKET_A,
+                provider=provider,
+                timeout_budget=0.01,
+                scope="call",
+            )
+        return callback()
+
+    monkeypatch.setitem(sys.modules, "akshare", fake_akshare)
+    monkeypatch.setattr(
+        market_scan_service_module, "_call_with_hard_timeout", bounded_call
+    )
+
+    payload = default_a_snapshot_loader()
+
+    assert payload["source"] == "akshare.stock_zh_a_spot"
+    assert calls == [
+        "akshare.stock_zh_a_spot_em",
+        "akshare.stock_zh_a_spot_tx",
+        "akshare.stock_zh_a_spot",
+    ]
+    assert any("snapshot_contract_failed" in item for item in payload["provider_errors"])
+    assert payload["capability_contract"]["usable_for_l1"] is True
+
+
+def test_injected_nonempty_a_snapshot_without_amount_fails_closed(
+    tmp_path: Path,
+) -> None:
+    incomplete = dict(_a_snapshot())
+    incomplete["records"] = [
+        {key: value for key, value in row.items() if key != "成交额"}
+        for row in incomplete["records"]
+    ]
+
+    result = _service(
+        tmp_path,
+        qwen=ReviewRecorder(),
+        deepseek=ReviewRecorder(),
+        a_loader=lambda: incomplete,
+        config_overrides={
+            "enabled_markets": (MARKET_A,),
+            "snapshot_retries": 1,
+        },
+    ).run()
+
+    assert result["market_operational_status"][MARKET_A] == "blocked"
+    assert result["operational_status"] == "failed"
+    assert result["safe_to_push"] is False
+    assert result["diagnostics"][MARKET_A]["eligible_count"] == 0
+    assert any(
+        "snapshot_contract_failed" in item
+        for item in result["diagnostics"]["a_snapshot_provider_errors"]
+    )
+
+
+def test_reviewer_prompt_does_not_duplicate_intraday_entry_zone_gate() -> None:
+    assert "当前快照价格高于或低于程序买入区，本身不是 watch/reject 理由" in (
+        MARKET_SCAN_REVIEW_SYSTEM_PROMPT
+    )
+    assert "必须留给后续带新鲜时间戳的" in MARKET_SCAN_REVIEW_SYSTEM_PROMPT
+    assert "intraday gate 判断" in MARKET_SCAN_REVIEW_SYSTEM_PROMPT
