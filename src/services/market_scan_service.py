@@ -453,6 +453,68 @@ def _first_column(frame: pd.DataFrame, aliases: Iterable[str]) -> Optional[pd.Se
     return None
 
 
+def _snapshot_contract_diagnostics(
+    frame: pd.DataFrame,
+    *,
+    market: str,
+    minimum_coverage: float = 0.90,
+) -> Dict[str, Any]:
+    """Validate the L1 capabilities required by deterministic screening.
+
+    A provider returning a non-empty DataFrame is not sufficient.  The L1
+    filter requires code/name plus finite price, change, volume and amount.
+    Missing turnover/amount capability must therefore fail closed instead of
+    masquerading as a healthy universe with zero eligible symbols.
+    """
+
+    required = ("code", "name", "price", "change_pct", "volume", "amount")
+    resolved: Dict[str, Optional[pd.Series]] = {
+        field: _first_column(frame, SNAPSHOT_ALIASES[field]) for field in required
+    }
+    missing_fields = [field for field, series in resolved.items() if series is None]
+    coverage: Dict[str, float] = {}
+    row_count = len(frame)
+    for field, series in resolved.items():
+        if series is None or row_count == 0:
+            coverage[field] = 0.0
+            continue
+        if field in {"code", "name"}:
+            valid = series.fillna("").astype(str).str.strip().ne("")
+        else:
+            numeric = pd.to_numeric(series, errors="coerce")
+            valid = numeric.notna() & np.isfinite(numeric)
+        coverage[field] = round(float(valid.mean()), 4)
+
+    low_coverage_fields = [
+        field
+        for field in required
+        if field not in missing_fields and coverage.get(field, 0.0) < minimum_coverage
+    ]
+    return {
+        "market": market,
+        "row_count": row_count,
+        "required_fields": list(required),
+        "missing_fields": missing_fields,
+        "coverage": coverage,
+        "minimum_coverage": minimum_coverage,
+        "low_coverage_fields": low_coverage_fields,
+        "usable_for_l1": bool(
+            row_count > 0 and not missing_fields and not low_coverage_fields
+        ),
+    }
+
+
+def _require_snapshot_contract(frame: pd.DataFrame, *, market: str) -> Dict[str, Any]:
+    diagnostics = _snapshot_contract_diagnostics(frame, market=market)
+    if not diagnostics["usable_for_l1"]:
+        raise MarketScanError(
+            "snapshot_contract_failed:"
+            f"missing={','.join(diagnostics['missing_fields']) or 'none'}:"
+            f"low_coverage={','.join(diagnostics['low_coverage_fields']) or 'none'}"
+        )
+    return diagnostics
+
+
 def _normalise_snapshot(frame: pd.DataFrame, *, market: str, now: datetime) -> pd.DataFrame:
     normalised = pd.DataFrame(index=frame.index)
     for target, aliases in SNAPSHOT_ALIASES.items():
@@ -1400,6 +1462,7 @@ class MarketScanService:
                 "a_snapshot_fetched_at": a_metadata.get("fetched_at") or "",
                 "hk_snapshot_fetched_at": hk_metadata.get("fetched_at") or "",
                 "a_snapshot_provider_errors": a_metadata.get("provider_errors") or [],
+                "a_snapshot_capability_contract": a_metadata.get("capability_contract") or {},
                 "hk_snapshot_provider_errors": hk_metadata.get("provider_errors") or [],
                 "hk_quote_requested_count": hk_metadata.get("requested_count"),
                 "hk_quote_fresh_count": hk_metadata.get("fresh_count"),
@@ -1451,9 +1514,15 @@ class MarketScanService:
                 frame_raw, metadata = _coerce_snapshot_payload(raw, now=now)
                 if not bool(metadata.get("is_full_a_universe")):
                     raise MarketScanError("A-share provider did not prove full-market coverage")
+                raw_contract = _require_snapshot_contract(frame_raw, market=MARKET_A)
                 frame = _normalise_snapshot(frame_raw, market=MARKET_A, now=now)
                 if frame.empty:
                     raise MarketScanError("A-share full-market provider returned no symbols")
+                normalised_contract = _require_snapshot_contract(frame, market=MARKET_A)
+                metadata["capability_contract"] = {
+                    "raw": raw_contract,
+                    "normalised": normalised_contract,
+                }
                 cache_payload = {
                     "schema_version": SCHEMA_VERSION,
                     "saved_at": _iso_datetime(now),
@@ -1464,6 +1533,7 @@ class MarketScanService:
                         *provider_errors,
                         *(str(item) for item in (metadata.get("provider_errors") or [])),
                     ],
+                    "capability_contract": metadata.get("capability_contract") or {},
                     "is_full_a_universe": True,
                     "records": frame.to_dict(orient="records"),
                 }
@@ -1488,6 +1558,10 @@ class MarketScanService:
             metadata["source"] = f"{metadata.get('source') or 'unknown'}:last_good_cache"
             metadata["provider_error"] = provider_errors[-1] if provider_errors else ""
             metadata["provider_errors"] = provider_errors
+            metadata["capability_contract"] = (
+                metadata.get("capability_contract")
+                or _snapshot_contract_diagnostics(frame, market=MARKET_A)
+            )
             return frame, metadata, False, ""
 
         reason = "A股全市场快照不可用或缓存过期，已安全停止本轮主动推送"
@@ -2691,11 +2765,13 @@ def default_a_snapshot_loader() -> Mapping[str, Any]:
             )
             if not isinstance(frame, pd.DataFrame) or frame.empty:
                 raise MarketScanError("provider returned an empty full-market snapshot")
+            capability_contract = _require_snapshot_contract(frame, market=MARKET_A)
             return {
                 "records": frame,
                 "fetched_at": _iso_datetime(_now_shanghai()),
                 "source": f"akshare.{provider_name}",
                 "provider_errors": provider_errors,
+                "capability_contract": capability_contract,
                 "is_full_a_universe": True,
             }
         except Exception as exc:  # noqa: BLE001 - explicit independent provider chain.
