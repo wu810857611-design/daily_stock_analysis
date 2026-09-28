@@ -89,12 +89,7 @@ jobs:
       - name: ✅ Local deterministic checks
         run: ./scripts/ci_gate.sh deterministic
       - name: ✅ Offline test suite
-        # A healthy full offline suite completes in minutes (PR #24: full CI
-        # completed in ~6m).  Bound this step so a deadlocked test/runner cannot
-        # leave a PR permanently "in progress"; -vv preserves the last started
-        # test in the completed log for root-cause diagnosis.
-        timeout-minutes: 15
-        run: python -m pytest -vv -m "not network"
+        run: ./scripts/ci_gate.sh offline-tests
 
   docker-build:
     name: docker-build
