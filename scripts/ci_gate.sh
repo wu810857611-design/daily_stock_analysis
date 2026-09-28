@@ -23,7 +23,10 @@ deterministic_checks() {
 
 offline_test_suite() {
   echo "==> backend-gate: offline test suite"
-  python -m pytest -m "not network"
+  # A healthy full suite completes in minutes.  Bound it so a deadlocked test
+  # cannot leave a PR permanently in progress, and keep the last started test
+  # visible in completed CI logs for diagnosis.
+  timeout 900 python -m pytest -vv -m "not network"
 }
 
 run_all() {
