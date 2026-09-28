@@ -2745,3 +2745,36 @@ def test_timing_override_never_upgrades_to_strong_or_exceptional_sizing(
     assert candidate["opportunity_tier"] == "standard"
     assert candidate["initial_position_fraction"] == 0.025
     assert candidate["add_position_fraction"] == 0.025
+
+
+def test_program_infers_timing_only_watch_even_when_model_flag_is_false() -> None:
+    raw = _timing_only_review(entry_timing_only=False)
+    effective, overridden = (
+        market_scan_service_module._effective_review_for_consensus(
+            raw, _timing_only_candidate()
+        )
+    )
+
+    assert overridden is True
+    assert raw["entry_timing_only"] is False
+    assert effective["verdict"] == "pass"
+    assert (
+        effective["entry_timing_override_basis"]
+        == "program_inferred_from_timing_only_review"
+    )
+
+
+def test_program_does_not_infer_timing_only_when_trend_is_also_uncertain() -> None:
+    raw = _timing_only_review(
+        entry_timing_only=False,
+        thesis="当前价高于买入区，同时趋势尚未确认，需要继续观察。",
+    )
+    effective, overridden = (
+        market_scan_service_module._effective_review_for_consensus(
+            raw, _timing_only_candidate()
+        )
+    )
+
+    assert overridden is False
+    assert effective["verdict"] == "watch"
+    assert effective["entry_timing_override_basis"] == ""
