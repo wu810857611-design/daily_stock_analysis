@@ -2341,6 +2341,9 @@ class MarketScanService:
             deepseek, deepseek_entry_timing_override = _effective_review_for_consensus(
                 deepseek_raw, candidate
             )
+            timing_override_used = bool(
+                qwen_entry_timing_override or deepseek_entry_timing_override
+            )
             disagreement = qwen["verdict"] != deepseek["verdict"]
             hard_risk = bool(qwen["hard_risk"] or deepseek["hard_risk"])
             both_pass = qwen["verdict"] == deepseek["verdict"] == "pass"
@@ -2408,9 +2411,13 @@ class MarketScanService:
                 actionable_by_market[candidate_market] = (
                     actionable_by_market.get(candidate_market, 0) + 1
                 )
+                # A timing-only override restores candidate reachability but
+                # must not upgrade sizing.  Because one raw reviewer did not
+                # actually return pass, fail closed to the existing 2.5%
+                # standard tier just like narrow conditional consensus.
                 opportunity = (
                     opportunity_policy(STANDARD_TIER)
-                    if conditional_review
+                    if conditional_review or timing_override_used
                     else classify_opportunity(
                         rank=rank,
                         data_quality=evidence_contract["data_quality"],
@@ -2452,10 +2459,15 @@ class MarketScanService:
                 evidence_contract["view"] = {
                     **dict(evidence_contract.get("view") or {}),
                     "short_term": (
-                        "一方通过、另一方仅因非关键数据缺失而观察；"
-                        "仅允许最低档人工复核"
-                        if conditional_review
-                        else "双模型与规则门已通过，仅在新鲜价格进入计划区时首笔建仓"
+                        "模型原始意见仅因当前价未入区而观察；程序只把入场时点"
+                        "延后给盘中新鲜价格门，并固定最低2.5%档人工复核"
+                        if timing_override_used
+                        else (
+                            "一方通过、另一方仅因非关键数据缺失而观察；"
+                            "仅允许最低档人工复核"
+                            if conditional_review
+                            else "双模型与规则门已通过，仅在新鲜价格进入计划区时首笔建仓"
+                        )
                     ),
                     "swing": (
                         f"首笔按{opportunity.initial_position_fraction * 100:g}%"
@@ -2512,6 +2524,10 @@ class MarketScanService:
                         "qwen": qwen_entry_timing_override,
                         "deepseek": deepseek_entry_timing_override,
                     },
+                    "entry_timing_override_used": timing_override_used,
+                    "entry_timing_override_sizing_cap": (
+                        STANDARD_TIER if timing_override_used else ""
+                    ),
                     "model_disagreement": disagreement,
                     "conditional_review": conditional_review,
                     "consensus_mode": consensus_mode,
