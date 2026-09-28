@@ -971,7 +971,7 @@ def _normalise_review_payload(raw: Any, candidates: Sequence[Mapping[str, Any]],
             "verdict_schema_valid": verdict_schema_valid,
             "confidence": min(max(confidence if confidence is not None else 0.0, 0.0), 1.0),
             "hard_risk": hard_risk,
-            "entry_timing_only": bool(item.get("entry_timing_only")),
+            "entry_timing_only": item.get("entry_timing_only") is True,
             "watch_reason_code": _normalise_watch_reason_code(
                 item.get("watch_reason_code") or item.get("reason_code"),
                 verdict=verdict,
