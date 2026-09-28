@@ -637,16 +637,21 @@ jobs:
           trap persist_private_shadow_state EXIT
           WATCHDOG_PID=""
           if [ "$MAX_CYCLES" = "0" ]; then
+            # This watcher is deliberately background-only.  Keep polling
+            # through the market-scan's bounded 30-minute budget so a successful
+            # current-slot artifact is written while intraday_session is still
+            # running and its existing fingerprint hot-reload loop can consume
+            # it.  The main monitor never waits synchronously for this poller.
             python3 scripts/market_scan_watchdog.py \
               --slot "$SESSION" \
               --repo "$GITHUB_REPOSITORY" \
               --ref "$GITHUB_REF_NAME" \
-              --sync-timeout-seconds 120 \
-              --sync-poll-seconds 10 \
+              --sync-timeout-seconds 2100 \
+              --sync-poll-seconds 20 \
               --sync-latest-path "$INTRADAY_CANDIDATE_PLANS_PATH" \
               --output "reports/market_scan_watchdog_${SESSION}.json" &
             WATCHDOG_PID=$!
-            echo "ℹ️ 已启动 ${SESSION} 时段全市场扫描漏跑兜底"
+            echo "ℹ️ 已启动 ${SESSION} 时段非阻塞扫描同步/漏跑兜底"
           fi
           set +e
           python3 scripts/intraday_session.py \
