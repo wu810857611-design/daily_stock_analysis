@@ -1041,8 +1041,13 @@ _SUBSTANTIVE_REVIEW_RISK_MARKERS = (
     "数据不足",
     "缺失",
     "趋势恶化",
+    "趋势不确定",
+    "趋势尚未确认",
+    "趋势转弱",
+    "趋势偏弱",
     "均线",
     "成交量",
+    "量价",
     "波动",
     "估值",
     "风险收益不足",
@@ -1070,7 +1075,6 @@ def _entry_timing_only_watch(
         or review.get("watch_reason_code") != "trend_or_entry_uncertain"
         or review.get("hard_risk")
         or review.get("verdict_schema_valid") is not True
-        or review.get("entry_timing_only") is not True
     ):
         return False
 
@@ -1106,12 +1110,18 @@ def _effective_review_for_consensus(
     effective = copy.deepcopy(dict(review))
     if not _entry_timing_only_watch(review, candidate):
         effective["entry_timing_override"] = False
+        effective["entry_timing_override_basis"] = ""
         return effective, False
     effective.update(
         {
             "verdict": "pass",
             "watch_reason_code": "passed",
             "entry_timing_override": True,
+            "entry_timing_override_basis": (
+                "model_declared_and_program_verified"
+                if review.get("entry_timing_only") is True
+                else "program_inferred_from_timing_only_review"
+            ),
             "entry_timing_override_reason": (
                 "timing_only_watch_deferred_to_intraday_fresh_buy_zone_gate"
             ),
