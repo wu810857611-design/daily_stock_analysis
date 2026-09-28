@@ -2637,3 +2637,55 @@ def test_entry_timing_override_requires_price_actually_outside_zone() -> None:
 
     assert overridden is False
     assert effective["verdict"] == "watch"
+
+
+def test_timing_only_model_watch_reaches_intraday_candidate_with_raw_audit(
+    tmp_path: Path,
+) -> None:
+    class TimingOnlyReviewer:
+        def __call__(self, candidates: Sequence[Mapping[str, Any]]) -> Mapping[str, Any]:
+            return {
+                "reviews": [
+                    {
+                        "code": candidate["code"],
+                        "verdict": "watch",
+                        "confidence": 0.82,
+                        "hard_risk": False,
+                        "entry_timing_only": True,
+                        "watch_reason_code": "trend_or_entry_uncertain",
+                        "thesis": "当前价高于买入区，等待回落至区间后再由盘中门判断。",
+                        "risks": [],
+                        "invalidators": [],
+                        "facts": [],
+                        "inferences": [],
+                        "view": "",
+                    }
+                    for candidate in candidates
+                ]
+            }
+
+    result = _service(
+        tmp_path,
+        qwen=TimingOnlyReviewer(),
+        deepseek=ReviewRecorder("pass"),
+        config_overrides={
+            "enabled_markets": (MARKET_A,),
+            "top_a_history": 1,
+            "final_top_n": 1,
+            "snapshot_retries": 1,
+        },
+        research_loader=lambda _candidate: {
+            "attempted": True,
+            "status": "partial",
+            "fundamentals": {"status": "unavailable", "data": {}},
+            "announcements_and_news": {"status": "unavailable", "items": []},
+            "errors": [],
+        },
+    ).run()
+
+    candidate = result["candidates"][0]
+    assert candidate["qwen_review_raw"]["verdict"] == "watch"
+    assert candidate["qwen_review"]["verdict"] == "pass"
+    assert candidate["entry_timing_overrides"]["qwen"] is True
+    assert candidate["eligible_for_intraday_review"] is True
+    assert candidate["action"] == "conditional_buy"
