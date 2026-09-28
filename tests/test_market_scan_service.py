@@ -2556,3 +2556,84 @@ def test_reviewer_prompt_does_not_duplicate_intraday_entry_zone_gate() -> None:
     )
     assert "必须留给后续带新鲜时间戳的" in MARKET_SCAN_REVIEW_SYSTEM_PROMPT
     assert "intraday gate 判断" in MARKET_SCAN_REVIEW_SYSTEM_PROMPT
+
+
+def _timing_only_review(**overrides: Any) -> dict[str, Any]:
+    review = {
+        "verdict": "watch",
+        "verdict_schema_valid": True,
+        "confidence": 0.82,
+        "hard_risk": False,
+        "entry_timing_only": True,
+        "watch_reason_code": "trend_or_entry_uncertain",
+        "thesis": "当前价高于买入区，等待回落至区间后再由盘中门判断。",
+        "risks": [],
+        "invalidators": [],
+        "facts": [],
+        "inferences": [],
+        "view": "",
+    }
+    review.update(overrides)
+    return review
+
+
+def _timing_only_candidate() -> dict[str, Any]:
+    return {
+        "code": "600001",
+        "price": 105.0,
+        "plan": {
+            "entry_low": 99.0,
+            "entry_high": 101.0,
+            "entry_mid": 100.0,
+            "stop_loss": 95.0,
+            "take_profit_1": 112.0,
+            "take_profit_2": 118.0,
+            "net_rr": 2.0,
+        },
+    }
+
+
+def test_entry_timing_only_watch_is_effectively_passed_without_mutating_raw() -> None:
+    raw = _timing_only_review()
+    effective, overridden = (
+        market_scan_service_module._effective_review_for_consensus(
+            raw, _timing_only_candidate()
+        )
+    )
+
+    assert overridden is True
+    assert raw["verdict"] == "watch"
+    assert raw["watch_reason_code"] == "trend_or_entry_uncertain"
+    assert effective["verdict"] == "pass"
+    assert effective["watch_reason_code"] == "passed"
+    assert effective["entry_timing_override"] is True
+
+
+def test_entry_timing_watch_with_substantive_risk_is_never_overridden() -> None:
+    raw = _timing_only_review(
+        thesis="当前价高于买入区，但同时存在基本面事件风险。",
+        risks=["基本面和公告风险仍需核验"],
+    )
+    effective, overridden = (
+        market_scan_service_module._effective_review_for_consensus(
+            raw, _timing_only_candidate()
+        )
+    )
+
+    assert overridden is False
+    assert effective["verdict"] == "watch"
+    assert effective["watch_reason_code"] == "trend_or_entry_uncertain"
+    assert effective["entry_timing_override"] is False
+
+
+def test_entry_timing_override_requires_price_actually_outside_zone() -> None:
+    candidate = _timing_only_candidate()
+    candidate["price"] = 100.0
+    effective, overridden = (
+        market_scan_service_module._effective_review_for_consensus(
+            _timing_only_review(), candidate
+        )
+    )
+
+    assert overridden is False
+    assert effective["verdict"] == "watch"
