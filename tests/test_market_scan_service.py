@@ -2687,5 +2687,61 @@ def test_timing_only_model_watch_reaches_intraday_candidate_with_raw_audit(
     assert candidate["qwen_review_raw"]["verdict"] == "watch"
     assert candidate["qwen_review"]["verdict"] == "pass"
     assert candidate["entry_timing_overrides"]["qwen"] is True
+    assert candidate["entry_timing_override_used"] is True
+    assert candidate["entry_timing_override_sizing_cap"] == "standard"
     assert candidate["eligible_for_intraday_review"] is True
     assert candidate["action"] == "conditional_buy"
+    assert candidate["opportunity_tier"] == "standard"
+    assert candidate["initial_position_fraction"] == 0.025
+    assert candidate["max_single_position_ratio"] == 0.15
+
+
+def test_timing_override_never_upgrades_to_strong_or_exceptional_sizing(
+    tmp_path: Path,
+) -> None:
+    class HighConfidenceTimingReviewer:
+        def __call__(self, candidates: Sequence[Mapping[str, Any]]) -> Mapping[str, Any]:
+            return {
+                "reviews": [
+                    {
+                        "code": candidate["code"],
+                        "verdict": "watch",
+                        "confidence": 0.99,
+                        "hard_risk": False,
+                        "entry_timing_only": True,
+                        "watch_reason_code": "trend_or_entry_uncertain",
+                        "thesis": "当前价高于买入区，唯一问题是等待回落入区。",
+                        "risks": [],
+                        "invalidators": [],
+                        "facts": [],
+                        "inferences": [],
+                        "view": "",
+                    }
+                    for candidate in candidates
+                ]
+            }
+
+    result = _service(
+        tmp_path,
+        qwen=HighConfidenceTimingReviewer(),
+        deepseek=ReviewRecorder("pass", confidence=0.99),
+        config_overrides={
+            "enabled_markets": (MARKET_A,),
+            "top_a_history": 1,
+            "final_top_n": 1,
+            "snapshot_retries": 1,
+        },
+        research_loader=lambda _candidate: {
+            "attempted": True,
+            "status": "available",
+            "fundamentals": {"status": "available", "data": {"ok": True}},
+            "announcements_and_news": {"status": "available", "items": [{"ok": True}]},
+            "errors": [],
+        },
+    ).run()
+
+    candidate = result["candidates"][0]
+    assert candidate["entry_timing_override_used"] is True
+    assert candidate["opportunity_tier"] == "standard"
+    assert candidate["initial_position_fraction"] == 0.025
+    assert candidate["add_position_fraction"] == 0.025
