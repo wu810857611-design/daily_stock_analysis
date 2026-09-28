@@ -227,18 +227,23 @@ intraday gate 判断。只有独立于当前价是否入区之外，确有趋势
 不足、重大事件/基本面风险、流动性或数据质量问题时，才据此 watch/reject。不得为了通过而忽略
 这些真实风险。
 
-必须输出 watch_reason_code。verdict=pass 时只能填 passed；verdict=watch 时只能从
+必须输出 watch_reason_code 和 entry_timing_only。verdict=pass 时 watch_reason_code
+只能填 passed 且 entry_timing_only=false；verdict=watch 时 watch_reason_code 只能从
 non_critical_data_gap、trend_or_entry_uncertain、risk_reward_insufficient、
-material_fundamental_or_event_risk、hard_risk、other 中选择。只有在报价、OHLCV、交易计划
-与扣费后风险回报均足够，且无任何重大不利证据或硬风险，剩余缺口仅为非关键研究维度
-（例如Level-2、行业或政策补充）时，才可使用 non_critical_data_gap。任何停牌、监管、
-财务造假、退市、重大公告/财务风险、不可执行流动性或重大数据质量问题必须 reject 且
-hard_risk=true；一般趋势、入场或风险收益不确定不得伪装成非关键数据缺失。
+material_fundamental_or_event_risk、hard_risk、other 中选择。只有当唯一不确定性确实只是
+“当前快照价格尚未进入/已经高于程序给定买入区”，除此之外没有趋势恶化、成交量、基本面、
+事件、流动性、数据质量或风险收益问题时，才允许 entry_timing_only=true；存在任何其他
+实质不确定性时必须为 false。只有在报价、OHLCV、交易计划与扣费后风险回报均足够，且无任何
+重大不利证据或硬风险，剩余缺口仅为非关键研究维度（例如Level-2、行业或政策补充）时，才可
+使用 non_critical_data_gap。任何停牌、监管、财务造假、退市、重大公告/财务风险、不可执行
+流动性或重大数据质量问题必须 reject 且 hard_risk=true；一般趋势、入场或风险收益不确定不得
+伪装成非关键数据缺失。
 
 输出严格 JSON，必须为每个输入代码且仅输出一条 review；`facts`、`inferences`、
 `risks`、`invalidators` 各最多两条，`thesis` 和 `view` 各最多 120 个汉字：
 {"reviews":[{"code":"...","verdict":"pass|watch|reject","confidence":0到1,
-"hard_risk":false,"watch_reason_code":"passed|non_critical_data_gap|trend_or_entry_uncertain|risk_reward_insufficient|material_fundamental_or_event_risk|hard_risk|other",
+"hard_risk":false,"entry_timing_only":false,
+"watch_reason_code":"passed|non_critical_data_gap|trend_or_entry_uncertain|risk_reward_insufficient|material_fundamental_or_event_risk|hard_risk|other",
 "thesis":"一句话审慎观点","risks":["..."],
 "invalidators":["..."],"facts":["..."],"inferences":["..."],"view":"..."}]}。
 """.strip()
