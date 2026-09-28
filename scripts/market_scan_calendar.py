@@ -127,7 +127,7 @@ def evaluate_market_sessions(
         status = "open"
 
     return {
-        "schema_version": 2,
+        "schema_version": 1,
         "observed_at": observed.isoformat(timespec="seconds"),
         "session_date": observed.date().isoformat(),
         "status": status,
