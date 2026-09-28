@@ -218,6 +218,7 @@ def test_calendar_gate_skips_weekend_and_isolates_divergent_market_holiday() -> 
     saturday = evaluate_market_sessions(
         datetime(2026, 8, 29, 10, 42, tzinfo=TZ),
         phase_resolver=lambda _market, **_kwargs: "non_trading",
+        southbound_resolver=lambda _now: {"status": "closed"},
     )
     assert saturday["should_run"] is False
     assert saturday["status"] == "market_closed"
@@ -226,24 +227,27 @@ def test_calendar_gate_skips_weekend_and_isolates_divergent_market_holiday() -> 
     split = evaluate_market_sessions(
         datetime(2026, 9, 3, 10, 42, tzinfo=TZ),
         phase_resolver=lambda market, **_kwargs: (
-            "non_trading" if market == "cn" else "intraday"
+            "non_trading" if market == "hk" else "intraday"
         ),
+        southbound_resolver=lambda _now: {"status": "open"},
     )
     assert split["should_run"] is True
     assert split["status"] == "partial_market_open"
-    assert split["active_markets"] == ["hk"]
-    assert split["market_states"] == {"cn": "closed", "hk": "open_session_day"}
+    assert split["active_markets"] == ["cn"]
+    assert split["market_states"] == {"cn": "open_session_day", "hk": "closed"}
 
 
-def test_calendar_unknown_fails_open_without_claiming_calendar_health() -> None:
+def test_calendar_unknown_keeps_a_fail_open_but_hk_connect_fail_closed() -> None:
     result = evaluate_market_sessions(
         datetime(2026, 8, 31, 10, 42, tzinfo=TZ),
         phase_resolver=lambda _market, **_kwargs: "unknown",
+        southbound_resolver=lambda _now: {"status": "open"},
     )
     assert result["should_run"] is True
     assert result["calendar_degraded"] is True
     assert result["status"] == "calendar_degraded"
-    assert result["active_markets"] == ["cn", "hk"]
+    assert result["active_markets"] == ["cn"]
+    assert result["market_states"]["hk"] == "calendar_unavailable"
 
 
 def test_slot_guard_marks_confirmed_closed_day_as_neutral_skip() -> None:
