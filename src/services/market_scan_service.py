@@ -971,6 +971,7 @@ def _normalise_review_payload(raw: Any, candidates: Sequence[Mapping[str, Any]],
             "verdict_schema_valid": verdict_schema_valid,
             "confidence": min(max(confidence if confidence is not None else 0.0, 0.0), 1.0),
             "hard_risk": hard_risk,
+            "entry_timing_only": item.get("entry_timing_only") is True,
             "watch_reason_code": _normalise_watch_reason_code(
                 item.get("watch_reason_code") or item.get("reason_code"),
                 verdict=verdict,
@@ -998,6 +999,7 @@ def _missing_review(reason: str) -> Dict[str, Any]:
         "verdict_schema_valid": False,
         "confidence": 0.0,
         "hard_risk": False,
+        "entry_timing_only": False,
         "watch_reason_code": "other",
         "thesis": "",
         "risks": [reason],
@@ -1006,6 +1008,116 @@ def _missing_review(reason: str) -> Dict[str, Any]:
         "inferences": [],
         "view": "",
     }
+
+
+_ENTRY_TIMING_TEXT_MARKERS = (
+    "当前价",
+    "现价",
+    "买入区",
+    "入场区",
+    "entry_low",
+    "entry_high",
+    "未进入",
+    "高于区间",
+    "低于区间",
+    "高于买入",
+    "低于买入",
+    "等待回落",
+    "等待回踩",
+    "回到区间",
+    "回落至区间",
+)
+
+_SUBSTANTIVE_REVIEW_RISK_MARKERS = (
+    "基本面",
+    "财务",
+    "公告",
+    "事件",
+    "监管",
+    "停牌",
+    "退市",
+    "流动性",
+    "数据质量",
+    "数据不足",
+    "缺失",
+    "趋势恶化",
+    "均线",
+    "成交量",
+    "波动",
+    "估值",
+    "风险收益不足",
+    "risk_reward_insufficient",
+    "hard_risk",
+)
+
+
+def _entry_timing_only_watch(
+    review: Mapping[str, Any],
+    candidate: Mapping[str, Any],
+) -> bool:
+    """Return True only for an explicitly timing-only model watch.
+
+    The raw model review is never rewritten in-place.  This narrow adapter is
+    allowed to neutralise a *watch* for consensus only when the model explicitly
+    declares that its concern is entry timing, the deterministic plan is valid,
+    the current snapshot is actually outside that plan, and no substantive risk
+    language is present.  Rejects, hard risks and mixed-risk watches stay
+    untouched.
+    """
+
+    if (
+        review.get("verdict") != "watch"
+        or review.get("watch_reason_code") != "trend_or_entry_uncertain"
+        or review.get("hard_risk")
+        or review.get("verdict_schema_valid") is not True
+        or review.get("entry_timing_only") is not True
+    ):
+        return False
+
+    plan = candidate.get("plan") or {}
+    validation = validate_trade_plan(plan, min_net_rr=0.0)
+    if not validation.valid:
+        return False
+
+    price = _finite_float(candidate.get("price"))
+    entry_low = _finite_float(plan.get("entry_low"))
+    entry_high = _finite_float(plan.get("entry_high"))
+    if price is None or entry_low is None or entry_high is None:
+        return False
+    if entry_low <= price <= entry_high:
+        return False
+
+    texts = [
+        str(review.get("thesis") or ""),
+        str(review.get("view") or ""),
+        *[str(item) for item in (review.get("risks") or [])],
+        *[str(item) for item in (review.get("inferences") or [])],
+    ]
+    combined = "\n".join(texts).lower()
+    if any(marker.lower() in combined for marker in _SUBSTANTIVE_REVIEW_RISK_MARKERS):
+        return False
+    return any(marker.lower() in combined for marker in _ENTRY_TIMING_TEXT_MARKERS)
+
+
+def _effective_review_for_consensus(
+    review: Mapping[str, Any],
+    candidate: Mapping[str, Any],
+) -> Tuple[Dict[str, Any], bool]:
+    effective = copy.deepcopy(dict(review))
+    if not _entry_timing_only_watch(review, candidate):
+        effective["entry_timing_override"] = False
+        return effective, False
+    effective.update(
+        {
+            "verdict": "pass",
+            "watch_reason_code": "passed",
+            "entry_timing_override": True,
+            "entry_timing_override_reason": (
+                "timing_only_watch_deferred_to_intraday_fresh_buy_zone_gate"
+            ),
+        }
+    )
+    return effective, True
 
 
 def _build_v4_evidence_contract(
@@ -2217,9 +2329,17 @@ class MarketScanService:
             candidate_snapshot_complete = bool(
                 market_snapshot_complete.get(candidate_market, False)
             )
-            qwen = qwen_reviews.get(code) or _missing_review(qwen_error or "qwen_review_missing")
-            deepseek = deepseek_reviews.get(code) or _missing_review(
+            qwen_raw = qwen_reviews.get(code) or _missing_review(
+                qwen_error or "qwen_review_missing"
+            )
+            deepseek_raw = deepseek_reviews.get(code) or _missing_review(
                 deepseek_error or "deepseek_review_missing"
+            )
+            qwen, qwen_entry_timing_override = _effective_review_for_consensus(
+                qwen_raw, candidate
+            )
+            deepseek, deepseek_entry_timing_override = _effective_review_for_consensus(
+                deepseek_raw, candidate
             )
             disagreement = qwen["verdict"] != deepseek["verdict"]
             hard_risk = bool(qwen["hard_risk"] or deepseek["hard_risk"])
@@ -2384,8 +2504,14 @@ class MarketScanService:
             candidate_output.update(
                 {
                     "rank": rank,
+                    "qwen_review_raw": qwen_raw,
+                    "deepseek_review_raw": deepseek_raw,
                     "qwen_review": qwen,
                     "deepseek_review": deepseek,
+                    "entry_timing_overrides": {
+                        "qwen": qwen_entry_timing_override,
+                        "deepseek": deepseek_entry_timing_override,
+                    },
                     "model_disagreement": disagreement,
                     "conditional_review": conditional_review,
                     "consensus_mode": consensus_mode,
