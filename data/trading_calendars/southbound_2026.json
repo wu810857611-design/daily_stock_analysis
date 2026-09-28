@@ -1,0 +1,46 @@
+{
+  "schema_version": 1,
+  "market": "HK_CONNECT_SOUTHBOUND",
+  "year": 2026,
+  "coverage_start": "2026-01-01",
+  "coverage_end": "2026-12-31",
+  "timezone": "Asia/Shanghai",
+  "policy": "open only when both mainland and HK exchange sessions are open and this official Southbound schedule does not close the service",
+  "full_day_closed_ranges": [
+    {"start": "2026-01-01", "end": "2026-01-03", "reason": "New Year"},
+    {"start": "2026-02-15", "end": "2026-02-23", "reason": "Spring Festival"},
+    {"start": "2026-04-03", "end": "2026-04-07", "reason": "Good Friday / Qingming / Easter"},
+    {"start": "2026-05-01", "end": "2026-05-05", "reason": "Labour Day"},
+    {"start": "2026-05-25", "end": "2026-05-25", "reason": "Buddha's Birthday"},
+    {"start": "2026-06-19", "end": "2026-06-21", "reason": "Dragon Boat Festival"},
+    {"start": "2026-07-01", "end": "2026-07-01", "reason": "HKSAR Establishment Day"},
+    {"start": "2026-09-25", "end": "2026-09-27", "reason": "Mid-Autumn Festival"},
+    {"start": "2026-10-01", "end": "2026-10-07", "reason": "National Day"},
+    {"start": "2026-10-19", "end": "2026-10-19", "reason": "Chung Yeung Festival"},
+    {"start": "2026-12-25", "end": "2026-12-25", "reason": "Christmas"}
+  ],
+  "afternoon_closed_dates": [
+    {"date": "2026-12-24", "reason": "Christmas Eve afternoon"},
+    {"date": "2026-12-31", "reason": "New Year's Eve afternoon"}
+  ],
+  "sources": [
+    {
+      "authority": "Shanghai Stock Exchange / China Investment Information Services",
+      "published": "2025-12-22",
+      "title": "关于2026年沪港通下港股通交易日安排的通知",
+      "url": "https://www.sse.com.cn/services/hkexsc/disclo/announ/c/c_20251222_10802519.shtml"
+    },
+    {
+      "authority": "Hong Kong Exchanges and Clearing",
+      "published": "2025-12-22",
+      "title": "Trading Calendar of Stock Connect for Year 2026",
+      "url": "https://www.hkex.com.hk/-/media/HKEX-Market/Services/Circulars-and-Notices/Participant-and-Members-Circulars/SEHK/2025/cc_SEHK_CTCSC_176_2025.pdf"
+    },
+    {
+      "authority": "Shanghai Stock Exchange / China Investment Information Services",
+      "published": "2026-09-17",
+      "title": "关于沪港通下港股通交易日安排的通知",
+      "url": "https://www.sse.com.cn/services/hkexsc/disclo/announ/c/c_20260917_10832484.shtml"
+    }
+  ]
+}
