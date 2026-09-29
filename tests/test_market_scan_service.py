@@ -2778,3 +2778,91 @@ def test_program_does_not_infer_timing_only_when_trend_is_also_uncertain() -> No
     assert overridden is False
     assert effective["verdict"] == "watch"
     assert effective["entry_timing_override_basis"] == ""
+
+
+def test_hk02269_production_review_resistance_and_downside_risk_is_not_timing_only() -> None:
+    raw = _timing_only_review(
+        entry_timing_only=False,
+        confidence=0.45,
+        thesis=(
+            "快照价53.2已明显高于买入区上限52.84，且接近阻力位54.15，"
+            "上行空间受限而下行风险未充分覆盖。"
+        ),
+    )
+    candidate = _timing_only_candidate()
+    candidate["code"] = "HK02269"
+    candidate["price"] = 53.2
+    candidate["plan"].update({"entry_low": 51.76, "entry_high": 52.84})
+
+    effective, overridden = (
+        market_scan_service_module._effective_review_for_consensus(raw, candidate)
+    )
+
+    assert overridden is False
+    assert effective["verdict"] == "watch"
+    assert effective["watch_reason_code"] == "trend_or_entry_uncertain"
+    assert effective["entry_timing_override"] is False
+
+
+@pytest.mark.parametrize(
+    ("field", "text"),
+    [
+        ("view", "当前位置赔率恶化，风险收益比不再理想。"),
+        ("inferences", ["接近压力位，上行空间有限且下行风险增加。"]),
+        ("thesis", "当前价高于买入区，同时风险回报恶化。"),
+    ],
+)
+def test_substantive_risk_outside_risks_array_is_never_overridden(
+    field: str,
+    text: Any,
+) -> None:
+    overrides = {"entry_timing_only": True, field: text}
+    raw = _timing_only_review(**overrides)
+
+    effective, overridden = (
+        market_scan_service_module._effective_review_for_consensus(
+            raw, _timing_only_candidate()
+        )
+    )
+
+    assert overridden is False
+    assert effective["verdict"] == "watch"
+    assert effective["entry_timing_override"] is False
+
+
+def test_generic_a_snapshot_uses_larger_but_bounded_provider_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    complete = pd.DataFrame(_a_snapshot()["records"])
+    incomplete = complete.drop(columns=["成交额"])
+    fake_akshare = SimpleNamespace(
+        stock_zh_a_spot_em=lambda: complete,
+        stock_zh_a_spot_tx=lambda: incomplete,
+        stock_zh_a_spot=lambda: complete,
+    )
+    budgets: list[tuple[str, float]] = []
+
+    def bounded_call(callback, **kwargs):
+        provider = str(kwargs["provider"])
+        budget = float(kwargs["timeout_seconds"])
+        budgets.append((provider, budget))
+        if provider.endswith("stock_zh_a_spot_em"):
+            raise ConnectionError("production-like primary failure")
+        return callback()
+
+    monkeypatch.setitem(sys.modules, "akshare", fake_akshare)
+    monkeypatch.setattr(
+        market_scan_service_module, "_call_with_hard_timeout", bounded_call
+    )
+
+    payload = default_a_snapshot_loader()
+
+    assert payload["source"] == "akshare.stock_zh_a_spot"
+    assert budgets == [
+        ("akshare.stock_zh_a_spot_em", 45.0),
+        ("akshare.stock_zh_a_spot_tx", 45.0),
+        ("akshare.stock_zh_a_spot", 100.0),
+    ]
+    assert payload["capability_contract"]["usable_for_l1"] is True
+    assert any("snapshot_contract_failed" in item for item in payload["provider_errors"])
+    assert budgets[-1][1] < 150.0
