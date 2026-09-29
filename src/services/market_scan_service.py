@@ -1050,6 +1050,28 @@ _SUBSTANTIVE_REVIEW_RISK_MARKERS = (
     "量价",
     "波动",
     "估值",
+    "阻力位",
+    "阻力",
+    "压力位",
+    "压力",
+    "上行空间受限",
+    "上行空间有限",
+    "上行空间不足",
+    "下行风险",
+    "赔率",
+    "盈亏比恶化",
+    "风险收益恶化",
+    "风险回报恶化",
+    "风险收益比",
+    "风险回报比",
+    "收益风险比",
+    "resistance",
+    "upside limited",
+    "limited upside",
+    "downside risk",
+    "risk-reward",
+    "risk reward",
+    "odds",
     "风险收益不足",
     "risk_reward_insufficient",
     "hard_risk",
@@ -2902,6 +2924,16 @@ def default_a_snapshot_loader() -> Mapping[str, Any]:
     import akshare as ak
 
     provider_errors: List[str] = []
+    provider_timeouts = {
+        # Eastmoney/Tencent are expected to be relatively quick full snapshots.
+        "stock_zh_a_spot_em": 45.0,
+        "stock_zh_a_spot_tx": 45.0,
+        # AkShare's generic A-share snapshot is a slower paginated fallback.
+        # Production on 2026-09-29 reached roughly half of its pages at the old
+        # uniform 45s cutoff. Give only this provider a larger *bounded* budget;
+        # the enclosing snapshot call/stage deadlines still cap the whole chain.
+        "stock_zh_a_spot": 100.0,
+    }
     for provider_name in (
         "stock_zh_a_spot_em",
         "stock_zh_a_spot_tx",
@@ -2910,7 +2942,7 @@ def default_a_snapshot_loader() -> Mapping[str, Any]:
         try:
             frame = _call_with_hard_timeout(
                 getattr(ak, provider_name),
-                timeout_seconds=45.0,
+                timeout_seconds=provider_timeouts[provider_name],
                 stage_name="a_share_snapshot_provider",
                 item_or_symbol=MARKET_A,
                 provider=f"akshare.{provider_name}",
