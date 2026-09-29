@@ -758,6 +758,9 @@ def test_workflows_wire_active_watchdogs_and_slot_guard() -> None:
     assert "--sync-poll-seconds 20" in intraday_text
     assert "--observe-only" in intraday_text
     assert "--sync-latest-path" in intraday_text
+    assert "market_scan_startup_restore.py" in intraday_text
+    assert "reports/market_scan_startup_restore.json" in intraday_text
+    assert "actions/artifacts?name=market-scan-state" not in intraday_text
     assert "market_scan_subchain_status.py" in intraday_text
     assert "market_scan_subchain_state.json" in intraday_text
     assert "全市场买入子链已独立降级" in intraday_text
