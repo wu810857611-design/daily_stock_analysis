@@ -324,7 +324,7 @@ jobs:
           restore-keys: |
             market-scan-state-
 
-      - name: 缓存缺失时恢复最新候选计划备份
+      - name: 验证并恢复可信候选计划
         if: steps.market_calendar.outputs.should_run == 'true'
         shell: bash
         env:
@@ -332,73 +332,17 @@ jobs:
           STATE_BRANCH: ${{ github.ref_name }}
         run: |
           set -euo pipefail
+          python3 scripts/market_scan_startup_restore.py \
+            --session "$SESSION" \
+            --repo "$GITHUB_REPOSITORY" \
+            --ref "$STATE_BRANCH" \
+            --target data/market_scan/latest.json \
+            --report reports/market_scan_startup_restore.json
           if [ -f data/market_scan/latest.json ]; then
-            echo "✅ 已恢复全市场候选计划"
-            exit 0
+            echo "✅ 启动候选计划已通过 completed+success+slot/date/fingerprint 信任校验"
+          else
+            echo "::warning::无可信候选计划；主盘中监控继续运行，买入候选链 fail-closed/degraded"
           fi
-          SCAN_TMP_DIR="$(mktemp -d)"
-          gh api --method GET \
-            -H "Accept: application/vnd.github+json" \
-            "/repos/${GITHUB_REPOSITORY}/actions/artifacts?name=market-scan-state&per_page=100" \
-            > "$SCAN_TMP_DIR/artifacts.json"
-          ARTIFACT_ID="$(
-            python3 - "$SCAN_TMP_DIR/artifacts.json" "$STATE_BRANCH" <<'PY'
-          import json
-          import sys
-
-          path, branch = sys.argv[1:3]
-          with open(path, encoding="utf-8") as handle:
-              artifacts = json.load(handle).get("artifacts", [])
-          candidates = [
-              item for item in artifacts
-              if not item.get("expired")
-              and item.get("name") == "market-scan-state"
-              and (item.get("workflow_run") or {}).get("head_branch") == branch
-          ]
-          candidates.sort(key=lambda item: item.get("created_at", ""), reverse=True)
-          print(candidates[0]["id"] if candidates else "")
-          PY
-          )"
-          if [ -z "$ARTIFACT_ID" ]; then
-            echo "ℹ️ 尚无同分支 market-scan-state；本轮只监控原配置标的"
-            exit 0
-          fi
-          mkdir -p "$SCAN_TMP_DIR/unpacked"
-          gh api \
-            -H "Accept: application/vnd.github+json" \
-            "/repos/${GITHUB_REPOSITORY}/actions/artifacts/${ARTIFACT_ID}/zip" \
-            > "$SCAN_TMP_DIR/state.zip"
-          unzip -q "$SCAN_TMP_DIR/state.zip" -d "$SCAN_TMP_DIR/unpacked"
-          test -f "$SCAN_TMP_DIR/unpacked/market-scan-state.tar.gz"
-          python3 - "$SCAN_TMP_DIR/unpacked/market-scan-state.tar.gz" "$GITHUB_WORKSPACE" <<'PY'
-          import pathlib
-          import sys
-          import tarfile
-
-          archive_path, workspace = sys.argv[1:3]
-          with tarfile.open(archive_path, "r:gz") as archive:
-              selected = []
-              for member in archive.getmembers():
-                  path = pathlib.PurePosixPath(member.name)
-                  allowed = (
-                      member.name == "data/market_scan"
-                      or member.name.startswith("data/market_scan/")
-                  )
-                  if (
-                      path.is_absolute()
-                      or ".." in path.parts
-                      or member.issym()
-                      or member.islnk()
-                  ):
-                      raise SystemExit(f"unsafe market-scan entry: {member.name}")
-                  if allowed:
-                      selected.append(member)
-              if not selected:
-                  raise SystemExit("market-scan-state 中缺少 data/market_scan")
-              archive.extractall(workspace, members=selected)
-          PY
-          test -f data/market_scan/latest.json
-          echo "✅ 已从同分支最新 market-scan-state artifact 恢复候选计划"
 
       - name: 恢复盘中状态缓存
         if: steps.market_calendar.outputs.should_run == 'true'
@@ -853,6 +797,7 @@ jobs:
             reports/market_session_gate.json
             reports/market_scan_watchdog_*.json
             reports/market_scan_subchain_*.json
+            reports/market_scan_startup_restore.json
             reports/longbridge_oauth_*.json
             data/scheduler/claims/*.json
             data/intraday/session_state.json
