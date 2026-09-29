@@ -4,18 +4,12 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
-import io
 import json
 import os
-import stat
 import sys
-import tarfile
-import tempfile
 import time
-import zipfile
 from datetime import datetime, time as datetime_time
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 from urllib import error, parse, request
 from zoneinfo import ZoneInfo
@@ -24,6 +18,11 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from scripts.market_scan_artifact_trust import (  # noqa: E402
+    atomic_write as _trusted_atomic_write,
+    read_market_scan_latest_from_artifact as _trusted_read_latest,
+    validate_watchdog_market_scan as _trusted_validate_watchdog,
+)
 from scripts.market_scan_calendar import evaluate_market_sessions  # noqa: E402
 
 
@@ -198,96 +197,22 @@ class GitHubActionsClient:
         return body
 
 
-def _safe_archive_path(name: str) -> PurePosixPath:
-    path = PurePosixPath(str(name or ""))
-    if not name or path.is_absolute() or ".." in path.parts:
-        raise ValueError(f"unsafe artifact path: {name}")
-    return path
-
-
 def _read_market_scan_latest_from_artifact(archive_bytes: bytes) -> bytes:
-    """Read only data/market_scan/latest.json from the nested artifact."""
-
-    with zipfile.ZipFile(io.BytesIO(archive_bytes)) as outer:
-        tar_info = None
-        for item in outer.infolist():
-            path = _safe_archive_path(item.filename)
-            mode = (item.external_attr >> 16) & 0o170000
-            if mode == stat.S_IFLNK:
-                raise ValueError(f"artifact zip contains symlink: {item.filename}")
-            if path.name == "market-scan-state.tar.gz":
-                if tar_info is not None:
-                    raise ValueError("artifact contains duplicate market-scan-state archives")
-                tar_info = item
-        if tar_info is None:
-            raise ValueError("artifact is missing market-scan-state.tar.gz")
-        nested = outer.read(tar_info)
-
-    latest_member = None
-    with tarfile.open(fileobj=io.BytesIO(nested), mode="r:gz") as archive:
-        for member in archive.getmembers():
-            path = _safe_archive_path(member.name)
-            if member.issym() or member.islnk():
-                raise ValueError(f"artifact tar contains link: {member.name}")
-            if not (member.isfile() or member.isdir()):
-                raise ValueError(f"artifact tar contains special file: {member.name}")
-            if path.as_posix() == "data/market_scan/latest.json":
-                if not member.isfile() or latest_member is not None:
-                    raise ValueError("artifact latest.json is missing or duplicated")
-                latest_member = member
-        if latest_member is None:
-            raise ValueError("artifact is missing data/market_scan/latest.json")
-        handle = archive.extractfile(latest_member)
-        if handle is None:
-            raise ValueError("artifact latest.json cannot be read")
-        return handle.read()
+    return _trusted_read_latest(archive_bytes)
 
 
 def _validate_synced_market_scan(
     raw_latest: bytes, *, slot: str, observed_at: datetime
 ) -> tuple[Mapping[str, Any], datetime, str]:
-    try:
-        payload = json.loads(raw_latest.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise ValueError("market-scan latest.json is invalid JSON") from exc
-    if not isinstance(payload, Mapping):
-        raise ValueError("market-scan latest.json root must be an object")
-    if not (
-        payload.get("simulation_only") is True
-        and payload.get("auto_order_enabled") is False
-        and payload.get("human_confirmation_required") is True
-    ):
-        raise ValueError("market-scan simulation safety contract is invalid")
-    scheduler = payload.get("scheduler")
-    if not isinstance(scheduler, Mapping) or scheduler.get("slot") != slot:
-        raise ValueError("market-scan slot does not match watchdog slot")
-    generated_at = _parse_datetime(str(payload.get("generated_at") or ""))
-    generated_time = generated_at.timetz().replace(tzinfo=None)
-    if (
-        generated_at.date() != observed_at.astimezone(SHANGHAI_TZ).date()
-        or not SLOT_SEARCH_START[slot] <= generated_time <= SLOT_TIMES[slot][1]
-    ):
-        raise ValueError("market-scan generated_at is outside the current slot")
-    fingerprint = hashlib.sha256(raw_latest).hexdigest()
-    return payload, generated_at, fingerprint
+    return _trusted_validate_watchdog(
+        raw_latest,
+        slot=slot,
+        observed_at=observed_at,
+    )
 
 
 def _atomic_write(path: Path, content: bytes) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent)
-    )
-    try:
-        with os.fdopen(descriptor, "wb") as handle:
-            handle.write(content)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary_name, path)
-    finally:
-        try:
-            os.unlink(temporary_name)
-        except FileNotFoundError:
-            pass
+    _trusted_atomic_write(path, content)
 
 
 def _sync_successful_slot_artifact(
