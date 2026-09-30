@@ -73,97 +73,9 @@ def _bounded_research_value(value: Any, *, depth: int = 0) -> Any:
 
 
 def default_research_evidence_loader(candidate: Mapping[str, Any]) -> Dict[str, Any]:
-    """Fetch available fundamentals and event/news evidence for one finalist.
-
-    Each source fails independently. Missing data stays explicit and ordinary
-    news is never represented as a verified exchange announcement.
-    """
-
-    from src.services.alphasift_service import (
-        get_dsa_fundamental_context,
-        search_dsa_stock_news,
-    )
-
-    code = str(candidate.get("code") or "").strip()
-    name = str(candidate.get("name") or "").strip()
-    errors: list[str] = []
-    fundamentals: Dict[str, Any] = {"status": "unavailable", "data": {}}
-    try:
-        raw_fundamentals = get_dsa_fundamental_context(code)
-        compact = (
-            _bounded_research_value(raw_fundamentals)
-            if isinstance(raw_fundamentals, Mapping)
-            else {}
-        )
-        coverage = compact.get("coverage") if isinstance(compact, Mapping) else {}
-        coverage_states = {
-            str(value).strip().lower()
-            for value in (coverage.values() if isinstance(coverage, Mapping) else [])
-        }
-        has_data = any(
-            isinstance(value, Mapping) and bool(value.get("data"))
-            for key, value in compact.items()
-            if key not in {"coverage", "errors"}
-        ) if isinstance(compact, Mapping) else False
-        if "available" in coverage_states:
-            status = "available"
-        elif "partial" in coverage_states or has_data:
-            status = "partial"
-        else:
-            status = "unavailable"
-        fundamentals = {"status": status, "data": compact}
-        if isinstance(compact, Mapping) and compact.get("errors"):
-            errors.append("fundamentals:provider_error")
-    except Exception as exc:  # noqa: BLE001 - preserve the other evidence source.
-        errors.append(f"fundamentals_error:{type(exc).__name__}")
-
-    announcements_and_news: Dict[str, Any] = {
-        "status": "unavailable",
-        "evidence_type": "news_search_not_verified_exchange_announcements",
-        "items": [],
-    }
-    try:
-        raw_news = search_dsa_stock_news(code, name, max_results=3)
-        raw_items = raw_news.get("results") if isinstance(raw_news, Mapping) else []
-        items = [
-            _bounded_research_value(item)
-            for item in (raw_items if isinstance(raw_items, list) else [])[:3]
-            if isinstance(item, Mapping)
-        ]
-        announcements_and_news = {
-            # Search results corroborate events but do not prove that an item
-            # is a filed company announcement, hence never mark them complete.
-            "status": "partial" if items else "unavailable",
-            "evidence_type": "news_search_not_verified_exchange_announcements",
-            "provider": str(raw_news.get("provider") or "")
-            if isinstance(raw_news, Mapping)
-            else "",
-            "items": items,
-        }
-        if isinstance(raw_news, Mapping) and raw_news.get("error"):
-            errors.append("news:provider_error")
-    except Exception as exc:  # noqa: BLE001 - preserve fundamental evidence.
-        errors.append(f"news_error:{type(exc).__name__}")
-
-    available_blocks = {
-        fundamentals.get("status"),
-        announcements_and_news.get("status"),
-    }
-    overall_status = (
-        "available"
-        if "available" in available_blocks and "unavailable" not in available_blocks
-        else "partial"
-        if available_blocks & {"available", "partial"}
-        else "unavailable"
-    )
-    return {
-        "attempted": True,
-        "status": overall_status,
-        "fetched_at": datetime.now(SHANGHAI_TZ).isoformat(timespec="seconds"),
-        "fundamentals": fundamentals,
-        "announcements_and_news": announcements_and_news,
-        "errors": errors[:6],
-    }
+    """Backward-compatible entry point for bounded scan research."""
+    from src.services.market_scan_research import ScanResearchCollector
+    return ScanResearchCollector()(candidate)
 
 
 def _parse_enabled_markets(value: str) -> tuple[str, ...]:
@@ -879,7 +791,7 @@ def _warning_notification_content(result: Mapping[str, Any], report: str) -> str
             "# 全市场买入链路维护预警",
             "",
             f"预警项：{warnings}。当前安全门仍有效、工作流不因此判为故障；"
-            "系统会在后续扫描继续尝试刷新，硬到期前仍未恢复则自动阻断对应市场。",
+            "研究来源故障会保留数据缺口，后续扫描继续尝试；成员缓存若硬到期则阻断对应市场。",
             "",
             report,
         ]
@@ -951,12 +863,20 @@ def persist_result_and_notify(
         and previous_health.get("last_alerted_warning_fingerprint")
         != warning_fingerprint
     )
+    research_warning = "research_evidence_provider_degraded" in operational_warnings
+    research_observed = bool((result.get("diagnostics") or {}).get("buy_funnel", {}).get("research_attempted_count"))
+    research_recovered = bool(
+        previous_health.get("research_warning_active")
+        and research_observed and not research_warning and not operational_failed
+    )
     hard_failure = result.get("operational_status") == "failed"
     notification_kind = health_kind or (
         "candidate_change"
         if candidate_change and not hard_failure
         else "warning"
         if warning_changed
+        else "research_recovery"
+        if research_recovered
         else ""
     )
     obvious_change = bool(notification_kind)
@@ -1029,6 +949,12 @@ def persist_result_and_notify(
     elif notification_kind == "warning":
         selected_title = "全市场买入链路维护预警"
         selected_content = _warning_notification_content(result, report)
+    elif notification_kind == "research_recovery":
+        selected_title = "全市场研究取数来源已恢复"
+        selected_content = (
+            "# 研究取数来源已恢复\n\n本轮研究来源不再报告取数故障；"
+            "这不代表所有证据完整或已有可买候选，仍以报告覆盖与全部安全门为准。\n\n" + report
+        )
 
     def save_outbox(error: str) -> None:
         payload = {
@@ -1071,6 +997,10 @@ def persist_result_and_notify(
         save_outbox("notification provider did not return explicit success")
         return outcome
     outcome["notification_sent"] = True
+    if research_warning:
+        health_state["research_warning_active"] = True
+    elif research_observed and not operational_failed:
+        health_state["research_warning_active"] = False
     if health_kind == "failure":
         health_state.update(
             {
@@ -1175,6 +1105,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         hk_membership_cache_path=args.state_dir / "hk_connect_membership.json",
         runtime_state_path=args.state_dir / "runtime.json",
     )
+    from src.services.market_scan_research import ScanResearchCollector
     service = MarketScanService(
         a_snapshot_loader=default_a_snapshot_loader,
         hk_connect_snapshot_loader=default_hk_connect_snapshot_loader,
@@ -1183,7 +1114,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         history_loader=default_history_loader,
         qwen_reviewer=build_litellm_reviewer("qwen"),
         deepseek_reviewer=build_litellm_reviewer("deepseek"),
-        research_evidence_loader=default_research_evidence_loader,
+        research_evidence_loader=ScanResearchCollector(config.research_symbol_timeout_seconds),
         config=config,
     )
 

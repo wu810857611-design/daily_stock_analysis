@@ -9,9 +9,10 @@ endpoint candidates. It should never raise to caller; partial data is allowed.
 from __future__ import annotations
 
 import logging
+import math
 import re
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import pandas as pd
 
@@ -264,9 +265,15 @@ def _extract_latest_row(df: pd.DataFrame, stock_code: str) -> Optional[pd.Series
 class AkshareFundamentalAdapter:
     """AkShare adapter for fundamentals, capital flow and dragon-tiger signals."""
 
+    def __init__(self, call_runner: Optional[Callable[..., Any]] = None) -> None:
+        # Scan research supplies a killable per-endpoint boundary. Ordinary
+        # analysis retains its existing adapter behaviour.
+        self.call_runner = call_runner
+
     def _call_df_candidates(
         self,
         candidates: List[Tuple[str, Dict[str, Any]]],
+        validator: Optional[Callable[[pd.DataFrame], bool]] = None,
     ) -> Tuple[Optional[pd.DataFrame], Optional[str], List[str]]:
         errors: List[str] = []
         try:
@@ -279,17 +286,24 @@ class AkshareFundamentalAdapter:
             if fn is None:
                 continue
             try:
-                df = fn(**kwargs)
+                if self.call_runner:
+                    df = (self.call_runner(fn, kwargs, validator=validator) if validator is not None
+                          else self.call_runner(fn, kwargs))
+                else:
+                    df = fn(**kwargs)
                 if isinstance(df, pd.Series):
                     df = df.to_frame().T
                 if isinstance(df, pd.DataFrame) and not df.empty:
+                    if validator is not None and not validator(df):
+                        errors.append(f"{func_name}:InvalidPayload")
+                        continue
                     return df, func_name, errors
             except Exception as exc:
-                errors.append(f"{func_name}:{type(exc).__name__}")
+                errors.append(f"{func_name}:{getattr(exc, 'error_class', type(exc).__name__)}")
                 continue
         return None, None, errors
 
-    def get_fundamental_bundle(self, stock_code: str) -> Dict[str, Any]:
+    def get_fundamental_bundle(self, stock_code: str, *, financial_only: bool = False) -> Dict[str, Any]:
         """
         Return normalized fundamental blocks from AkShare with partial tolerance.
         """
@@ -303,13 +317,37 @@ class AkshareFundamentalAdapter:
         }
 
         # Financial indicators
+        def normalized_financial_frame(frame: pd.DataFrame) -> pd.DataFrame:
+            if "指标" not in frame.columns:
+                return frame
+            date_columns = [c for c in frame.columns if isinstance(c, str)
+                            and re.fullmatch(r"\d{4}-?\d{2}-?\d{2}", c)
+                            and _safe_datetime(c) is not None]
+            if not date_columns:
+                return frame
+            normalized = frame.set_index("指标")[date_columns].T.reset_index(names="报告期")
+            return normalized.sort_values("报告期", ascending=False)
+
+        def has_financial_evidence(frame: pd.DataFrame) -> bool:
+            row = _extract_latest_row(normalized_financial_frame(frame), stock_code)
+            if row is None:
+                return False
+            for keyword in ("营业收入", "营收", "净利润", "净资产收益", "ROE", "毛利率", "经营现金流"):
+                value = _safe_float(_pick_by_keywords(row, [keyword]))
+                if value is not None and math.isfinite(value):
+                    return True
+            return False
+
         fin_df, fin_source, fin_errors = self._call_df_candidates([
             ("stock_financial_abstract", {"symbol": stock_code}),
             ("stock_financial_analysis_indicator", {"symbol": stock_code}),
             ("stock_financial_analysis_indicator", {}),
-        ])
+        ], validator=has_financial_evidence if financial_only else None)
         result["errors"].extend(fin_errors)
         if fin_df is not None:
+            # stock_financial_abstract uses indicator rows and report-date
+            # columns. Transpose that shape before the shared row extractor.
+            fin_df = normalized_financial_frame(fin_df)
             row = _extract_latest_row(fin_df, stock_code)
             if row is not None:
                 revenue_yoy = _safe_float(_pick_by_keywords(row, ["营业收入同比", "营收同比", "收入同比", "同比增长"]))
@@ -338,6 +376,10 @@ class AkshareFundamentalAdapter:
                 if any(v is not None for v in financial_report_payload.values()):
                     result["earnings"]["financial_report"] = financial_report_payload
                 result["source_chain"].append(f"growth:{fin_source}")
+
+        if financial_only:
+            result["status"] = "partial" if result["growth"] or result["earnings"] else "not_supported"
+            return result
 
         # Earnings forecast
         forecast_df, forecast_source, forecast_errors = self._call_df_candidates([

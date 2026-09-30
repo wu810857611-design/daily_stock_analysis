@@ -50,7 +50,7 @@ def _execute(callback: Callable[[], Any], path: str, budget: float) -> None:
         if len(serialized) > 16 * 1024 * 1024:
             raise ValueError("research result exceeds 16 MiB")
     except BaseException as exc:
-        serialized = pickle.dumps(("error", type(exc).__name__, str(exc)[:400]))
+        serialized = pickle.dumps(("error", getattr(exc, "error_class", type(exc).__name__), str(exc)[:400]))
     Path(path).write_bytes(serialized)
 
 

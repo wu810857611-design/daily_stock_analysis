@@ -19,7 +19,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional, Tuple, Callable
 from itertools import cycle
 from urllib.parse import parse_qsl, unquote, urlparse
 import requests
@@ -3664,7 +3664,9 @@ class SearchService:
         stock_code: str,
         stock_name: str,
         max_results: int = 5,
-        focus_keywords: Optional[List[str]] = None
+        focus_keywords: Optional[List[str]] = None,
+        *,
+        request_runner: Optional[Callable[..., SearchResponse]] = None,
     ) -> SearchResponse:
         """
         搜索股票相关新闻
@@ -3813,7 +3815,13 @@ class SearchService:
                         provider=provider.name,
                         operation="search_stock_news",
                     )
-                    response = provider.search(query, provider_max_results, days=search_days, **search_kwargs)
+                    if request_runner is None:
+                        response = provider.search(query, provider_max_results, days=search_days, **search_kwargs)
+                    else:
+                        response = request_runner(
+                            lambda: provider.search(query, provider_max_results, days=search_days, **search_kwargs),
+                            provider.name,
+                        )
                 except Exception as exc:
                     self._record_news_search_run(
                         provider=provider.name,
@@ -3823,6 +3831,8 @@ class SearchService:
                         error_type=type(exc).__name__,
                         error_message=exc,
                     )
+                    if request_runner is not None:
+                        continue
                     raise
                 filtered_response = self._filter_news_response(
                     response,
