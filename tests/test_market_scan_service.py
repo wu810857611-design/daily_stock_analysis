@@ -2325,6 +2325,12 @@ def test_reviewer_timeout_exhaustion_keeps_scan_failed_with_independent_sibling(
     result = _service(
         tmp_path, qwen=build_litellm_reviewer("qwen"),
         deepseek=build_litellm_reviewer("deepseek"),
+        research_loader=lambda _candidate: {
+            "status": "complete", "fundamentals": {"data": {"roe": 18.2}},
+            "announcements_and_news": {"items": [{"title": "fixture news"}]},
+            "announcements": {"items": [{"title": "fixture official report"}]},
+            "errors": [],
+        },
     ).run()
     assert calls.count("openai/test-qwen") == 2
     assert "deepseek/test-deepseek" in calls
@@ -2334,6 +2340,8 @@ def test_reviewer_timeout_exhaustion_keeps_scan_failed_with_independent_sibling(
     assert not any(c["eligible_for_intraday_review"] for c in result["candidates"])
     assert not any(c["conditional_review"] for c in result["candidates"])
     assert result["diagnostics"]["reviewer_requests"]["qwen"]["request_count"] == 2
+    assert result["diagnostics"]["buy_funnel"]["research_complete_count"] == len(result["candidates"])
+    assert "research_evidence_provider_degraded" not in result["operational_warnings"]
 
 
 def test_reviewer_does_not_return_partial_batches_or_retry_reject(monkeypatch: Any) -> None:

@@ -59,6 +59,7 @@ class ResearchBudget:
                     detail = str(getattr(result, "error_message", "") or "")
                     if any(term in detail.lower() for term in ("429", "rate limit", "限流", "503", "502")):
                         raise ResearchCallError("TransientProviderError", "retryable provider response")
+                    raise ResearchCallError("ProviderResponseError", "provider returned failure")
                 event.update(result="success", elapsed=round(time.monotonic() - started, 3),
                              fetched_at=datetime.now(timezone.utc).isoformat(),
                              fallback_result="recovered" if any(

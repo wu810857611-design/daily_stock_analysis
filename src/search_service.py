@@ -2027,7 +2027,8 @@ class SearXNGSearchProvider(BaseSearchProvider):
         except Exception:
             return "未知来源"
 
-    def search(self, query: str, max_results: int = 5, days: int = 7) -> SearchResponse:
+    def search(self, query: str, max_results: int = 5, days: int = 7, *,
+               request_runner: Optional[Callable[..., Any]] = None) -> SearchResponse:
         """Execute SearXNG search with instance rotation and per-request failover."""
         start_time = time.time()
         if self._base_urls:
@@ -2039,7 +2040,18 @@ class SearXNGSearchProvider(BaseSearchProvider):
             timeout = self.SELF_HOSTED_TIMEOUT_SECONDS
             empty_error = "SearXNG 未配置可用实例"
         elif self._use_public_instances:
-            public_instances = self._get_public_instances()
+            if request_runner is None:
+                public_instances = self._get_public_instances()
+            else:
+                def discover():
+                    urls = self._get_public_instances()
+                    return urls, self._public_instances_cache, self._public_instances_stale_retry_after
+                public_instances, cache, retry_after = request_runner(discover, "SearXNG:discovery")
+                # Preserve the child's actual cache timestamp/backoff, not a
+                # fabricated refresh time, between finalist requests.
+                with self._public_instances_lock:
+                    type(self)._public_instances_cache = cache
+                    type(self)._public_instances_stale_retry_after = retry_after
             candidates = self._rotate_candidates(
                 public_instances,
                 max_attempts=min(len(public_instances), self.PUBLIC_INSTANCES_MAX_ATTEMPTS),
@@ -2065,14 +2077,17 @@ class SearXNGSearchProvider(BaseSearchProvider):
 
         errors: List[str] = []
         for base_url in candidates:
-            response = self._do_search(
-                query,
-                base_url,
-                max_results,
-                days=days,
-                timeout=timeout,
-                retry_enabled=retry_enabled,
-            )
+            def search_instance():
+                return self._do_search(query, base_url, max_results, days=days,
+                                       timeout=timeout, retry_enabled=retry_enabled if request_runner is None else False)
+            if request_runner is None:
+                response = search_instance()
+            else:
+                try:
+                    response = request_runner(search_instance, f"SearXNG:{urlparse(base_url).hostname}")
+                except Exception as exc:
+                    errors.append(f"{urlparse(base_url).hostname}:{getattr(exc, 'error_class', type(exc).__name__)}")
+                    continue
             response.search_time = time.time() - start_time
             if response.success:
                 logger.info(
@@ -3817,6 +3832,11 @@ class SearchService:
                     )
                     if request_runner is None:
                         response = provider.search(query, provider_max_results, days=search_days, **search_kwargs)
+                    elif isinstance(provider, SearXNGSearchProvider):
+                        # Bound each instance, rather than killing the entire
+                        # fallback loop when its first instance hangs.
+                        response = provider.search(query, provider_max_results, days=search_days,
+                                                   request_runner=request_runner, **search_kwargs)
                     else:
                         response = request_runner(
                             lambda: provider.search(query, provider_max_results, days=search_days, **search_kwargs),

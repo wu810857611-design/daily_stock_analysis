@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import pandas as pd
 import pytest
 
-from src.search_service import SearchResponse, SearchResult, SearchService
+from src.search_service import SearchResponse, SearchResult, SearchService, SearXNGSearchProvider
 from src.services.market_scan_research import ResearchBudget, ScanResearchCollector, meaningful
 from src.services.research_execution import ResearchCallError
 
@@ -94,6 +94,42 @@ def test_news_zero_results_differs_from_provider_failure(configured):
     result = ScanResearchCollector(2)(CANDIDATE)
     assert result["announcements_and_news"]["status"] == "provider_error"
     assert "news:provider_error" in result["errors"]
+
+
+def test_searxng_hanging_instance_does_not_block_next_instance(configured, monkeypatch):
+    _, service = configured
+    provider = SearXNGSearchProvider(["https://hung.invalid", "https://working.invalid"])
+    def instance(query, base_url, *args, **kwargs):
+        if "hung" in base_url:
+            hanging()
+        return no_news()
+    monkeypatch.setattr(provider, "_do_search", instance)
+    service._providers = [provider]
+    result = ScanResearchCollector(2)(CANDIDATE)
+    assert result["announcements_and_news"]["status"] == "no_results"
+    assert any(e["provider"] == "SearXNG:hung.invalid" and e["error_class"] == "TimeoutError"
+               for e in result["diagnostics"])
+    assert any(e["provider"] == "SearXNG:working.invalid" and e.get("fallback_result") == "recovered"
+               for e in result["diagnostics"])
+
+
+def test_bounded_searxng_discovery_retains_actual_cache_time(configured, monkeypatch):
+    _, service = configured
+    provider = SearXNGSearchProvider(use_public_instances=True)
+    saved_at = time.time() - 4000
+    def discover(cls):
+        cls._public_instances_cache = (saved_at, ["https://fixture.invalid"])
+        cls._public_instances_stale_retry_after = time.time() + 60
+        return cls._public_instances_cache[1]
+    monkeypatch.setattr(SearXNGSearchProvider, "_get_public_instances", classmethod(discover))
+    monkeypatch.setattr(SearXNGSearchProvider, "_public_instances_cache", None)
+    monkeypatch.setattr(SearXNGSearchProvider, "_public_instances_stale_retry_after", 0)
+    monkeypatch.setattr(provider, "_do_search", lambda *args, **kwargs: no_news())
+    service._providers = [provider]
+    result = ScanResearchCollector(2)(CANDIDATE)
+    assert result["announcements_and_news"]["status"] == "no_results"
+    assert SearXNGSearchProvider._public_instances_cache[0] == saved_at
+    assert SearXNGSearchProvider._public_instances_stale_retry_after > time.time()
 
 
 @pytest.mark.parametrize("change", [
