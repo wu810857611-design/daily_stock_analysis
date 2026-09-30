@@ -22,7 +22,7 @@ def meaningful(value: Any) -> bool:
     if isinstance(value, Mapping):
         return any(meaningful(v) for k, v in value.items() if k not in {
             "status", "source", "provider", "fetched_at", "as_of", "report_date",
-            "published_at", "error", "errors", "coverage", "market", "source_chain",
+            "published_at", "error", "errors", "coverage", "market", "source_chain", "cache_age_seconds",
         })
     if isinstance(value, (list, tuple)):
         return any(meaningful(v) for v in value)
@@ -60,7 +60,11 @@ class ResearchBudget:
                     if any(term in detail.lower() for term in ("429", "rate limit", "限流", "503", "502")):
                         raise ResearchCallError("TransientProviderError", "retryable provider response")
                 event.update(result="success", elapsed=round(time.monotonic() - started, 3),
-                             fetched_at=datetime.now(timezone.utc).isoformat())
+                             fetched_at=datetime.now(timezone.utc).isoformat(),
+                             fallback_result="recovered" if any(
+                                 item.get("stage") == self.stage and item.get("result") == "failed"
+                                 for item in self.events
+                             ) else "primary_success")
                 self.events.append(event)
                 print(json.dumps({"event": "research_provider", **event}), flush=True)
                 return result
@@ -112,7 +116,12 @@ class ScanResearchCollector:
                                "result": "cache_hit", "fetched_at": cached[1],
                                "cache_age_seconds": round(time.monotonic() - cached[0], 3)})
                 return copy.deepcopy(cached[2])
-            result = budget.call(callback, key)
+            def checked_callback():
+                result = callback()
+                if cache_validator is not None and not cache_validator(result):
+                    raise ResearchCallError("InvalidPayload", "no valid symbol financial fields")
+                return result
+            result = budget.call(checked_callback, key)
             cacheable = not result.empty if hasattr(result, "empty") else meaningful(result)
             if cacheable and cache_validator is not None:
                 cacheable = cache_validator(result)
@@ -145,8 +154,13 @@ class ScanResearchCollector:
                 bundle = AkshareFundamentalAdapter(call_runner=adapter_call).get_fundamental_bundle(code, financial_only=True)
             for block in ("growth", "earnings", "institution"):
                 data = bundle.get(block) or {}
+                provenance = next((item for item in reversed(events)
+                                   if item.get("stage") == "fundamentals"
+                                   and item.get("result") in {"success", "cache_hit"}), {})
                 fundamental[block] = {"status": "partial" if meaningful(data) else "unavailable", "data": data,
-                                      "source_chain": bundle.get("source_chain") or []}
+                                      "source_chain": bundle.get("source_chain") or [],
+                                      "fetched_at": provenance.get("fetched_at", ""),
+                                      "cache_age_seconds": provenance.get("cache_age_seconds", 0)}
             errors.extend(f"fundamentals:{item}" for item in bundle.get("errors", []))
         except Exception as exc:
             errors.append(f"fundamentals:{getattr(exc, 'error_class', type(exc).__name__)}")

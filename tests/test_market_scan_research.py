@@ -193,6 +193,8 @@ def test_nonempty_but_useless_financial_table_advances_to_fallback(configured, m
     assert result["fundamentals"]["data"]["growth"]["data"]["roe"] == 18.2
     assert "fundamentals:stock_financial_abstract:InvalidPayload" in result["errors"]
     assert not any(":invalid:" in key for key in collector._cache)
+    assert any(event["error_class"] == "InvalidPayload" for event in result["diagnostics"])
+    assert any(event.get("fallback_result") == "recovered" for event in result["diagnostics"])
 
 
 def test_hk_announcement_query_is_company_scoped_and_exact_code_checked(configured, monkeypatch):

@@ -329,6 +329,10 @@ class AkshareFundamentalAdapter:
             return normalized.sort_values("报告期", ascending=False)
 
         def has_financial_evidence(frame: pd.DataFrame) -> bool:
+            if isinstance(frame, pd.Series):
+                frame = frame.to_frame().T
+            if not isinstance(frame, pd.DataFrame):
+                return False
             row = _extract_latest_row(normalized_financial_frame(frame), stock_code)
             if row is None:
                 return False
