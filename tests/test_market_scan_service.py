@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import sys
 import time
@@ -1335,6 +1336,43 @@ def test_unavailable_research_is_data_gap_not_incomplete_model_review(
     assert funnel["research_available_count"] == 0
 
 
+def test_null_research_wrapper_is_not_counted_as_available(tmp_path: Path) -> None:
+    result = _service(tmp_path, qwen=ReviewRecorder("watch"), deepseek=ReviewRecorder("watch"), research_loader=lambda _candidate: {
+        "attempted": True, "status": "partial",
+        "fundamentals": {"status": "partial", "data": {
+            "valuation": {"status": "partial", "data": {"pe": None, "pb": None}},
+        }}, "errors": ["fundamental_timeout"],
+    }).run()
+    funnel = result["diagnostics"]["buy_funnel"]
+    assert funnel["research_available_count"] == 0
+    assert funnel["research_complete_count"] == 0
+    assert funnel["research_unavailable_count"] == len(result["candidates"])
+    assert "research_evidence_provider_degraded" in result["operational_warnings"]
+    assert result["review_complete"] is True
+
+
+def test_research_warning_and_recovery_notify_once_and_retry_delivery(tmp_path: Path) -> None:
+    import scripts.market_scan as scan_script
+    result = _service(tmp_path, qwen=ReviewRecorder("watch"), deepseek=ReviewRecorder("watch"), research_loader=lambda _candidate: {
+        "status": "unavailable", "errors": ["fundamental_timeout"],
+    }).run()
+    delivered = []
+    kwargs = {"report_path": tmp_path / "report.md", "result_path": tmp_path / "report.json",
+              "state_dir": tmp_path / "health", "notify": True,
+              "notifier": lambda title, content: delivered.append(title) or True}
+    assert scan_script.persist_result_and_notify(result, **kwargs)["notification_sent"]
+    assert not scan_script.persist_result_and_notify(result, **kwargs)["notification_attempted"]
+    recovered = copy.deepcopy(result)
+    recovered["operational_warnings"] = []
+    fail_kwargs = {**kwargs, "notifier": lambda *args: False}
+    failed = scan_script.persist_result_and_notify(recovered, **fail_kwargs)
+    assert failed["notification_kind"] == "research_recovery" and failed["outbox_pending"]
+    outcome = scan_script.persist_result_and_notify(recovered, **kwargs)
+    assert outcome["notification_kind"] == "research_recovery" and outcome["notification_sent"]
+    assert delivered[-1] == "全市场研究取数来源已恢复"
+    assert not scan_script.persist_result_and_notify(recovered, **kwargs)["notification_attempted"]
+
+
 def test_one_pass_one_noncritical_watch_enters_only_standard_manual_review(
     tmp_path: Path,
 ) -> None:
@@ -2287,6 +2325,12 @@ def test_reviewer_timeout_exhaustion_keeps_scan_failed_with_independent_sibling(
     result = _service(
         tmp_path, qwen=build_litellm_reviewer("qwen"),
         deepseek=build_litellm_reviewer("deepseek"),
+        research_loader=lambda _candidate: {
+            "status": "complete", "fundamentals": {"data": {"roe": 18.2}},
+            "announcements_and_news": {"items": [{"title": "fixture news"}]},
+            "announcements": {"items": [{"title": "fixture official report"}]},
+            "errors": [],
+        },
     ).run()
     assert calls.count("openai/test-qwen") == 2
     assert "deepseek/test-deepseek" in calls
@@ -2296,6 +2340,8 @@ def test_reviewer_timeout_exhaustion_keeps_scan_failed_with_independent_sibling(
     assert not any(c["eligible_for_intraday_review"] for c in result["candidates"])
     assert not any(c["conditional_review"] for c in result["candidates"])
     assert result["diagnostics"]["reviewer_requests"]["qwen"]["request_count"] == 2
+    assert result["diagnostics"]["buy_funnel"]["research_complete_count"] == len(result["candidates"])
+    assert "research_evidence_provider_degraded" not in result["operational_warnings"]
 
 
 def test_reviewer_does_not_return_partial_batches_or_retry_reject(monkeypatch: Any) -> None:

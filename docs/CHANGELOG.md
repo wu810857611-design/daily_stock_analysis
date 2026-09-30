@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 > For user-friendly release highlights, see the [GitHub Releases](https://github.com/ZhuLinsen/daily_stock_analysis/releases) page.
 
 ## [Unreleased]
+
+- [修复] 全市场最终候选研究取数改用可终止的逐来源进程边界和剩余预算，复用扫描估值而不重抓全市场报价；财务、新闻与官方公告索引独立fallback并保留来源/时间/缺口，研究覆盖统计与维护预警/恢复去重不再把空字段或部分证据说成完整。交易安全门与双模型规则保持不变。
 - [修复] 全市场扫描为第三方快照、单标的历史/研究、阶段及整轮增加分层硬截止时间；AkShare 新浪港股99页备用改为逐页 connect/read/total timeout 和结构化定位，Efinance 无内置超时调用改用不会阻塞解释器退出的 daemon 边界；关键阶段超时继续失败关闭并在 Actions 75分钟硬杀前主动落盘最后阶段、标的与 provider。
 - [修复] 盘中 market-scan watchdog 的同步等待从40分钟收敛到120秒；在途扫描记为 pending 且不重复派发、不阻塞盘中主监控，主监控收尾时再做一次零等待且禁止派发的最终复查，取消、平台超时、失败、产物未就绪与完全缺失保留独立语义和 run ID，故障/恢复通知继续去重。
 - [测试] 覆盖永久挂起 provider、单标的超时、主源超时后备用成功、非关键研究超时降级、关键快照失败关闭、阶段/整轮预算、watchdog 在途不重派、取消/超时/失败归因、产物未就绪和非阻塞收尾。

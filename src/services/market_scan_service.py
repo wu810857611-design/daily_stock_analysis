@@ -1256,6 +1256,10 @@ def _build_v4_evidence_contract(
         "history_source": candidate.get("history_source"),
         "fundamentals": _json_safe(fundamentals),
         "announcements_and_news": _json_safe(announcements_and_news),
+        # A provider-indexed official document is distinct from news, and the
+        # index does not prove the document contents were reviewed. Keep the
+        # existing quality weights and decision gates unchanged.
+        "official_announcements": _json_safe(research.get("announcements") or {}),
     }
     above_ma20 = bool(
         _finite_float(candidate.get("price"))
@@ -2210,6 +2214,8 @@ class MarketScanService:
         research_requested_count = 0
         research_attempted_count = 0
         research_available_count = 0
+        research_status_counts = {"complete": 0, "partial": 0, "unavailable": 0}
+        research_block_counts = {"fundamentals": 0, "news": 0, "announcements": 0}
         research_errors: Dict[str, List[str]] = {}
         review_payload = []
         self._begin_stage(
@@ -2229,8 +2235,19 @@ class MarketScanService:
                     }
                 else:
                     try:
+                        research_candidate = copy.deepcopy(candidate)
+                        research_candidate["_research_timeout_seconds"] = self._remaining_call_budget(
+                            self.config.research_symbol_timeout_seconds
+                        )[0]
+                        is_a = candidate.get("market") == MARKET_A
+                        research_candidate["_research_snapshot_source"] = l1.diagnostics.get(
+                            "a_snapshot_source" if is_a else "hk_snapshot_source", ""
+                        )
+                        research_candidate["_research_snapshot_fetched_at"] = l1.diagnostics.get(
+                            "a_snapshot_fetched_at" if is_a else "hk_snapshot_fetched_at", ""
+                        )
                         raw_research = self._timed_call(
-                            lambda candidate_value=copy.deepcopy(candidate): (
+                            lambda candidate_value=research_candidate: (
                                 self.research_evidence_loader(candidate_value)
                             ),
                             timeout_seconds=self.config.research_symbol_timeout_seconds,
@@ -2272,11 +2289,26 @@ class MarketScanService:
                         }
                 research_evidence["attempted"] = True
                 research_attempted_count += 1
-                if str(research_evidence.get("status") or "").lower() in {
-                    "available",
-                    "partial",
-                }:
+                from src.services.market_scan_research import meaningful
+                def research_block(key: str, payload_key: str) -> Any:
+                    block = research_evidence.get(key)
+                    return block.get(payload_key) if isinstance(block, Mapping) else None
+                blocks = {
+                    "fundamentals": research_block("fundamentals", "data"),
+                    "news": research_block("announcements_and_news", "items"),
+                    "announcements": research_block("announcements", "items"),
+                }
+                block_available = {key: meaningful(value) for key, value in blocks.items()}
+                if any(block_available.values()):
                     research_available_count += 1
+                complete = (
+                    str(research_evidence.get("status") or "").lower() == "complete"
+                    and all(block_available.values())
+                )
+                evidence_status = "complete" if complete else "partial" if any(block_available.values()) else "unavailable"
+                research_status_counts[evidence_status] += 1
+                for key, has_block in block_available.items():
+                    research_block_counts[key] += int(has_block)
                 errors = research_evidence.get("errors")
                 if isinstance(errors, list) and errors:
                     research_errors[code] = [str(item) for item in errors[:3]]
@@ -2643,6 +2675,10 @@ class MarketScanService:
 
         operational_failures: List[str] = list(dict.fromkeys(self._runtime_failures))
         operational_warnings: List[str] = []
+        if research_errors:
+            # Stable warning fingerprints use existing PushPlus change/recovery
+            # deduplication. Detailed per-symbol errors remain in diagnostics.
+            operational_warnings.append("research_evidence_provider_degraded")
         if l1.a_safe_halt:
             operational_failures.append("a_share_full_market_snapshot_unavailable")
         if l1.hk_safe_halt:
@@ -2710,6 +2746,11 @@ class MarketScanService:
             "research_requested_count": research_requested_count,
             "research_attempted_count": research_attempted_count,
             "research_available_count": research_available_count,
+            "research_available_count_semantics": "any_nonempty_evidence_not_complete",
+            "research_complete_count": research_status_counts["complete"],
+            "research_partial_count": research_status_counts["partial"],
+            "research_unavailable_count": research_status_counts["unavailable"],
+            "research_block_coverage": research_block_counts,
             "actionable_count": actionable_count,
             "history_rejection_reasons": history_rejection_counts,
             "candidate_rejection_reasons": candidate_rejection_reasons,
@@ -3226,6 +3267,10 @@ def render_market_scan_markdown(result: Mapping[str, Any]) -> str:
                 f"- L1合格/短名单：{funnel.get('l1_eligible_count', 0)} / "
                 f"{funnel.get('l1_shortlist_count', 0)}",
                 f"- 历史与交易计划有效：{funnel.get('history_and_plan_valid_count', 0)}",
+                f"- 研究取数尝试/完整/部分/不可用：{funnel.get('research_attempted_count', 0)} / "
+                f"{funnel.get('research_complete_count', 0)} / {funnel.get('research_partial_count', 0)} / "
+                f"{funnel.get('research_unavailable_count', 0)}",
+                f"- 研究有效覆盖（基本面/新闻/官方公告索引）：{json.dumps(funnel.get('research_block_coverage') or {}, ensure_ascii=False)}",
                 f"- 双模型完成/同时通过：{funnel.get('dual_model_reviewed_count', 0)} / "
                 f"{funnel.get('dual_model_pass_count', 0)}",
                 f"- 可进入盘中买入区复核：{funnel.get('actionable_count', 0)}",
