@@ -86,6 +86,22 @@ jobs:
           echo "RUN_PHASE=$RUN_PHASE" >> "$GITHUB_ENV"
           echo "本轮阶段: $RUN_PHASE"
 
+      - name: 固定定时收盘交易日
+        if: github.event_name == 'schedule' && env.RUN_PHASE == 'full'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CLOSE_SCHEDULE: ${{ github.event.schedule }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh api "/repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+            --jq '{event, created_at}' > data/daily_analysis/close_run.json
+          TRADE_DATE="$(python -m src.core.close_analysis_context \
+            --run-metadata data/daily_analysis/close_run.json \
+            --schedule "$CLOSE_SCHEDULE" \
+            --report reports/close_analysis_context.json)"
+          echo "SCHEDULED_CLOSE_DATE=$TRADE_DATE" >> "$GITHUB_ENV"
+
       - name: 恢复收盘数据库与旧模拟历史
         uses: actions/cache/restore@v4
         with:
@@ -730,13 +746,14 @@ jobs:
           )"
           echo "📅 收盘分析交易日: $TRADE_DATE"
 
-          # 定时任务若延迟到次日凌晨，拒绝把前一交易日分析记到错误日期。
+          # 定时运行（含跨日迟到）使用已核验的原 cron 日期；实际记录时间不回填。
+          CLOSE_DATE_ARGS=()
+          CLOSE_DEADLINE_EPOCH=0
           if [ "${{ github.event_name }}" = "schedule" ]; then
-            LOCAL_HOUR="$(TZ='Asia/Shanghai' date '+%H')"
-            if [ "$LOCAL_HOUR" -lt 18 ]; then
-              echo "❌ 定时收盘任务已跨越自然日，无法可靠确定 trade_date；本轮 fail closed"
-              exit 1
-            fi
+            TRADE_DATE="${SCHEDULED_CLOSE_DATE:?missing validated close date}"
+            CLOSE_DATE_ARGS=(--close-analysis-date "$TRADE_DATE")
+            CLOSE_DEADLINE_EPOCH="$(python3 -c 'import json; from datetime import datetime; print(int(datetime.fromisoformat(json.load(open("reports/close_analysis_context.json"))["deadline"]).timestamp()))')"
+            echo "📅 固定定时收盘交易日: $TRADE_DATE（次日09:00前截止）"
           fi
 
           # 旁路观察层共享一个有限时间预算。预算耗尽时跳过低优先级层，不影响
@@ -769,16 +786,27 @@ jobs:
               echo "📌 $priority $label / $market_label: $batch"
 
               if [ "$required" = "true" ]; then
-                python main.py --stocks "$batch" --no-market-review --no-notify $FORCE_RUN_ARG \
+                local close_timeout=()
+                if [ "$CLOSE_DEADLINE_EPOCH" -gt 0 ]; then
+                  remaining=$((CLOSE_DEADLINE_EPOCH - $(date +%s)))
+                  [ "$remaining" -gt 0 ] || return 1
+                  close_timeout=(timeout --signal=TERM --kill-after=30s "${remaining}s")
+                fi
+                "${close_timeout[@]}" python main.py --stocks "$batch" --no-market-review --no-notify \
+                  "${CLOSE_DATE_ARGS[@]}" $FORCE_RUN_ARG \
                   || layer_status=1
               else
                 remaining=$((OPTIONAL_ANALYSIS_DEADLINE - $(date +%s)))
+                if [ "$CLOSE_DEADLINE_EPOCH" -gt 0 ] && [ "$remaining" -gt "$((CLOSE_DEADLINE_EPOCH - $(date +%s)))" ]; then
+                  remaining=$((CLOSE_DEADLINE_EPOCH - $(date +%s)))
+                fi
                 if [ "$remaining" -le 0 ]; then
                   echo "::warning::$priority $label 因旁路分析时间预算耗尽而跳过；PRIMARY 不受影响"
                   return 0
                 fi
-                timeout --signal=TERM "${remaining}s" \
-                  python main.py --stocks "$batch" --no-market-review --no-notify $FORCE_RUN_ARG \
+                timeout --signal=TERM --kill-after=30s "${remaining}s" \
+                  python main.py --stocks "$batch" --no-market-review --no-notify \
+                    "${CLOSE_DATE_ARGS[@]}" $FORCE_RUN_ARG \
                   || layer_status=1
               fi
 
@@ -930,10 +958,43 @@ jobs:
       - name: 检出代码
         uses: actions/checkout@v5
 
+      - name: 设置兜底 Python 环境
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: 安装兜底交易日依赖
+        run: python -m pip install 'exchange-calendars>=4.13.0'
+
       - name: 兜底检查19:15全市场扫描
         env:
           GH_TOKEN: ${{ github.token }}
+          CLOSE_SCHEDULE: ${{ github.event.schedule }}
         run: |
+          set -euo pipefail
+          gh api "/repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+            --jq '{event, created_at}' > close-watchdog-run.json
+          python -m src.core.close_analysis_context \
+            --run-metadata close-watchdog-run.json \
+            --schedule "$CLOSE_SCHEDULE" \
+            --report close-scan-watchdog.json
+          # 跨日迟到不能把昨天19:27的兜底改成等待今天19:27。
+          if ! python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          path = Path('close-scan-watchdog.json')
+          result = json.loads(path.read_text())
+          if not result['close_scan_should_run']:
+              result.update(status='skipped_late', slot='close', reason='original_close_scan_window_ended')
+              path.write_text(json.dumps(result, indent=2) + '\n')
+              raise SystemExit(1)
+          PY
+          then
+            echo "ℹ️ 原收盘扫描窗口已结束；只保存迟到审计，不等待或触发下一日扫描"
+            exit 0
+          fi
           python3 scripts/market_scan_watchdog.py \
             --slot close \
             --repo "$GITHUB_REPOSITORY" \
