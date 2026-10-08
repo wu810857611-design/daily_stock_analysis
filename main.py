@@ -23,6 +23,7 @@ A股自选股智能分析系统 - 主调度程序
 """
 from __future__ import annotations
 
+import copy
 import json
 import multiprocessing
 import os
@@ -289,6 +290,11 @@ def parse_arguments() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        '--close-analysis-date',
+        help='A/H收盘归属日 YYYY-MM-DD；仅在当天18:00至次日09:00有效',
+    )
+
+    parser.add_argument(
         '--debug',
         action='store_true',
         help='启用调试模式，输出详细日志'
@@ -439,7 +445,10 @@ def parse_arguments() -> argparse.Namespace:
         help='强制回测（即使已有回测结果也重新计算）'
     )
 
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.close_analysis_date and (args.market_review or args.schedule or args.portfolio or args.backtest):
+        parser.error("--close-analysis-date is only supported for one-shot A/H stock analysis")
+    return args
 
 
 def _compute_trading_day_filter(
@@ -456,8 +465,9 @@ def _compute_trading_day_filter(
         - effective_region '' = all relevant markets closed, skip market review
         - should_skip_all: skip entire run when no stocks and no market review to run
     """
+    close_date = getattr(args, 'close_analysis_date', None)
     force_run = getattr(args, 'force_run', False)
-    if force_run or not getattr(config, 'trading_day_check_enabled', True):
+    if not close_date and (force_run or not getattr(config, 'trading_day_check_enabled', True)):
         return (stock_codes, None, False)
 
     from src.core.trading_calendar import (
@@ -466,11 +476,16 @@ def _compute_trading_day_filter(
         compute_effective_region,
     )
 
-    open_markets = get_open_markets_today()
+    if close_date:
+        from src.services.close_analysis_context import close_reference_time, close_open_markets
+        close_reference_time(close_date)
+        open_markets = close_open_markets(close_date)
+    else:
+        open_markets = get_open_markets_today()
     filtered_codes = []
     for code in stock_codes:
         mkt = get_market_for_stock(code)
-        if mkt in open_markets or mkt is None:
+        if mkt in open_markets or (mkt is None and not close_date):
             filtered_codes.append(code)
 
     if config.market_review_enabled and not getattr(args, 'no_market_review', False):
@@ -731,6 +746,12 @@ def run_full_analysis(
     # Portfolio resolution is its own CLI contract boundary. A broker import
     # failure must reach the one-shot caller, while all later work keeps the
     # existing run_full_analysis return-value semantics.
+    close_date = getattr(args, 'close_analysis_date', None)
+    if close_date:
+        # Keep this one-shot close policy local; API/scheduler config is not mutated.
+        config = copy.copy(config)
+        config.enable_realtime_quote = False
+        config.enable_realtime_technical_indicators = False
     portfolio_stock_codes = _resolve_portfolio_stock_codes(args)
     portfolio_is_empty = portfolio_stock_codes == []
     market_review_requested = (
@@ -815,7 +836,12 @@ def run_full_analysis(
             should_run_market_review
             and getattr(config, 'daily_market_context_enabled', True)
         )
-        analysis_reference_time = datetime.now(timezone.utc)
+        close_date = getattr(args, 'close_analysis_date', None)
+        if close_date:
+            from src.services.close_analysis_context import close_reference_time
+            analysis_reference_time = close_reference_time(close_date)
+        else:
+            analysis_reference_time = datetime.now(timezone.utc)
         daily_market_context_target_date = None
         if should_use_daily_market_context:
             daily_market_context_target_date = _resolve_daily_market_context_target_date(
@@ -834,6 +860,7 @@ def run_full_analysis(
             save_context_snapshot=save_context_snapshot,
             daily_market_context_enabled=should_use_daily_market_context,
             daily_market_context_allow_generate=should_use_daily_market_context,
+            close_analysis_date=date.fromisoformat(close_date) if close_date else None,
         )
         if should_use_daily_market_context:
             # Prompt-side context can reuse historical summaries, while full-merge

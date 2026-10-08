@@ -193,6 +193,9 @@ jobs:
       
       - name: 执行股票分析
         env:
+          GH_TOKEN: ${{ github.token }}
+          CLOSE_EVENT_NAME: ${{ github.event_name }}
+          CLOSE_EVENT_SCHEDULE: ${{ github.event.schedule }}
           # ==========================================
           # AI 配置
           # ==========================================
@@ -712,31 +715,37 @@ jobs:
           ANALYSIS_SINCE_UTC="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
           echo "🕐 本轮个股分析起点（UTC）: $ANALYSIS_SINCE_UTC"
 
-          # 北京时间 18:00 后使用当天；18:00 前使用最近一个已经结束的工作日。
-          # 节假日不在这里猜测，由下面的严格覆盖率检查自然拒绝无有效分析的日期。
-          TRADE_DATE="$(
-            python3 - <<'PY'
-          from datetime import datetime, time, timedelta
-          from zoneinfo import ZoneInfo
-
-          now = datetime.now(ZoneInfo("Asia/Shanghai"))
-          trade_date = now.date()
-          if now.time() < time(18, 0):
-              trade_date -= timedelta(days=1)
-          while trade_date.weekday() >= 5:
-              trade_date -= timedelta(days=1)
-          print(trade_date.isoformat())
-          PY
-          )"
-          echo "📅 收盘分析交易日: $TRADE_DATE"
-
-          # 定时任务若延迟到次日凌晨，拒绝把前一交易日分析记到错误日期。
-          if [ "${{ github.event_name }}" = "schedule" ]; then
-            LOCAL_HOUR="$(TZ='Asia/Shanghai' date '+%H')"
-            if [ "$LOCAL_HOUR" -lt 18 ]; then
-              echo "❌ 定时收盘任务已跨越自然日，无法可靠确定 trade_date；本轮 fail closed"
-              exit 1
-            fi
+          # 原始 run 创建时间锚定收盘归属日；跨午夜允许继续，超过次日开盘前
+          # 截止时间或旧 run 的 rerun 仍拒绝。不能用本次重跑时刻重写归属日。
+          gh api --method GET \
+            "/repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+            > data/daily_analysis/run_metadata.json
+          python3 scripts/close_analysis_context.py \
+            --event "$CLOSE_EVENT_NAME" --schedule "$CLOSE_EVENT_SCHEDULE" \
+            --run-metadata data/daily_analysis/run_metadata.json \
+            --budget-minutes "$ANALYSIS_TIMEOUT_MINUTES" \
+            --output data/daily_analysis/close_context.json
+          mapfile -t CLOSE_CONTEXT < <(python3 - <<'PY_CONTEXT'
+          import json
+          from pathlib import Path
+          context = json.loads(Path("data/daily_analysis/close_context.json").read_text())
+          print(context["trade_date"])
+          print(",".join(context["active_primary"]))
+          print(context["cutoff_epoch"])
+          print(",".join(context["closed_primary"]))
+          PY_CONTEXT
+          )
+          if [ "${#CLOSE_CONTEXT[@]}" -ne 4 ] || ! [[ "${CLOSE_CONTEXT[2]}" =~ ^[0-9]+$ ]]; then
+            echo "❌ 收盘归属日上下文读取失败"
+            exit 1
+          fi
+          TRADE_DATE="${CLOSE_CONTEXT[0]}"
+          ACTIVE_PRIMARY_STOCKS="${CLOSE_CONTEXT[1]}"
+          CLOSE_CUTOFF_EPOCH="${CLOSE_CONTEXT[2]}"
+          echo "📅 收盘分析交易日: $TRADE_DATE；休市 PRIMARY: ${CLOSE_CONTEXT[3]}"
+          if [ -z "$ACTIVE_PRIMARY_STOCKS" ]; then
+            echo "ℹ️ 收盘归属日 A/H 均休市，本轮不生成分析或参考位"
+            exit 0
           fi
 
           # 旁路观察层共享一个有限时间预算。预算耗尽时跳过低优先级层，不影响
@@ -751,6 +760,7 @@ jobs:
             local market_label
             local batch
             local remaining
+            local close_remaining
             local layer_status=0
 
             if [ -z "$stocks" ]; then
@@ -768,8 +778,15 @@ jobs:
               fi
               echo "📌 $priority $label / $market_label: $batch"
 
+              close_remaining=$((CLOSE_CUTOFF_EPOCH - $(date +%s)))
+              if [ "$close_remaining" -le 0 ]; then
+                echo "❌ 收盘分析已超过开盘前截止时间"
+                return 1
+              fi
               if [ "$required" = "true" ]; then
-                python main.py --stocks "$batch" --no-market-review --no-notify $FORCE_RUN_ARG \
+                timeout --signal=TERM --kill-after=10s "${close_remaining}s" \
+                  python main.py --stocks "$batch" --no-market-review --no-notify \
+                    --close-analysis-date "$TRADE_DATE" $FORCE_RUN_ARG \
                   || layer_status=1
               else
                 remaining=$((OPTIONAL_ANALYSIS_DEADLINE - $(date +%s)))
@@ -777,8 +794,12 @@ jobs:
                   echo "::warning::$priority $label 因旁路分析时间预算耗尽而跳过；PRIMARY 不受影响"
                   return 0
                 fi
-                timeout --signal=TERM "${remaining}s" \
-                  python main.py --stocks "$batch" --no-market-review --no-notify $FORCE_RUN_ARG \
+                if [ "$remaining" -gt "$close_remaining" ]; then
+                  remaining="$close_remaining"
+                fi
+                timeout --signal=TERM --kill-after=10s "${remaining}s" \
+                  python main.py --stocks "$batch" --no-market-review --no-notify \
+                    --close-analysis-date "$TRADE_DATE" $FORCE_RUN_ARG \
                   || layer_status=1
               fi
 
@@ -796,19 +817,19 @@ jobs:
             return 0
           }
 
-          # P0 必须先完整分析，并用现有只读导出器做14只严格覆盖校验；
+          # P0 必须先完整分析，严格校验归属日开市的全部 PRIMARY 标的；
           # 该文件仅用于覆盖审计，不会传给旧 paper_trade_tracker。
           if ! run_analysis_layer "P0_PRIMARY" "本人主账户" "$PRIMARY_STOCKS" true; then
             exit 1
           fi
           if ! python3 scripts/export_paper_signals.py \
               --db "$DATABASE_PATH" \
-              --stocks "$PRIMARY_STOCKS" \
+              --stocks "$ACTIVE_PRIMARY_STOCKS" \
               --trade-date "$TRADE_DATE" \
               --analysis-since "$ANALYSIS_SINCE_UTC" \
-              --min-coverage 1.0 \
+              --min-coverage 1.0 --require-dated-close \
               --output data/daily_analysis/primary_coverage.json; then
-            echo "❌ PRIMARY 14只未达到100%收盘覆盖率；停止旁路分析"
+            echo "❌ 开市 PRIMARY 未达到100%同日收盘覆盖率；停止旁路分析"
             exit 1
           fi
 
@@ -891,6 +912,8 @@ jobs:
             reports/
             logs/
             data/daily_analysis/primary_coverage.json
+            data/daily_analysis/close_context.json
+            data/daily_analysis/run_metadata.json
             data/stock_analysis.db
           if-no-files-found: warn
           retention-days: 90

@@ -1862,7 +1862,8 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
     def get_latest_data(
         self, 
         code: str, 
-        days: int = 2
+        days: int = 2,
+        end_date: Optional[date] = None,
     ) -> List[StockDaily]:
         """
         获取最近 N 天的数据
@@ -1877,13 +1878,12 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
             StockDaily 对象列表（按日期降序）
         """
         with self.get_session() as session:
+            query = select(StockDaily).where(StockDaily.code == code)
+            if end_date is not None:
+                query = query.where(StockDaily.date <= end_date)
             results = session.execute(
-                select(StockDaily)
-                .where(StockDaily.code == code)
-                .order_by(desc(StockDaily.date))
-                .limit(days)
+                query.order_by(desc(StockDaily.date)).limit(days)
             ).scalars().all()
-            
             return list(results)
 
     def save_news_intel(
@@ -2793,21 +2793,16 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
         
         Args:
             code: 股票代码
-            target_date: 目标日期（默认今天）
+            target_date: 数据截止日期（省略时使用最新数据）
             
         Returns:
             包含今日数据、昨日对比等信息的字典
         """
-        if target_date is None:
-            target_date = date.today()
-        # 注意：尽管入参提供了 target_date，但当前实现实际使用的是“最新两天数据”（get_latest_data），
-        # 并不会按 target_date 精确取当日/前一交易日的上下文。
-        # 因此若未来需要支持“按历史某天复盘/重算”的可解释性，这里需要调整。
-        # 该行为目前保留（按需求不改逻辑）。
-        
-        # 获取最近2天数据
-        recent_data = self.get_latest_data(code, days=2)
-        
+        # Explicit close-date callers must not read later bars from a shared DB.
+        # Undated callers retain the existing latest-data behavior.
+        recent_data = (self.get_latest_data(code, days=2, end_date=target_date)
+                       if target_date is not None else self.get_latest_data(code, days=2))
+
         if not recent_data:
             logger.warning(f"未找到 {code} 的数据")
             return None
@@ -2920,6 +2915,9 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
         生成完整分析结果字典
         """
         data = result.to_dict() if hasattr(result, "to_dict") else {}
+        close_date = getattr(result, 'close_analysis_date', None)
+        if close_date:
+            data['close_analysis_date'] = close_date
         data.update({
             'data_sources': getattr(result, 'data_sources', ''),
             'raw_response': getattr(result, 'raw_response', None),

@@ -198,6 +198,7 @@ class StockAnalysisPipeline:
         portfolio_context: Optional[Dict[str, Any]] = None,
         daily_market_context_enabled: Optional[bool] = None,
         daily_market_context_allow_generate: bool = True,
+        close_analysis_date: Optional[date] = None,
     ):
         """
         初始化调度器
@@ -207,6 +208,7 @@ class StockAnalysisPipeline:
             max_workers: 最大并发线程数（可选，默认从配置读取）
         """
         self.config = config or get_config()
+        self.close_analysis_date = close_analysis_date
         self.max_workers = max_workers or self.config.max_workers
         self.source_message = source_message
         self.query_id = query_id
@@ -360,7 +362,15 @@ class StockAnalysisPipeline:
 
             # 从数据源获取数据
             logger.info(f"{stock_name}({code}) 开始从数据源获取数据...")
-            df, source_name = self.fetcher_manager.get_daily_data(code, days=30)
+            close_date = getattr(self, "close_analysis_date", None)
+            if close_date:
+                df, source_name = self.fetcher_manager.get_daily_data(
+                    code, days=30, end_date=close_date.isoformat()
+                )
+                if df is not None and not df.empty:
+                    df = df[pd.to_datetime(df["date"]).dt.date <= close_date]
+            else:
+                df, source_name = self.fetcher_manager.get_daily_data(code, days=30)
 
             if df is None or df.empty:
                 return False, "获取数据为空"
@@ -409,6 +419,12 @@ class StockAnalysisPipeline:
             if not isinstance(portfolio_context, dict):
                 portfolio_context = None
             market = get_market_for_stock(normalize_stock_code(code))
+            close_date = getattr(self, "close_analysis_date", None)
+            if close_date:
+                close_context = self.db.get_analysis_context(code, target_date=close_date)
+                if not close_context or close_context.get("date") != close_date.isoformat():
+                    logger.error("[%s] missing daily bar for close date %s; refusing analysis", code, close_date)
+                    return None
             market_phase_context = build_market_phase_context(
                 market=market,
                 current_time=current_time,
@@ -803,6 +819,8 @@ class StockAnalysisPipeline:
                 if isinstance(market_structure_context, dict):
                     result.market_structure_context = market_structure_context
                 result.market_phase_summary = market_phase_summary
+                if getattr(self, "close_analysis_date", None):
+                    result.close_analysis_date = self.close_analysis_date.isoformat()
                 result.analysis_context_pack_overview = analysis_context_pack_overview
                 self._refresh_decision_action_for_final_result(
                     result,
@@ -1579,6 +1597,8 @@ class StockAnalysisPipeline:
                 if isinstance(market_structure_context, dict):
                     result.market_structure_context = market_structure_context
                 result.market_phase_summary = market_phase_summary
+                if getattr(self, "close_analysis_date", None):
+                    result.close_analysis_date = self.close_analysis_date.isoformat()
                 result.analysis_context_pack_overview = analysis_context_pack_overview
                 final_action = normalize_decision_action(getattr(result, "action", None))
                 if isinstance(result.dashboard, dict):
@@ -1730,7 +1750,9 @@ class StockAnalysisPipeline:
 
     def _get_analysis_context_with_market_fallback(self, code: str) -> Optional[Dict[str, Any]]:
         """Load analysis context, fetching JP/KR/TW daily bars when DB has no context."""
-        context = self.db.get_analysis_context(code)
+        close_date = getattr(self, "close_analysis_date", None)
+        context = (self.db.get_analysis_context(code, target_date=close_date)
+                   if close_date else self.db.get_analysis_context(code))
         if isinstance(context, dict) and context:
             return context
 
