@@ -241,6 +241,19 @@ PushPlus 发送。公开 artifact 仅允许保存不含绝对资产信息的运�
 收盘分析按 P0 PRIMARY、P1 父亲、P2 其他已持有账户、P3 候选顺序执行；可选层失败
 不会拖累 PRIMARY，重复 symbol 不重复分析。`002759` 在明确成交前始终只是 candidate。
 
+GitHub 定时收盘运行允许在原定18:00至次日09:00前有界迟到。工作流读取同一
+run 的原始 `created_at`（重跑不换日期），以已知18:00 weekday cron 的最近一次
+发生时间固定收盘日期；由于 GitHub 不提供精确的计划触发时间，超过这个窗口、
+缺少带时区的创建时间、未知 cron 和旧 run 重跑均拒绝。该日期通过
+`main.py --close-analysis-date YYYY-MM-DD --no-market-review` 传给每个 A/H 股票批次，
+交易日筛选、日线目标和分析上下文共同使用原日18:00。节假日仍按各市场日历筛选，
+不会猜测前一工作日或强制分析休市市场；PRIMARY 原100%覆盖门保持。所有个股批次
+次日09:00触发终止（30秒内强制回收），实际数据库创建时间与 `--analysis-since` 仍为本轮UTC时间，
+不回填时间戳、不延长参考位有效期。无此CLI参数的其他入口行为保持；该参数不支持
+Web、常驻调度、券商持仓或单独大盘复盘。接受/拒绝日期的证据保存在
+`reports/close_analysis_context.json`。收盘扫描兜底 job 独立安装交易日依赖，避免
+因缺少 pandas 而在导入阶段失败；21:00以后不补触发收盘扫描的原规则保持。
+
 公开代码只保存 symbol、账户层和 held/candidate 状态。第二账户及妹妹账户的真实
 数量与成本如需用于人工风险复核，只能放入 GitHub Repository Secret
 `WATCH_ACCOUNTS_PRIVATE_JSON`；运行时只在生成 Push 文案时读取建议股数，不输出日志、

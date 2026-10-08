@@ -525,9 +525,9 @@ def build_market_phase_context(
     )
 
 
-def get_open_markets_today() -> Set[str]:
+def get_open_markets_today(current_time: Optional[datetime] = None) -> Set[str]:
     """
-    Get markets that are open today (by each market's local timezone).
+    Get markets open on the reference date (default: today in each market timezone).
 
     Returns:
         Set of market keys that are trading today
@@ -535,10 +535,9 @@ def get_open_markets_today() -> Set[str]:
     if not _XCALS_AVAILABLE:
         return set(MARKET_TIMEZONE)
     result: Set[str] = set()
-    for mkt, tz_name in MARKET_TIMEZONE.items():
+    for mkt in MARKET_TIMEZONE:
         try:
-            tz = ZoneInfo(tz_name)
-            today = datetime.now(tz).date()
+            today = get_market_now(mkt, current_time=current_time).date()
             if is_market_open(mkt, today):
                 result.add(mkt)
         except Exception as e:

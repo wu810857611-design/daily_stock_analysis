@@ -369,6 +369,11 @@ def parse_arguments() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        '--close-analysis-date',
+        help='固定 A/H 收盘个股分析日期 YYYY-MM-DD，仅允许该日18:00至次日09:00前'
+    )
+
+    parser.add_argument(
         '--webui',
         action='store_true',
         help='启动 Web 管理界面'
@@ -439,7 +444,14 @@ def parse_arguments() -> argparse.Namespace:
         help='强制回测（即使已有回测结果也重新计算）'
     )
 
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.close_analysis_date and (
+        args.schedule or args.serve or args.serve_only or args.webui or args.webui_only
+        or args.market_review or args.portfolio or args.backtest or args.check_notify
+        or not args.no_market_review
+    ):
+        parser.error('--close-analysis-date requires one-shot A/H stocks with --no-market-review')
+    return args
 
 
 def _compute_trading_day_filter(
@@ -466,7 +478,14 @@ def _compute_trading_day_filter(
         compute_effective_region,
     )
 
-    open_markets = get_open_markets_today()
+    close_date = getattr(args, 'close_analysis_date', None)
+    if close_date:
+        from src.core.close_analysis_context import close_reference_time
+        open_markets = get_open_markets_today(
+            current_time=close_reference_time(close_date, datetime.now(timezone.utc))
+        )
+    else:
+        open_markets = get_open_markets_today()
     filtered_codes = []
     for code in stock_codes:
         mkt = get_market_for_stock(code)
@@ -731,6 +750,12 @@ def run_full_analysis(
     # Portfolio resolution is its own CLI contract boundary. A broker import
     # failure must reach the one-shot caller, while all later work keeps the
     # existing run_full_analysis return-value semantics.
+    close_date = getattr(args, 'close_analysis_date', None)
+    if close_date:
+        from src.core.close_analysis_context import close_reference_time
+        close_reference = close_reference_time(close_date, datetime.now(timezone.utc))
+    else:
+        close_reference = None
     portfolio_stock_codes = _resolve_portfolio_stock_codes(args)
     portfolio_is_empty = portfolio_stock_codes == []
     market_review_requested = (
@@ -761,6 +786,10 @@ def run_full_analysis(
 
         # Issue #373: Trading day filter (per-stock, per-market)
         effective_codes = stock_codes if stock_codes is not None else config.stock_list
+        if close_reference is not None:
+            from src.core.trading_calendar import get_market_for_stock
+            if any(get_market_for_stock(code) not in {'cn', 'hk'} for code in effective_codes):
+                raise ValueError('--close-analysis-date supports only A/H stocks')
         filtered_codes, effective_region, should_skip = _compute_trading_day_filter(
             config, args, effective_codes
         )
@@ -815,7 +844,7 @@ def run_full_analysis(
             should_run_market_review
             and getattr(config, 'daily_market_context_enabled', True)
         )
-        analysis_reference_time = datetime.now(timezone.utc)
+        analysis_reference_time = close_reference or datetime.now(timezone.utc)
         daily_market_context_target_date = None
         if should_use_daily_market_context:
             daily_market_context_target_date = _resolve_daily_market_context_target_date(
@@ -1336,6 +1365,12 @@ def main() -> int:
         config = get_config()
     except Exception as exc:
         logger.exception("加载配置失败: %s", exc)
+        return 1
+
+    if getattr(args, 'close_analysis_date', None) and (
+        config.schedule_enabled or config.webui_enabled
+    ):
+        logger.error('--close-analysis-date cannot be used with a configured scheduler or Web service')
         return 1
 
     # 配置日志（输出到控制台和文件）
