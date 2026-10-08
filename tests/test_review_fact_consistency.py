@@ -19,6 +19,15 @@ def test_percent_is_percentage_points_and_rounding_is_allowed():
     assert '0.27972%' in fact_contract(CANDIDATE)['rendered']
 
 
+def test_dated_research_valuation_is_checked_without_replacing_entry_quote():
+    candidate = {**CANDIDATE, "research_evidence": {"fundamentals": {"data": {
+        "valuation": {"data": {"pe_ratio": 12.5, "pb_ratio": 1.2}, "status": "partial"}
+    }}}}
+    values = numeric_facts(candidate)
+    assert values["price"] == CANDIDATE["price"] and values["pe"] == 12.5
+    assert validate_review_facts({"numeric_facts": values, "facts": ["PE 125倍"]}, candidate)
+
+
 @pytest.mark.parametrize('facts,field', [
     ('日涨27.97%', 'change_pct'), ('快照价43.02人民币', 'price'),
     ('成交额16.49万港元', 'amount'), ('当前价4302港元', 'price'),

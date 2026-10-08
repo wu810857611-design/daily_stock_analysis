@@ -159,7 +159,7 @@ material_fundamental_or_event_risk、hard_risk、other 中选择。只有当唯�
 输出严格 JSON，必须为每个输入代码且仅输出一条 review；`facts`、`inferences`、
 `risks`、`invalidators` 各最多两条，`thesis` 和 `view` 各最多 120 个汉字：
 {"reviews":[{"code":"...","verdict":"pass|watch|reject","confidence":0到1,
-"hard_risk":false,"entry_timing_only":false,"numeric_facts":{"price":输入值,"change_pct":输入百分点值,"amount":输入值,"currency":"CNY或HKD"},
+"hard_risk":false,"entry_timing_only":false,"numeric_facts":该候选numeric_fact_contract.values完整对象（包括已提供的pe/pb，不增加缺失字段）,
 "watch_reason_code":"passed|non_critical_data_gap|trend_or_entry_uncertain|risk_reward_insufficient|material_fundamental_or_event_risk|hard_risk|other",
 "thesis":"一句话审慎观点","risks":["..."],
 "invalidators":["..."],"facts":["..."],"inferences":["..."],"view":"..."}]}。

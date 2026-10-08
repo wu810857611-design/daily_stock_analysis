@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import math
+import numbers
 import re
 from datetime import datetime, timedelta
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -47,18 +48,26 @@ _DIVIDEND_KEYWORD_MAP: Dict[str, List[str]] = {
 
 def _safe_float(value: Any) -> Optional[float]:
     """Best-effort float conversion."""
-    if value is None:
+    if value is None or isinstance(value, bool):
         return None
     if isinstance(value, (int, float)):
         try:
-            return float(value)
+            number = float(value)
+            return number if math.isfinite(number) else None
         except (TypeError, ValueError):
             return None
     s = str(value).strip().replace(",", "").replace("%", "")
+    multiplier = 1.0
+    for unit, factor in (("亿元", 1e8), ("万元", 1e4), ("亿", 1e8), ("万", 1e4), ("元", 1.0)):
+        if s.endswith(unit):
+            multiplier = factor
+            s = s[:-len(unit)]
+            break
     if not s:
         return None
     try:
-        return float(s)
+        number = float(s) * multiplier
+        return number if math.isfinite(number) else None
     except (TypeError, ValueError):
         return None
 
@@ -96,12 +105,32 @@ def _pick_by_keywords(row: pd.Series, keywords: List[str]) -> Optional[Any]:
     """
     Return first non-empty row value whose column name contains any keyword.
     """
-    for col in row.index:
-        col_s = str(col)
-        if any(k in col_s for k in keywords):
-            val = row.get(col)
-            if val is not None and str(val).strip() not in ("", "-", "nan", "None"):
-                return val
+    # Provider tables can repeat indicator names after transposition. row.get
+    # then returns a Series and silently loses every repeated numeric field.
+    # Prefer exact labels (including unit suffixes), never a growth rate when
+    # asking for an absolute income/profit value.
+    def label(value: Any) -> str:
+        return re.sub(r"[（(].*?[）)]", "", str(value)).replace("_", "").strip()
+    for exact in (True, False):
+        for keyword in keywords:
+            for index, col in enumerate(row.index):
+                if keyword in {"营业总收入", "营业收入", "营收", "归母净利润", "净利润",
+                               "经营现金流", "经营活动现金流", "经营活动产生的现金流量净额"} and any(
+                    term in str(col) for term in ("同比", "增长", "比率", "每股", "%")
+                ):
+                    continue
+                if (label(col) == keyword if exact else keyword in str(col)):
+                    values = [row.iloc[i] for i, other in enumerate(row.index) if other == col
+                              and str(row.iloc[i]).strip() not in ("", "-", "nan", "None")]
+                    if not values:
+                        continue
+                    if len({str(value).strip() for value in values}) > 1:
+                        return None  # Conflicting duplicate facts must remain missing.
+                    value = values[0]
+                    unit = re.search(r"[（(](亿元|万元|元)[）)]", str(col))
+                    if unit and isinstance(value, numbers.Real):
+                        return f"{value}{unit.group(1)}"
+                    return value
     return None
 
 
@@ -318,15 +347,20 @@ class AkshareFundamentalAdapter:
 
         # Financial indicators
         def normalized_financial_frame(frame: pd.DataFrame) -> pd.DataFrame:
-            if "指标" not in frame.columns:
-                return frame
-            date_columns = [c for c in frame.columns if isinstance(c, str)
-                            and re.fullmatch(r"\d{4}-?\d{2}-?\d{2}", c)
-                            and _safe_datetime(c) is not None]
-            if not date_columns:
-                return frame
-            normalized = frame.set_index("指标")[date_columns].T.reset_index(names="报告期")
-            return normalized.sort_values("报告期", ascending=False)
+            if "指标" in frame.columns:
+                date_columns = [c for c in frame.columns if isinstance(c, str)
+                                and re.fullmatch(r"\d{4}-?\d{2}-?\d{2}", c)
+                                and _safe_datetime(c) is not None]
+                if date_columns:
+                    frame = frame.set_index("指标")[date_columns].T.reset_index(names="报告期")
+            # Some fallbacks return oldest first; ignore future financial rows.
+            for date_column in ("报告期", "报告日期", "截止日期", "日期"):
+                if date_column in frame.columns:
+                    dates = pd.to_datetime(frame[date_column], errors="coerce")
+                    frame = frame.loc[dates.notna() & (dates <= pd.Timestamp.now())].copy()
+                    frame["报告期"] = dates.loc[frame.index].dt.strftime("%Y-%m-%d")
+                    return frame.sort_values("报告期", ascending=False)
+            return frame
 
         def has_financial_evidence(frame: pd.DataFrame) -> bool:
             if isinstance(frame, pd.Series):
@@ -336,50 +370,64 @@ class AkshareFundamentalAdapter:
             row = _extract_latest_row(normalized_financial_frame(frame), stock_code)
             if row is None:
                 return False
-            for keyword in ("营业收入", "营收", "净利润", "净资产收益", "ROE", "毛利率", "经营现金流"):
-                value = _safe_float(_pick_by_keywords(row, [keyword]))
-                if value is not None and math.isfinite(value):
-                    return True
-            return False
+            return any(_safe_float(_pick_by_keywords(row, [keyword])) is not None
+                       for keyword in ("营业总收入", "营业收入", "归母净利润", "净利润", "净资产收益率", "ROE", "经营现金流"))
 
-        fin_df, fin_source, fin_errors = self._call_df_candidates([
+        start_year = str(datetime.now().year - 1)
+        scoped_sources = [
             ("stock_financial_abstract", {"symbol": stock_code}),
-            ("stock_financial_analysis_indicator", {"symbol": stock_code}),
-            ("stock_financial_analysis_indicator", {}),
-        ], validator=has_financial_evidence if financial_only else None)
-        result["errors"].extend(fin_errors)
-        if fin_df is not None:
-            # stock_financial_abstract uses indicator rows and report-date
-            # columns. Transpose that shape before the shared row extractor.
-            fin_df = normalized_financial_frame(fin_df)
-            row = _extract_latest_row(fin_df, stock_code)
-            if row is not None:
-                revenue_yoy = _safe_float(_pick_by_keywords(row, ["营业收入同比", "营收同比", "收入同比", "同比增长"]))
-                profit_yoy = _safe_float(_pick_by_keywords(row, ["净利润同比", "净利同比", "归母净利润同比"]))
-                roe = _safe_float(_pick_by_keywords(row, ["净资产收益率", "ROE", "净资产收益"]))
-                gross_margin = _safe_float(_pick_by_keywords(row, ["毛利率"]))
-                report_date = _normalize_report_date(_pick_by_keywords(row, _DIVIDEND_KEYWORD_MAP["report_date"]))
-                revenue = _safe_float(_pick_by_keywords(row, ["营业总收入", "营业收入", "营收"]))
-                net_profit_parent = _safe_float(_pick_by_keywords(row, ["归母净利润", "母公司股东净利润", "净利润"]))
-                operating_cash_flow = _safe_float(
-                    _pick_by_keywords(row, ["经营活动产生的现金流量净额", "经营现金流", "经营活动现金流"])
-                )
-                result["growth"] = {
-                    "revenue_yoy": revenue_yoy,
-                    "net_profit_yoy": profit_yoy,
-                    "roe": roe,
-                    "gross_margin": gross_margin,
-                }
-                financial_report_payload = {
-                    "report_date": report_date,
-                    "revenue": revenue,
-                    "net_profit_parent": net_profit_parent,
-                    "operating_cash_flow": operating_cash_flow,
-                    "roe": roe,
-                }
-                if any(v is not None for v in financial_report_payload.values()):
-                    result["earnings"]["financial_report"] = financial_report_payload
-                result["source_chain"].append(f"growth:{fin_source}")
+            ("stock_financial_analysis_indicator", {"symbol": stock_code, "start_year": start_year}),
+            ("stock_financial_abstract_ths", {"symbol": stock_code, "indicator": "按报告期"}),
+        ]
+        source_groups = [[source] for source in scoped_sources] if financial_only else [scoped_sources]
+        for sources in source_groups:
+            fin_df, fin_source, fin_errors = self._call_df_candidates(
+                sources, validator=has_financial_evidence if financial_only else None
+            )
+            result["errors"].extend(fin_errors)
+            if fin_df is None:
+                continue
+            row = _extract_latest_row(normalized_financial_frame(fin_df), stock_code)
+            if row is None:
+                continue
+            report_date = _normalize_report_date(_pick_by_keywords(row, _DIVIDEND_KEYWORD_MAP["report_date"] + ["日期"]))
+            growth = {
+                "revenue_yoy": _safe_float(_pick_by_keywords(row, ["营业总收入同比增长率", "营业收入同比", "营收同比", "收入同比"])),
+                "net_profit_yoy": _safe_float(_pick_by_keywords(row, ["归母净利润同比增长率", "净利润同比", "净利同比", "归母净利润同比"])),
+                "roe": _safe_float(_pick_by_keywords(row, ["净资产收益率", "ROE", "净资产收益"])),
+                "gross_margin": _safe_float(_pick_by_keywords(row, ["毛利率"])),
+            }
+            report = {
+                "report_date": report_date,
+                "revenue": _safe_float(_pick_by_keywords(row, ["营业总收入", "营业收入", "营收"])),
+                "net_profit_parent": _safe_float(_pick_by_keywords(row, ["归母净利润", "归属于母公司所有者的净利润", "母公司股东净利润", "净利润"])),
+                "operating_cash_flow": _safe_float(_pick_by_keywords(row, ["经营活动产生的现金流量净额", "经营现金流", "经营活动现金流"])),
+                "roe": growth["roe"],
+                "currency": "CNY",
+                "units": {"revenue": "CNY", "net_profit_parent": "CNY", "operating_cash_flow": "CNY", "roe": "percentage_points"},
+            }
+            existing = result["earnings"].get("financial_report") or {}
+            if existing and (not report_date or report_date != existing.get("report_date")):
+                result["errors"].append(f"{fin_source}:ReportPeriodMismatch")
+                continue  # Never combine different accounting periods.
+            for field, value in growth.items():
+                if result["growth"].get(field) is None:
+                    result["growth"][field] = value
+                    if value is not None:
+                        result["growth"].setdefault("field_sources", {})[field] = fin_source
+            for field, value in report.items():
+                if existing.get(field) is None:
+                    existing[field] = value
+                    if value is not None:
+                        existing.setdefault("field_sources", {})[field] = fin_source
+            if any(report.get(key) is not None for key in ("revenue", "net_profit_parent", "operating_cash_flow", "roe")):
+                result["earnings"]["financial_report"] = existing
+            result["source_chain"].append(f"growth:{fin_source}")
+            if not financial_only or (report_date and all(existing.get(field) is not None
+                                  for field in ("revenue", "net_profit_parent", "operating_cash_flow", "roe"))
+                                  and result["growth"].get("revenue_yoy") is not None
+                                  and result["growth"].get("net_profit_yoy") is not None):
+                break
 
         if financial_only:
             result["status"] = "partial" if result["growth"] or result["earnings"] else "not_supported"

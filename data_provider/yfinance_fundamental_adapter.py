@@ -29,7 +29,7 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import pandas as pd
 
@@ -143,7 +143,8 @@ class YfinanceFundamentalAdapter:
     market-agnostic.
     """
 
-    def get_fundamental_bundle(self, stock_code: str) -> Dict[str, Any]:
+    def get_fundamental_bundle(self, stock_code: str, *, financial_only: bool = False,
+                               call_runner: Optional[Callable] = None) -> Dict[str, Any]:
         result: Dict[str, Any] = {
             "status": "not_supported",
             "growth": {},
@@ -167,9 +168,18 @@ class YfinanceFundamentalAdapter:
             return result
 
         ticker = yf.Ticker(symbol)
+        def read(callback, endpoint):
+            return call_runner(callback, endpoint) if call_runner else callback()
+        def dated_statement(frame):
+            if not financial_only or frame is None or frame.empty:
+                return frame
+            dates = pd.to_datetime(frame.columns, errors="coerce", utc=True)
+            columns = [col for col, date in zip(frame.columns, dates)
+                       if pd.notna(date) and date <= pd.Timestamp.now(tz="UTC")]
+            return frame.reindex(columns=sorted(columns, reverse=True))
         info: Dict[str, Any] = {}
         try:
-            info = ticker.get_info() if hasattr(ticker, "get_info") else (ticker.info or {})
+            info = read(lambda: ticker.get_info() if hasattr(ticker, "get_info") else (ticker.info or {}), "info")
             if not isinstance(info, dict):
                 info = {}
         except Exception as exc:
@@ -196,14 +206,16 @@ class YfinanceFundamentalAdapter:
 
         # ---------------- financial_report ----------------
         report_date: Optional[str] = None
+        cashflow_date: Optional[str] = None
         revenue_latest: Optional[float] = None
         net_profit_latest: Optional[float] = None
         operating_cash_flow_latest: Optional[float] = None
         revenue_row = None
         net_profit_row = None
+        cashflow_from_statement = False
 
         try:
-            income_df = ticker.quarterly_income_stmt
+            income_df = dated_statement(read(lambda: ticker.quarterly_income_stmt, "quarterly_income_stmt"))
         except Exception as exc:
             result["errors"].append(f"quarterly_income_stmt:{type(exc).__name__}")
             income_df = None
@@ -223,12 +235,17 @@ class YfinanceFundamentalAdapter:
             net_profit_latest = _latest_value(net_profit_row)
 
         try:
-            cashflow_df = ticker.quarterly_cashflow
+            cashflow_df = dated_statement(read(lambda: ticker.quarterly_cashflow, "quarterly_cashflow"))
         except Exception as exc:
             result["errors"].append(f"quarterly_cashflow:{type(exc).__name__}")
             cashflow_df = None
         if cashflow_df is not None and not cashflow_df.empty:
+            cashflow_df = cashflow_df.reindex(columns=sorted(cashflow_df.columns, reverse=True))
             operating_cash_flow_latest = _latest_value(_pick_row(cashflow_df, _CASHFLOW_OP_KEYS))
+            cashflow_from_statement = operating_cash_flow_latest is not None
+            parsed = pd.to_datetime(cashflow_df.columns[0], errors="coerce")
+            if pd.notna(parsed):
+                cashflow_date = parsed.date().isoformat()
 
         # Fallback to TTM aggregates from .info when quarterly statements are
         # unavailable — still produces a non-empty row.
@@ -236,7 +253,9 @@ class YfinanceFundamentalAdapter:
             revenue_latest = _safe_float(info.get("totalRevenue"))
         if operating_cash_flow_latest is None:
             operating_cash_flow_latest = _safe_float(info.get("operatingCashflow"))
-        if net_profit_latest is None and revenue_latest is not None:
+        if net_profit_latest is None and financial_only:
+            net_profit_latest = _safe_float(info.get("netIncomeToCommon"))
+        if net_profit_latest is None and revenue_latest is not None and not financial_only:
             margin = _safe_float(info.get("profitMargins"))
             if margin is not None:
                 net_profit_latest = revenue_latest * margin
@@ -261,10 +280,29 @@ class YfinanceFundamentalAdapter:
             "operating_cash_flow": operating_cash_flow_latest,
             "roe": growth_payload.get("roe"),
             "currency": financial_currency,
+            "period_basis": {
+                "revenue": "quarterly_statement" if revenue_row is not None and _latest_value(revenue_row) is not None else "info_ttm",
+                "net_profit_parent": "quarterly_statement" if net_profit_row is not None and _latest_value(net_profit_row) is not None else "info_ttm" if financial_only else "derived_info_margin",
+                "operating_cash_flow": "quarterly_cashflow" if cashflow_from_statement else "info_ttm",
+                "roe": "info_ratio",
+            },
+            "field_periods": {
+                "revenue": report_date if revenue_row is not None and _latest_value(revenue_row) is not None else "TTM",
+                "net_profit_parent": report_date if net_profit_row is not None and _latest_value(net_profit_row) is not None else "TTM" if financial_only else "derived_margin_estimate",
+                "operating_cash_flow": cashflow_date if cashflow_from_statement else "TTM",
+                "roe": "info_ratio",
+            },
         }
-        if any(v is not None and v != "" for v in financial_report.values()):
+        if any(financial_report.get(key) is not None for key in
+               ("revenue", "net_profit_parent", "operating_cash_flow", "roe")):
             result.setdefault("earnings", {})["financial_report"] = financial_report
             result["source_chain"].append("earnings.financial_report:yfinance")
+
+        if financial_only:
+            result["status"] = "partial" if result["growth"] or any(
+                value is not None for value in (revenue_latest, net_profit_latest, operating_cash_flow_latest)
+            ) else "not_supported"
+            return result
 
         # ---------------- dividend block ----------------
         events: List[Dict[str, Any]] = []

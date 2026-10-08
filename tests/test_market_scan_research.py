@@ -57,6 +57,11 @@ def configured(monkeypatch):
     ))
     monkeypatch.setattr(ak, "stock_financial_abstract", financial)
     monkeypatch.setattr(ak, "stock_financial_analysis_indicator", financial)
+    monkeypatch.setattr(ak, "stock_financial_abstract_ths", lambda **kwargs: pd.DataFrame())
+    for name in ("stock_value_em", "stock_zh_valuation_baidu", "stock_hk_valuation_baidu", "stock_news_em"):
+        monkeypatch.setattr(ak, name, lambda **kwargs: pd.DataFrame())
+    monkeypatch.setattr("src.services.market_scan_research.announcement_excerpt",
+                        lambda *args: {"body_excerpt_available": False})
     monkeypatch.setattr(ak, "stock_zh_a_disclosure_report_cninfo", announcements)
     return ak, service
 
@@ -157,6 +162,108 @@ def test_official_index_is_preserved_without_claiming_document_review(configured
     assert result["status"] == "partial"
 
 
+def test_dated_valuation_fallback_and_field_provenance(configured, monkeypatch):
+    ak, _ = configured
+    monkeypatch.setattr(ak, "stock_value_em", lambda **kwargs: pd.DataFrame([
+        {"数据日期": (datetime.now() - timedelta(days=1)).date(), "PE(TTM)": 12.5, "市净率": 1.2},
+        {"数据日期": (datetime.now() - timedelta(days=2)).date(), "PE(TTM)": 99, "市净率": 99},
+    ]))
+    result = ScanResearchCollector(2)({"code": "603259", "name": "药明康德"})
+    block = result["fundamentals"]["data"]["valuation"]
+    assert block["data"] == {"pe_ratio": 12.5, "pb_ratio": 1.2}
+    assert block["field_provenance"]["pe_ratio"]["as_of"]
+    assert "pe_ratio" not in result["missing_fields"]
+    assert result["status"] == "partial"  # Ratios do not imply complete research.
+
+
+def test_fresh_cache_age_cannot_revive_stale_valuation_data(configured, monkeypatch):
+    ak, _ = configured
+    monkeypatch.setattr(ak, "stock_value_em", lambda **kwargs: pd.DataFrame([
+        {"数据日期": datetime.now().date(), "PE(TTM)": 12.5, "市净率": 1.2}
+    ]))
+    collector = ScanResearchCollector(2)
+    candidate = {"code": "603259", "name": "药明康德"}
+    collector(candidate)
+    for key, (saved, fetched, value) in list(collector._cache.items()):
+        if "stock_value_em" in key:
+            collector._cache[key] = (saved, fetched, {"as_of": "2020-01-01", "data": {"pe_ratio": 999}})
+    result = collector(candidate)
+    assert result["fundamentals"]["data"]["valuation"]["data"]["pe_ratio"] == 12.5
+    assert not any(e["result"] == "cache_hit" and "stock_value_em" in e["provider"] for e in result["diagnostics"])
+
+
+def test_hk_info_timeout_does_not_discard_available_financial_statements(configured, monkeypatch):
+    ticker = SimpleNamespace(get_info=hanging,
+        quarterly_income_stmt=pd.DataFrame({pd.Timestamp("2026-06-30"): {"Total Revenue": 100, "Net Income": 20}}),
+        quarterly_cashflow=pd.DataFrame({pd.Timestamp("2026-03-31"): {"Operating Cash Flow": 30}}))
+    monkeypatch.setattr("yfinance.Ticker", lambda code: ticker)
+    result = ScanResearchCollector(2)({"code": "HK00700", "name": "腾讯控股"})
+    report = result["fundamentals"]["data"]["earnings"]["data"]["financial_report"]
+    assert report["revenue"] == 100
+    assert report["field_periods"]["revenue"] == "2026-06-30"
+    assert report["field_periods"]["operating_cash_flow"] == "2026-03-31"
+    assert any(e["provider"] == "yfinance:info:HK00700" and e["error_class"] == "TimeoutError"
+               for e in result["diagnostics"])
+    assert not multiprocessing.active_children()
+
+
+def test_hk_scanner_does_not_invent_profit_from_quarterly_revenue_and_ttm_margin(monkeypatch):
+    from data_provider.yfinance_fundamental_adapter import YfinanceFundamentalAdapter
+    ticker = SimpleNamespace(get_info=lambda: {"profitMargins": .3, "currency": "HKD"},
+        quarterly_income_stmt=pd.DataFrame({pd.Timestamp("2026-06-30"): {"Total Revenue": 100}}),
+        quarterly_cashflow=pd.DataFrame())
+    monkeypatch.setattr("yfinance.Ticker", lambda code: ticker)
+    report = YfinanceFundamentalAdapter().get_fundamental_bundle("HK00700", financial_only=True)["earnings"]["financial_report"]
+    assert report["net_profit_parent"] is None
+
+
+def test_stale_valuation_advances_to_baidu_and_rejects_future_records(configured, monkeypatch):
+    ak, _ = configured
+    monkeypatch.setattr(ak, "stock_value_em", lambda **kwargs: pd.DataFrame([
+        {"数据日期": (datetime.now() - timedelta(days=10)).date(), "PE(TTM)": 50, "市净率": 8},
+        {"数据日期": (datetime.now() + timedelta(days=1)).date(), "PE(TTM)": 60, "市净率": 9},
+    ]))
+    monkeypatch.setattr(ak, "stock_zh_valuation_baidu", lambda **kwargs: pd.DataFrame([
+        {"date": datetime.now().date(), "value": 12 if kwargs["indicator"] == "市盈率(TTM)" else 2}
+    ]))
+    collector = ScanResearchCollector(2)
+    result = collector({"code": "603259", "name": "药明康德"})
+    assert result["fundamentals"]["data"]["valuation"]["data"] == {"pe_ratio": 12, "pb_ratio": 2}
+    assert any("stock_value_em:InvalidPayload" in error for error in result["errors"])
+    assert not any("stock_value_em" in key for key in collector._cache)
+
+
+def test_news_fallback_uses_identity_date_and_existing_admission_filters(configured, monkeypatch):
+    ak, service = configured
+    service._providers = [Provider("Failed", news_error)]
+    def news(**kwargs):
+        assert kwargs == {"symbol": "603259"}
+        return pd.DataFrame([
+            {"新闻标题": "药明康德发布研发业务更新", "新闻内容": "药明康德603259发布研发业务更新",
+             "新闻链接": "https://finance.eastmoney.com/a/fixture.html", "文章来源": "东方财富",
+             "发布时间": datetime.now().isoformat()},
+            {"新闻标题": "其他公司发布业务更新", "新闻内容": "与药明康德无关",
+             "新闻链接": "https://finance.eastmoney.com/a/old.html", "发布时间": "2020-01-01"},
+        ])
+    monkeypatch.setattr(ak, "stock_news_em", news)
+    result = ScanResearchCollector(2)(CANDIDATE)
+    assert result["announcements_and_news"]["status"] == "partial"
+    assert len(result["announcements_and_news"]["items"]) == 1
+    assert result["announcements_and_news"]["provider"] == "Eastmoney"
+    assert "news:provider_error" in result["errors"]  # Do not hide the primary fault.
+
+
+def test_official_body_excerpt_does_not_claim_full_review(configured, monkeypatch):
+    monkeypatch.setattr("src.services.market_scan_research.announcement_excerpt", lambda *args: {
+        "excerpt": "药明康德公告内容摘录", "body_excerpt_available": True, "content_reviewed": False,
+    })
+    result = ScanResearchCollector(2)(CANDIDATE)
+    assert result["announcements"]["body_excerpt_count"] == 1
+    assert result["announcements"]["content_reviewed"] is False
+    assert result["announcements"]["items"][0]["fetched_at"]
+    assert "announcement_body" not in result["missing_fields"]
+
+
 def test_successful_cache_retains_fetch_time_and_expires(configured):
     collector = ScanResearchCollector(2)
     collector(CANDIDATE)
@@ -204,6 +311,7 @@ def test_retry_is_bounded_and_diagnostic(configured):
 
 def test_metadata_and_null_fields_do_not_count_as_research():
     assert not meaningful({"valuation": {"status": "partial", "data": {"pe": None, "pb": None}}})
+    assert not meaningful({"currency": "CNY", "field_sources": {"roe": "fixture"}, "units": {"roe": "%"}})
     assert meaningful({"data": {"roe": 0}})
 
 
@@ -244,6 +352,6 @@ def test_hk_announcement_query_is_company_scoped_and_exact_code_checked(configur
         return frame
     monkeypatch.setattr(ak, "stock_zh_a_disclosure_report_cninfo", hk)
     monkeypatch.setattr("data_provider.yfinance_fundamental_adapter.YfinanceFundamentalAdapter.get_fundamental_bundle",
-                        lambda self, code: {"growth": {"roe": 18.2}})
+                        lambda self, code, **kwargs: {"growth": {"roe": 18.2}})
     result = ScanResearchCollector(2)({"code": "HK00700", "name": "腾讯控股"})
     assert result["announcements"]["items"][0]["url"].startswith("https://www.hkexnews.hk/")

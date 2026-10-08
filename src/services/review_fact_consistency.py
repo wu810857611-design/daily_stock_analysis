@@ -15,6 +15,13 @@ def numeric_facts(candidate: Mapping[str, Any]) -> dict:
     result = {}
     for field in ("price", "change_pct", "amount", "pe", "pb"):
         raw = candidate.get(field)
+        if field in {"pe", "pb"} and not (isinstance(raw, (int, float)) and not isinstance(raw, bool) and math.isfinite(raw)):
+            def mapping(value):
+                return value if isinstance(value, Mapping) else {}
+            research = mapping(candidate.get("research_evidence"))
+            data = mapping(mapping(research.get("fundamentals")).get("data"))
+            valuation = mapping(mapping(data.get("valuation")).get("data"))
+            raw = valuation.get("pe_ratio" if field == "pe" else "pb_ratio")
         if isinstance(raw, (int, float)) and not isinstance(raw, bool) and math.isfinite(raw):
             result[field] = raw
     if result:
@@ -51,6 +58,8 @@ _CLAIMS = {
     "change_pct": r"(?:日(?:内)?(?:涨跌幅|涨幅|跌幅|涨跌)|日涨|日跌|当日涨幅|当日跌幅)\s*(?:约|为|达|达到|了|：|:|=)?\s*([+-]?\d+(?:\.\d+)?)\s*[%％]",
     "price": r"(?:快照价|最新价|现价|当前价)\s*(?:约|为|：|:|=)?\s*([+-]?\d+(?:\.\d+)?)\s*(港元|港币|人民币|元|HKD|CNY)?",
     "amount": r"成交额\s*(?:约|为|：|:|=)?\s*([+-]?\d+(?:\.\d+)?)\s*(亿|万)?\s*(港元|港币|人民币|元|HKD|CNY)?",
+    "pe": r"(?:(?<![A-Za-z])PE(?![A-Za-z])(?:\(TTM\))?|市盈率(?:\(TTM\))?)\s*(?:约|为|：|:|=)?\s*([+-]?\d+(?:\.\d+)?)",
+    "pb": r"(?:(?<![A-Za-z])PB(?![A-Za-z])|市净率)\s*(?:约|为|：|:|=)?\s*([+-]?\d+(?:\.\d+)?)",
 }
 
 

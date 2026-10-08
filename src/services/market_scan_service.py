@@ -1176,6 +1176,9 @@ def _build_v4_evidence_contract(
     research = dict(research_evidence or {})
     fundamentals = research.get("fundamentals")
     fundamentals = dict(fundamentals) if isinstance(fundamentals, Mapping) else {}
+    valuation_research = (((fundamentals.get("data") or {}).get("valuation") or {}).get("data") or {})
+    valuation_available = valuation_available or any(_finite_float(valuation_research.get(field)) is not None
+                                                     for field in ("pe_ratio", "pb_ratio"))
     announcements_and_news = research.get("announcements_and_news")
     announcements_and_news = (
         dict(announcements_and_news)
@@ -2219,6 +2222,8 @@ class MarketScanService:
         research_available_count = 0
         research_status_counts = {"complete": 0, "partial": 0, "unavailable": 0}
         research_block_counts = {"fundamentals": 0, "news": 0, "announcements": 0}
+        research_field_counts = {key: 0 for key in ("pe_ratio", "pb_ratio", "dated_financial_report", "revenue",
+                                                   "net_profit_parent", "operating_cash_flow", "roe", "announcement_body_excerpt")}
         research_errors: Dict[str, List[str]] = {}
         review_payload = []
         self._begin_stage(
@@ -2312,6 +2317,20 @@ class MarketScanService:
                 research_status_counts[evidence_status] += 1
                 for key, has_block in block_available.items():
                     research_block_counts[key] += int(has_block)
+                def as_mapping(value):
+                    return value if isinstance(value, Mapping) else {}
+                fundamental_data = as_mapping(blocks["fundamentals"])
+                valuation_data = as_mapping(as_mapping(fundamental_data.get("valuation")).get("data"))
+                financial_report = as_mapping(as_mapping(as_mapping(fundamental_data.get("earnings")).get("data")).get("financial_report"))
+                for field in ("pe_ratio", "pb_ratio"):
+                    research_field_counts[field] += int(_finite_float(valuation_data.get(field)) is not None)
+                for field in ("revenue", "net_profit_parent", "operating_cash_flow", "roe"):
+                    research_field_counts[field] += int(_finite_float(financial_report.get(field)) is not None)
+                research_field_counts["dated_financial_report"] += int(bool(financial_report.get("report_date")))
+                research_field_counts["announcement_body_excerpt"] += int(any(
+                    isinstance(item, Mapping) and item.get("body_excerpt_available") is True
+                    for item in (blocks["announcements"] or [])
+                ))
                 errors = research_evidence.get("errors")
                 if isinstance(errors, list) and errors:
                     research_errors[code] = [str(item) for item in errors[:3]]
@@ -2756,6 +2775,7 @@ class MarketScanService:
             "research_partial_count": research_status_counts["partial"],
             "research_unavailable_count": research_status_counts["unavailable"],
             "research_block_coverage": research_block_counts,
+            "research_field_coverage": research_field_counts,
             "actionable_count": actionable_count,
             "history_rejection_reasons": history_rejection_counts,
             "candidate_rejection_reasons": candidate_rejection_reasons,
@@ -3291,6 +3311,7 @@ def render_market_scan_markdown(result: Mapping[str, Any]) -> str:
                 f"{funnel.get('research_complete_count', 0)} / {funnel.get('research_partial_count', 0)} / "
                 f"{funnel.get('research_unavailable_count', 0)}",
                 f"- 研究有效覆盖（基本面/新闻/官方公告索引）：{json.dumps(funnel.get('research_block_coverage') or {}, ensure_ascii=False)}",
+                f"- 研究字段覆盖（正文摘录不等于全文审查）：{json.dumps(funnel.get('research_field_coverage') or {}, ensure_ascii=False)}",
                 f"- 双模型完成/同时通过：{funnel.get('dual_model_reviewed_count', 0)} / "
                 f"{funnel.get('dual_model_pass_count', 0)}",
                 f"- 可进入盘中买入区复核：{funnel.get('actionable_count', 0)}",
@@ -3324,6 +3345,7 @@ def render_market_scan_markdown(result: Mapping[str, Any]) -> str:
                 f"- 支撑/压力：{candidate.get('support', '-')} / {candidate.get('resistance', '-')}",
                 f"- 模型分歧：{'是' if candidate.get('model_disagreement') else '否'}",
                 f"- 最终原因：{candidate.get('action_reason') or '-'}",
+                f"- 研究字段缺口：{json.dumps((candidate.get('research_evidence') or {}).get('missing_fields') or [], ensure_ascii=False)}",
                 "",
                 "### 已核验事实",
                 "",

@@ -15,6 +15,7 @@ from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
 from src.services.research_execution import ResearchCallError, run_isolated
+from src.services.research_evidence import announcement_excerpt, recent_valuation
 
 
 def meaningful(value: Any) -> bool:
@@ -23,6 +24,7 @@ def meaningful(value: Any) -> bool:
         return any(meaningful(v) for k, v in value.items() if k not in {
             "status", "source", "provider", "fetched_at", "as_of", "report_date",
             "published_at", "error", "errors", "coverage", "market", "source_chain", "cache_age_seconds",
+            "currency", "field_sources", "field_periods", "period_basis", "units", "provenance", "field_provenance", "missing_fields",
         })
     if isinstance(value, (list, tuple)):
         return any(meaningful(v) for v in value)
@@ -112,7 +114,9 @@ class ScanResearchCollector:
         def cached_call(budget: ResearchBudget, callback: Callable[[], Any], key: str,
                         cache_validator: Callable[[Any], bool] | None = None) -> Any:
             cached = self._cache.get(key)
-            if cached and ttl > 0 and 0 <= time.monotonic() - cached[0] < ttl:
+            if cached and ttl > 0 and 0 <= time.monotonic() - cached[0] < ttl and (
+                cache_validator is None or cache_validator(cached[2])
+            ):
                 events.append({"stage": budget.stage, "symbol": code, "provider": key,
                                "result": "cache_hit", "fetched_at": cached[1],
                                "cache_age_seconds": round(time.monotonic() - cached[0], 3)})
@@ -145,8 +149,10 @@ class ScanResearchCollector:
                 raise ResearchCallError("NotConfigured", "fundamental pipeline disabled")
             if code.startswith("HK"):
                 from data_provider.yfinance_fundamental_adapter import YfinanceFundamentalAdapter
-                bundle = cached_call(budget, lambda: YfinanceFundamentalAdapter().get_fundamental_bundle(code),
-                                     f"yfinance:financial_bundle:{code}")
+                bundle = YfinanceFundamentalAdapter().get_fundamental_bundle(
+                    code, financial_only=True, call_runner=lambda callback, endpoint:
+                    cached_call(budget, callback, f"yfinance:{endpoint}:{code}")
+                )
             else:
                 from data_provider.fundamental_adapter import AkshareFundamentalAdapter
                 def adapter_call(fn: Callable[..., Any], kwargs: dict, validator=None) -> Any:
@@ -167,6 +173,48 @@ class ScanResearchCollector:
             errors.append(f"fundamentals:{getattr(exc, 'error_class', type(exc).__name__)}")
         for block in ("growth", "earnings", "institution"):
             fundamental.setdefault(block, {"status": "unavailable", "data": {}})
+        # Per-symbol public valuation sources cover missing snapshot ratios.
+        # They retain the provider's trading date and never become entry quotes.
+        valuation_block = fundamental["valuation"]
+        valuation_block["field_provenance"] = {
+            field: {"source": valuation_block["source"], "fetched_at": valuation_block["fetched_at"],
+                    "basis": "scan_snapshot"} for field in valuation
+        }
+        if config.enable_fundamental_pipeline and any(field not in valuation for field in ("pe_ratio", "pb_ratio")):
+            budget = stage("fundamental_valuation")
+            def valuation_call(fn_name: str, kwargs: dict, fields: dict) -> None:
+                import akshare as ak
+                key = f"akshare:{fn_name}:{json.dumps(kwargs, sort_keys=True)}"
+                def fetch():
+                    return recent_valuation(getattr(ak, fn_name)(**kwargs), now, config.news_max_age_days, fields)
+                def valid(item):
+                    try:
+                        date = datetime.fromisoformat(item["as_of"]).date()
+                        return bool(item.get("data")) and (now - timedelta(days=config.news_max_age_days)).date() <= date <= now.date()
+                    except (KeyError, TypeError, ValueError):
+                        return False
+                try:
+                    parsed = cached_call(budget, fetch, key, cache_validator=valid)
+                    provenance = next((e for e in reversed(events) if e.get("provider") == key), {})
+                    for field, value in parsed["data"].items():
+                        if field not in valuation:
+                            valuation[field] = value
+                            valuation_block["field_provenance"][field] = {
+                                "source": key, "as_of": parsed["as_of"], "basis": "dated_research_valuation",
+                                "fetched_at": provenance.get("fetched_at", ""),
+                                "cache_age_seconds": provenance.get("cache_age_seconds", 0),
+                            }
+                except Exception as exc:
+                    errors.append(f"valuation:{fn_name}:{getattr(exc, 'error_class', type(exc).__name__)}")
+            if not code.startswith("HK"):
+                valuation_call("stock_value_em", {"symbol": code}, {"pe_ratio": "PE(TTM)", "pb_ratio": "市净率"})
+            for field, indicator in (("pe_ratio", "市盈率(TTM)"), ("pb_ratio", "市净率")):
+                if field not in valuation:
+                    valuation_call("stock_hk_valuation_baidu" if code.startswith("HK") else "stock_zh_valuation_baidu",
+                                   {"symbol": code[2:] if code.startswith("HK") else code,
+                                    "indicator": indicator, "period": "近一年"}, {field: "value"})
+        valuation_block.update(data=valuation, status="partial" if valuation else "unavailable",
+                               units={"pe_ratio": "multiple", "pb_ratio": "multiple"})
         fundamental["coverage"] = {key: value["status"] for key, value in fundamental.items()
                                     if isinstance(value, Mapping) and "status" in value}
         fundamentals = {"status": "partial" if any(meaningful(v.get("data")) for v in fundamental.values()
@@ -216,6 +264,19 @@ class ScanResearchCollector:
                 items.append({"title": str(row["公告标题"]), "url": url,
                               "published_date": published.isoformat(), "source": "cninfo"})
             announcements.update(status="partial" if items else "no_results", items=items[:3])
+            # At most one document per candidate; preserve an index if its
+            # body is inaccessible, and never claim an excerpt is full review.
+            for item in announcements["items"][:1]:
+                try:
+                    document = cached_call(budget, lambda: announcement_excerpt(item["url"], code,
+                                             str(candidate.get("name") or "")), f"official_document:{item['url']}:{code}")
+                    item.update(document)
+                    item["fetched_at"] = next((e.get("fetched_at", "") for e in reversed(events)
+                                                if e.get("provider") == f"official_document:{item['url']}:{code}"), "")
+                except Exception as exc:
+                    item["body_status"] = getattr(exc, "error_class", type(exc).__name__)
+                    errors.append(f"announcement_body:{item['body_status']}")
+            announcements["body_excerpt_count"] = sum(bool(item.get("body_excerpt_available")) for item in announcements["items"])
             if not items:
                 self._cache.pop(announcement_key, None)
             if invalid_rows and not items:
@@ -232,9 +293,12 @@ class ScanResearchCollector:
             service = _get_dsa_search_service()
             if not service.is_available:
                 raise ResearchCallError("NotConfigured", "no available news provider")
+            search_budget = ResearchBudget(min(stage_limit / 2, max(0, budget.deadline - time.monotonic()) / 2),
+                                           code, "news", events, config.fundamental_retry_max,
+                                           config.fundamental_fetch_timeout_seconds)
             response = service.search_stock_news(
                 code, str(candidate.get("name") or code), max_results=3,
-                request_runner=lambda callback, provider: budget.call(callback, provider),
+                request_runner=lambda callback, provider: search_budget.call(callback, provider),
             )
             items = [{"title": item.title, "snippet": item.snippet[:500], "url": item.url,
                       "source": item.source, "published_date": item.published_date}
@@ -247,11 +311,52 @@ class ScanResearchCollector:
         except Exception as exc:
             errors.append(f"news:{getattr(exc, 'error_class', type(exc).__name__)}")
 
+        if not news["items"] and not code.startswith("HK"):
+            try:
+                import akshare as ak
+                from src.search_service import SearchResponse, SearchResult, SearchService
+                frame = cached_call(budget, lambda: ak.stock_news_em(symbol=code), f"eastmoney:news:{code}")
+                response = SearchResponse(code, [SearchResult(
+                    title=str(row.get("新闻标题") or ""), snippet=str(row.get("新闻内容") or ""),
+                    url=str(row.get("新闻链接") or ""), source=str(row.get("文章来源") or "Eastmoney"),
+                    published_date=str(row.get("发布时间") or ""),
+                ) for row in frame.to_dict("records") if urlparse(str(row.get("新闻链接") or "")).scheme in {"http", "https"}], "Eastmoney", success=True)
+                filters = SearchService(searxng_public_instances_enabled=False)
+                response = filters._filter_news_response(response, search_days=config.news_max_age_days,
+                                                          max_results=10, log_scope=f"{code}:fallback")
+                response = filters._rank_news_response(response, stock_code=code,
+                          stock_name=str(candidate.get("name") or code), prefer_chinese=True,
+                          max_results=10, log_scope=f"{code}:fallback")
+                response = filters._filter_ranked_news_for_context(response, log_scope=f"{code}:fallback")
+                # Company-specific evidence only; sector matches are not
+                # counted as a company's research coverage.
+                admitted = [item for item in response.results if item.relevance_category == filters._DIRECT_NEWS_CATEGORY
+                            and item.published_date <= now.date().isoformat()][:3]
+                if admitted:
+                    news.update(status="partial", provider="Eastmoney", items=[{
+                        "title": item.title, "snippet": item.snippet[:500], "url": item.url,
+                        "source": item.source, "published_date": item.published_date,
+                    } for item in admitted])
+                news["fallback_status"] = "partial" if admitted else "no_results"
+            except Exception as exc:
+                news["fallback_status"] = "provider_error"
+                errors.append(f"news_fallback:{getattr(exc, 'error_class', type(exc).__name__)}")
+
+        report = fundamental["earnings"]["data"].get("financial_report") or {}
+        missing = [f"valuation.{field}" for field in ("pe_ratio", "pb_ratio") if field not in valuation]
+        missing += [f"financial_report.{field}" for field in ("report_date", "revenue", "net_profit_parent", "operating_cash_flow", "roe")
+                if report.get(field) is None]
+        missing += [f"growth.{field}" for field in ("revenue_yoy", "net_profit_yoy")
+                    if fundamental["growth"]["data"].get(field) is None]
+        if not news["items"]:
+            missing.append("news")
+        if not any(item.get("body_excerpt_available") for item in announcements["items"]):
+            missing.append("announcement_body")
+
         has_data = meaningful(fundamentals.get("data")) or bool(news["items"] or announcements["items"])
         return {"attempted": True, "status": "partial" if has_data else "unavailable",
                 "fetched_at": datetime.now(timezone.utc).isoformat(), "fundamentals": fundamentals,
                 "announcements_and_news": news, "announcements": announcements,
                 "diagnostics": events, "errors": errors,
-                "missing_fields": [block for block in ("valuation", "growth", "earnings")
-                                   if not meaningful(fundamental[block].get("data"))],
+                "missing_fields": missing,
                 "simulation_only": True, "auto_order_enabled": False}

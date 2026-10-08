@@ -185,6 +185,25 @@ def _service(
     )
 
 
+def test_research_field_counts_do_not_claim_complete_evidence(tmp_path):
+    def research(candidate):
+        return {"attempted": True, "status": "partial", "missing_fields": ["news", "announcement_body"],
+                "fundamentals": {"status": "partial", "data": {
+                    "valuation": {"status": "partial", "data": {"pe_ratio": 12.5}},
+                    "earnings": {"status": "partial", "data": {"financial_report": {
+                        "report_date": "2026-06-30", "operating_cash_flow": 100,
+                    }}},
+                }}, "announcements": {"items": [{"title": "官方索引", "content_reviewed": False}]}}
+    result = _service(tmp_path, qwen=ReviewRecorder(), deepseek=ReviewRecorder(), research_loader=research).run()
+    funnel = result["diagnostics"]["buy_funnel"]
+    fields = funnel["research_field_coverage"]
+    assert fields["pe_ratio"] == funnel["research_attempted_count"]
+    assert fields["operating_cash_flow"] > 0 and fields["revenue"] == 0
+    assert fields["announcement_body_excerpt"] == 0 and funnel["research_complete_count"] == 0
+    markdown = render_market_scan_markdown(result)
+    assert "正文摘录不等于全文审查" in markdown and "研究字段缺口" in markdown
+
+
 def test_l1_is_vectorised_and_makes_zero_history_or_llm_calls(tmp_path: Path) -> None:
     qwen = ReviewRecorder()
     deepseek = ReviewRecorder()
