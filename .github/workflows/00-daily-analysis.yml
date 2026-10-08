@@ -970,7 +970,31 @@ jobs:
       - name: 兜底检查19:15全市场扫描
         env:
           GH_TOKEN: ${{ github.token }}
+          CLOSE_SCHEDULE: ${{ github.event.schedule }}
         run: |
+          set -euo pipefail
+          gh api "/repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+            --jq '{event, created_at}' > close-watchdog-run.json
+          python -m src.core.close_analysis_context \
+            --run-metadata close-watchdog-run.json \
+            --schedule "$CLOSE_SCHEDULE" \
+            --report close-scan-watchdog.json
+          # 跨日迟到不能把昨天19:27的兜底改成等待今天19:27。
+          if ! python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          path = Path('close-scan-watchdog.json')
+          result = json.loads(path.read_text())
+          if not result['close_scan_should_run']:
+              result.update(status='skipped_late', slot='close', reason='original_close_scan_window_ended')
+              path.write_text(json.dumps(result, indent=2) + '\n')
+              raise SystemExit(1)
+          PY
+          then
+            echo "ℹ️ 原收盘扫描窗口已结束；只保存迟到审计，不等待或触发下一日扫描"
+            exit 0
+          fi
           python3 scripts/market_scan_watchdog.py \
             --slot close \
             --repo "$GITHUB_REPOSITORY" \

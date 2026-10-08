@@ -253,6 +253,8 @@ run 的原始 `created_at`（重跑不换日期），以已知18:00 weekday cron
 Web、常驻调度、券商持仓或单独大盘复盘。接受/拒绝日期的证据保存在
 `reports/close_analysis_context.json`。收盘扫描兜底 job 独立安装交易日依赖，避免
 因缺少 pandas 而在导入阶段失败；21:00以后不补触发收盘扫描的原规则保持。
+兜底也核验原run的收盘日期，原日21:00后只保存 `skipped_late` 审计并正常退出，
+跨日运行不会改为等待下一日19:27或替下一日触发扫描。
 
 公开代码只保存 symbol、账户层和 held/candidate 状态。第二账户及妹妹账户的真实
 数量与成本如需用于人工风险复核，只能放入 GitHub Repository Secret

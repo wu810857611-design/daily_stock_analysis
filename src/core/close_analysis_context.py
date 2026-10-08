@@ -52,6 +52,7 @@ def scheduled_close_context(run: Mapping[str, Any], *, schedule: str,
         "observed_at": now.astimezone(SHANGHAI).isoformat(),
         "deadline": datetime.combine(day + timedelta(days=1), time(9), tzinfo=SHANGHAI).isoformat(),
         "date_source": "bounded_latest_cron_occurrence_from_run_created_at",
+        "close_scan_should_run": now <= datetime.combine(day, time(21), tzinfo=SHANGHAI),
     }
 
 

@@ -1,4 +1,5 @@
 from datetime import datetime, timezone
+import json
 from pathlib import Path
 import subprocess
 from types import SimpleNamespace
@@ -32,6 +33,7 @@ def test_delayed_close_is_pinned_to_cron_day(created, observed, expected):
     assert result['trade_date'] == expected
     assert result['analysis_reference_time'] == expected + 'T18:00:00+08:00'
     assert result['observed_at'].startswith(observed)
+    assert result['close_scan_should_run'] == (observed[:10] == expected and observed[11:16] <= '21:00')
 
 
 @pytest.mark.parametrize('created,observed', [
@@ -154,6 +156,9 @@ def test_workflow_wires_both_batches_and_installs_watchdog_dependencies():
     dependency_index = next(i for i, s in enumerate(watchdog) if 'exchange-calendars' in s.get('run', ''))
     run_index = next(i for i, s in enumerate(watchdog) if 'market_scan_watchdog.py' in s.get('run', ''))
     assert dependency_index < run_index
+    scan_script = watchdog[run_index]['run']
+    assert scan_script.index('close_scan_should_run') < scan_script.index('scripts/market_scan_watchdog.py')
+    assert 'original_close_scan_window_ended' in scan_script
 
 
 @pytest.mark.parametrize('expired', [False, True])
@@ -189,3 +194,18 @@ run_analysis_layer P1 FAMILY 300408 false
         assert len(calls.read_text().splitlines()) == 4  # mandatory + optional A/H batches
         assert all('--close-analysis-date 2026-10-08' in line for line in calls.read_text().splitlines())
         assert len((tmp_path / 'timeouts.txt').read_text().splitlines()) == 4
+
+
+def test_overnight_watchdog_exits_before_wait_or_dispatch(tmp_path):
+    workflow = yaml.safe_load(Path('.github/workflows/00-daily-analysis.yml').read_text())
+    script = next(s['run'] for s in workflow['jobs']['close-scan-watchdog']['steps']
+                  if s['name'] == '兜底检查19:15全市场扫描')
+    guard = script[script.index("if ! python3 - <<'PY'"):script.index('python3 scripts/market_scan_watchdog.py')]
+    context = scheduled_close_context(run('2026-10-07T17:14:34Z'), schedule=CLOSE_CRON,
+                                      now=local('2026-10-08T01:15:58'))
+    audit = tmp_path / 'close-scan-watchdog.json'
+    audit.write_text(json.dumps(context))
+    subprocess.run(['bash'], input=guard + '\ntouch wrongly-dispatched\n', cwd=tmp_path,
+                   capture_output=True, text=True, check=True)
+    assert not (tmp_path / 'wrongly-dispatched').exists()
+    assert json.loads(audit.read_text())['status'] == 'skipped_late'
