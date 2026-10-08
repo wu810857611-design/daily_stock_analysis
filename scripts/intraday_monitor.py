@@ -244,6 +244,9 @@ def _latest_row(
             parameters.append(cutoff_text)
         else:
             return None
+        if "created_at" in columns:
+            filters.append("datetime(created_at) <= datetime(?)")
+            parameters.append(current_text)
     elif fresh_only:
         current = now or datetime.now(SHANGHAI_TZ)
         if current.tzinfo is None:
@@ -266,6 +269,8 @@ def _latest_row(
             f'AND datetime("{date_column}") >= datetime(?))'
         )
         parameters.append(cutoff_text)
+        filters.append(f'datetime("{date_column}") <= datetime(?)')
+        parameters.append(current.astimezone(SHANGHAI_TZ).strftime("%Y-%m-%d %H:%M:%S"))
     order_parts = []
     if "created_at" in columns:
         order_parts.append("datetime(created_at) DESC")

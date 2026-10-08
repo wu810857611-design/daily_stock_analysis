@@ -83,7 +83,7 @@ def create_reference_database(path: Path) -> None:
                 "active",
                 50.0,
                 70.0,
-                "2026-07-28 09:00:00",
+                "2026-07-28 01:00:00",  # decision_signals uses naive UTC (09:00 Shanghai).
                 None,
             ),
         )

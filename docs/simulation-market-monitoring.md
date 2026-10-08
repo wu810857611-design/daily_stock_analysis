@@ -380,3 +380,10 @@ OpenAPI（不是 App/PC/Web）的港股行情权限；账户确有实时包却�
 GitHub Actions 页面分别 Disable `01-intraday-session.yml` 和
 `03-intraday-supervisor.yml`，并按需 Disable `02-market-scan.yml`；原有 20 日模拟仍可
 独立继续。
+
+
+### 持仓参考位恢复与诊断
+
+`01` 恢复收盘缓存后先执行 `reference_levels_audit.py`，按原七天有效期和信号显式过期时间核验 PRIMARY。覆盖不完整时仍检查同分支近期 `paper-close-state` 备份；数据库存在或 SQLite 完整性通过均不代表参考位有效。`reference_restore_before.json` / `reference_restore_after.json` 与会话 `reference_levels.by_symbol` 记录来源、最近日期、有效来源及缺失原因；未覆盖止损或目标的能力逐项标明。港股短代码如 `1548.HK` 与 `HK01548` 使用同一映射。
+
+未来日期、过期、未注明日期、非分析或非 active 信号均不能成为持仓参考位。若上游收盘分析没有生成新的有效计划，盘中仍保持参考位降级，不能把旧计划重新启用；正常收盘分析与新备份的生产验证仍是恢复覆盖的必要条件。
