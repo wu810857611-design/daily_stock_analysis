@@ -82,8 +82,15 @@ def test_first_fundamental_source_hangs_then_fallback_succeeds(configured, monke
     assert result["simulation_only"] and result["auto_order_enabled"] is False
 
 
-def test_hanging_news_provider_advances_to_next_with_existing_news_filters(configured):
+def test_hanging_news_provider_advances_to_next_with_existing_news_filters(configured, monkeypatch):
     _, service = configured
+    # The half-stage reserved for SearXNG must fit timeout, process-group
+    # cleanup, and a second isolated call even on a busy CI runner. Budget
+    # exhaustion has its own test; production settings are unchanged.
+    from src.config import get_config
+    config = get_config()
+    config.fundamental_stage_timeout_seconds = 1.0
+    monkeypatch.setattr("src.config.get_config", lambda: config)
     service._providers = [Provider("Hung", hanging), Provider("EmptySuccess", no_news)]
     result = ScanResearchCollector(2)(CANDIDATE)
     assert result["announcements_and_news"]["status"] == "no_results"
