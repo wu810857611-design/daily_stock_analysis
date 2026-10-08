@@ -15,6 +15,8 @@ notification, or broker access.  This module has no order-placement capability.
 from __future__ import annotations
 
 import copy
+
+from src.services.review_fact_consistency import validate_review_facts
 import json
 import math
 import os
@@ -989,6 +991,7 @@ def _normalise_review_payload(raw: Any, candidates: Sequence[Mapping[str, Any]],
                 str(text).strip() for text in (item.get("inferences") or []) if str(text).strip()
             ],
             "view": str(item.get("view") or "").strip(),
+            "numeric_facts": copy.deepcopy(item.get("numeric_facts")),
         }
     return reviews
 
@@ -2553,6 +2556,8 @@ class MarketScanService:
                 count_candidate_rejection("hard_risk_veto", candidate_market)
             elif "reject" in {qwen["verdict"], deepseek["verdict"]}:
                 count_candidate_rejection("model_reject_veto", candidate_market)
+            elif any((r.get("numeric_consistency") or {}).get("status") == "inconsistent" for r in (qwen, deepseek)):
+                count_candidate_rejection("numeric_fact_inconsistent", candidate_market)
             elif disagreement:
                 if (
                     one_pass_one_watch
@@ -2846,6 +2851,12 @@ class MarketScanService:
                 "最终是否执行仍由用户人工决定。"
             ),
         }
+        for item in candidates:
+            errors = {label: detail for label in ("qwen", "deepseek")
+                      if (detail := (item.get(f"{label}_review") or {}).get("numeric_consistency") or {}).get("status") == "inconsistent"}
+            if errors:
+                item["action_reason"] = "模型关键数值与输入事实不一致，禁止进入可执行建议"
+                item["numeric_fact_errors"] = errors
         self._stage_name = "completed"
         self._write_runtime_state(status="completed")
         result["diagnostics"]["runtime"] = self.runtime_diagnostics()
@@ -2913,6 +2924,15 @@ class MarketScanService:
             if isinstance(diagnostics, Mapping):
                 reason_code = str(diagnostics.get("error_code") or reason_code)
             return {}, f"{label}_review_failed:{reason_code}"
+        inputs = {str(item["code"]): item for item in payload}
+        for code, review in reviews.items():
+            errors = validate_review_facts(review, inputs[code])
+            review["numeric_consistency"] = {"status": "inconsistent" if errors else "checked", "errors": errors, "original_verdict": review["verdict"]}
+            if errors:
+                # Do not retain an eligibility vote based on contradictory facts.
+                review.update(verdict="reject" if review["verdict"] == "reject" else "watch", verdict_schema_valid=False,
+                              watch_reason_code="other", entry_timing_only=False)
+                review["risks"].append("模型关键数值与可信输入不一致，禁止进入可执行建议")
         missing = [code for code in market_by_code if code not in reviews]
         if missing:
             return reviews, f"{label}_review_missing:{','.join(missing)}"
@@ -3313,6 +3333,9 @@ def render_market_scan_markdown(result: Mapping[str, Any]) -> str:
                 f"- 价格/涨跌/成交额：{facts.get('price', '-')} / "
                 f"{facts.get('change_pct', '-')}% / {facts.get('amount', '-')}",
                 f"- PE/PB：{facts.get('pe', '-')} / {facts.get('pb', '-')}",
+                "",
+                f"- 模型数值校验：通义={(candidate.get('qwen_review') or {}).get('numeric_consistency', {}).get('status', '未完成')}；"
+                f"DeepSeek={(candidate.get('deepseek_review') or {}).get('numeric_consistency', {}).get('status', '未完成')}",
                 "",
                 "### 规则推断（不是事实）",
                 "",

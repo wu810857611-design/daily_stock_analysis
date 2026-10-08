@@ -101,6 +101,9 @@ def _parse_enabled_markets(value: str) -> tuple[str, ...]:
     return tuple(resolved)
 
 
+from src.services.review_fact_consistency import fact_contract, validate_review_facts
+
+
 MARKET_SCAN_REVIEW_SYSTEM_PROMPT = """
 你是独立的股票风险复核员。本系统已经主动查询可获得的全市场基础行情与OHLCV；
 若输入把基本面、行业、公告、资金、政策、盘口L1或Level-2标记为 unavailable，
@@ -121,6 +124,8 @@ MARKET_SCAN_REVIEW_SYSTEM_PROMPT = """
 2. inferences：基于数据的可证伪推断，不得冒充事实；
 3. view：审慎观点，需说明短线、波段、中线和长线的数据边界。
 
+输入 numeric_fact_contract 由程序生成：change_pct 单位是百分数的百分点，0.27972 表示0.27972%，绝不能乘100；price/amount单位依currency为CNY或HKD。
+每条review必须返回 numeric_facts，逐字段复述契约values（缺失值不得补造），并核对自己的facts、推断和风险描述没有数字或币种矛盾。
 不得改写程序计算的观察买入区、止损和目标价。发现停牌、监管、财务造假、退市、
 重大数据质量问题或流动性无法执行时 hard_risk=true。缺少可靠Level-2时，不得把
 “主力抢筹、洗盘、诱多”写成事实。做T必须有分时、盘口、波动、胜率及扣费后正期望，
@@ -154,7 +159,7 @@ material_fundamental_or_event_risk、hard_risk、other 中选择。只有当唯�
 输出严格 JSON，必须为每个输入代码且仅输出一条 review；`facts`、`inferences`、
 `risks`、`invalidators` 各最多两条，`thesis` 和 `view` 各最多 120 个汉字：
 {"reviews":[{"code":"...","verdict":"pass|watch|reject","confidence":0到1,
-"hard_risk":false,"entry_timing_only":false,
+"hard_risk":false,"entry_timing_only":false,"numeric_facts":{"price":输入值,"change_pct":输入百分点值,"amount":输入值,"currency":"CNY或HKD"},
 "watch_reason_code":"passed|non_critical_data_gap|trend_or_entry_uncertain|risk_reward_insufficient|material_fundamental_or_event_risk|hard_risk|other",
 "thesis":"一句话审慎观点","risks":["..."],
 "invalidators":["..."],"facts":["..."],"inferences":["..."],"view":"..."}]}。
@@ -365,7 +370,7 @@ def build_litellm_reviewer(label: str) -> Optional[Callable[[Sequence[Mapping[st
         user_prompt = json.dumps(
             {
                 "task": "独立复核以下程序初筛候选；意见冲突会自动降级为观察。",
-                "candidates": candidates,
+                "candidates": [{**candidate, "numeric_fact_contract": fact_contract(candidate)} for candidate in candidates],
             },
             ensure_ascii=False,
             separators=(",", ":"),
@@ -450,6 +455,13 @@ def build_litellm_reviewer(label: str) -> Optional[Callable[[Sequence[Mapping[st
             raise ReviewResponseError(
                 "response_verdict_invalid", invalid_codes=invalid_verdict_codes,
             )
+        inputs = {str(candidate["code"]): candidate for candidate in candidates}
+        inconsistencies = {
+            str(item["code"]): errors for item in reviews
+            if (errors := validate_review_facts(item, inputs[str(item["code"])], require_echo=True))
+        }
+        if inconsistencies:
+            raise ReviewResponseError("response_numeric_fact_mismatch", numeric_errors=inconsistencies)
         return payload
 
     def review(candidates: Sequence[Mapping[str, Any]]) -> Mapping[str, Any]:
