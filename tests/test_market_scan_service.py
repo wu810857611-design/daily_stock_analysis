@@ -185,6 +185,25 @@ def _service(
     )
 
 
+def test_research_field_counts_do_not_claim_complete_evidence(tmp_path):
+    def research(candidate):
+        return {"attempted": True, "status": "partial", "missing_fields": ["news", "announcement_body"],
+                "fundamentals": {"status": "partial", "data": {
+                    "valuation": {"status": "partial", "data": {"pe_ratio": 12.5}},
+                    "earnings": {"status": "partial", "data": {"financial_report": {
+                        "report_date": "2026-06-30", "operating_cash_flow": 100,
+                    }}},
+                }}, "announcements": {"items": [{"title": "官方索引", "content_reviewed": False}]}}
+    result = _service(tmp_path, qwen=ReviewRecorder(), deepseek=ReviewRecorder(), research_loader=research).run()
+    funnel = result["diagnostics"]["buy_funnel"]
+    fields = funnel["research_field_coverage"]
+    assert fields["pe_ratio"] == funnel["research_attempted_count"]
+    assert fields["operating_cash_flow"] > 0 and fields["revenue"] == 0
+    assert fields["announcement_body_excerpt"] == 0 and funnel["research_complete_count"] == 0
+    markdown = render_market_scan_markdown(result)
+    assert "正文摘录不等于全文审查" in markdown and "研究字段缺口" in markdown
+
+
 def test_l1_is_vectorised_and_makes_zero_history_or_llm_calls(tmp_path: Path) -> None:
     qwen = ReviewRecorder()
     deepseek = ReviewRecorder()
@@ -2270,6 +2289,7 @@ def _review_response(batch: Any, *, verdict: str = "pass") -> Any:
         "reviews": [{
             "code": item["code"], "verdict": verdict, "confidence": 0.9,
             "hard_risk": verdict == "reject", "watch_reason_code": "passed",
+            "numeric_facts": item.get("numeric_fact_contract", {}).get("values", {}),
         } for item in batch],
     })}}]}
 
@@ -2303,7 +2323,8 @@ def test_reviewer_small_batches_recover_same_model_and_keep_both_votes(
         assert [item["code"] for item in result["reviews"]] == [item["code"] for item in candidates]
         assert result["reviews"][0]["verdict"] == "reject"
         assert result["reviews"][0]["hard_risk"] is True
-    assert calls[0][1] == calls[1][1] == candidates[:4]
+    assert calls[0][1] == calls[1][1]
+    assert [{k: v for k, v in item.items() if k != "numeric_fact_contract"} for item in calls[0][1]] == candidates[:4]
     assert qwen.diagnostics["request_count"] == 4
     assert qwen.diagnostics["completed_candidate_count"] == 12
     assert "offline-qwen-secret" not in json.dumps(qwen.diagnostics)

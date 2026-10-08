@@ -43,6 +43,7 @@ from scripts.intraday_monitor import (  # noqa: E402
     RiskAlert,
     evaluate_quote,
     send_pushplus,
+    _symbol_aliases,
 )
 from scripts.adaptive_signal_policy import (  # noqa: E402
     CONSIDER_ENTRY,
@@ -1466,6 +1467,7 @@ def load_reference_levels_batch(
     *,
     now: Optional[datetime] = None,
     max_signal_age_days: int = DEFAULT_REFERENCE_SIGNAL_MAX_AGE_DAYS,
+    diagnostics: Optional[MutableMapping[str, Any]] = None,
 ) -> Dict[str, ReferenceLevels]:
     """Load all latest reference levels once at session start.
 
@@ -1475,12 +1477,18 @@ def load_reference_levels_batch(
     """
 
     result = {canonical_symbol(symbol): ReferenceLevels() for symbol in symbols}
+    if diagnostics is not None:
+        diagnostics.update({symbol: {"status": "unavailable", "reason": "database_missing"}
+                            for symbol in result})
     if not database_path.exists():
         return result
     try:
         connection = sqlite3.connect(f"file:{database_path}?mode=ro", uri=True)
         connection.row_factory = sqlite3.Row
-    except sqlite3.Error:
+    except sqlite3.Error as exc:
+        if diagnostics is not None:
+            for detail in diagnostics.values():
+                detail.update(reason="database_unreadable", error_class=type(exc).__name__)
         return result
 
     def columns(table: str) -> set[str]:
@@ -1507,30 +1515,7 @@ def load_reference_levels_batch(
     ).strftime("%Y-%m-%d %H:%M:%S")
     try:
         for symbol in result:
-            aliases = {symbol.upper()}
-            if symbol.startswith("HK"):
-                digits = symbol[2:].zfill(5)
-                aliases.update(
-                    {
-                        digits,
-                        f"HK.{digits}",
-                        f"{digits}.HK",
-                        f"HK{digits}",
-                    }
-                )
-            elif symbol.isdigit() and len(symbol) == 6:
-                exchange = _a_share_exchange(symbol).upper()
-                aliases.update(
-                    {
-                        f"{exchange}{symbol}",
-                        f"{exchange}.{symbol}",
-                        f"{symbol}.{exchange}",
-                    }
-                )
-                if exchange == "SH":
-                    aliases.update(
-                        {f"SS{symbol}", f"SS.{symbol}", f"{symbol}.SS"}
-                    )
+            aliases = _symbol_aliases(symbol)
             placeholders = ",".join("?" for _ in aliases)
             signal = None
             history = None
@@ -1566,6 +1551,9 @@ def load_reference_levels_batch(
                     # An undated analysis signal cannot safely remain a
                     # permanent intraday stop/target reference.
                     filters.append("0 = 1")
+                if "created_at" in signal_columns:
+                    filters.append("datetime(created_at) <= datetime(?)")
+                    parameters.append(current_text)
                 ordering = (
                     "datetime(created_at) DESC, id DESC"
                     if {"created_at", "id"}.issubset(signal_columns)
@@ -1602,8 +1590,9 @@ def load_reference_levels_batch(
                             f"WHERE UPPER(code) IN ({placeholders}) "
                             f"AND {history_date_column} IS NOT NULL "
                             f"AND datetime({history_date_column}) >= datetime(?) "
+                            f"AND datetime({history_date_column}) <= datetime(?) "
                             f"ORDER BY {ordering} LIMIT 1",
-                            [*aliases, history_cutoff_text],
+                            [*aliases, history_cutoff_text, current.astimezone(SHANGHAI_TZ).strftime("%Y-%m-%d %H:%M:%S")],
                         ).fetchone()
                     except sqlite3.Error:
                         history = None
@@ -1628,6 +1617,68 @@ def load_reference_levels_batch(
                     "analysis_history" if history_target is not None else ""
                 ),
             )
+            if diagnostics is not None:
+                detail: Dict[str, Any] = {
+                    "status": "available" if signal_stop or signal_target or history_stop or history_target else "unavailable",
+                    "reason": "", "sources": {}, "max_age_days": max_signal_age_days,
+                    "stop_source": result[symbol].stop_source,
+                    "target_source": result[symbol].target_source,
+                    "affected_capabilities": [],
+                }
+                for table, code_field, available_columns, selected in (
+                    ("decision_signals", "stock_code", signal_columns, signal),
+                    ("analysis_history", "code", history_columns, history),
+                ):
+                    source = {"status": "table_missing"}
+                    if code_field in available_columns:
+                        try:
+                            raw = connection.execute(
+                                f"SELECT * FROM {table} WHERE UPPER({code_field}) IN ({placeholders}) "
+                                "ORDER BY rowid DESC LIMIT 1", list(aliases)
+                            ).fetchone()
+                            source = {"status": "record_missing" if raw is None else
+                                      "eligible" if selected is not None else "ineligible",
+                                      "latest_created_at": value(raw, "created_at") or value(raw, "trade_date"),
+                                      "latest_expires_at": value(raw, "expires_at"),
+                                      "record_status": value(raw, "status"),
+                                      "source_type": value(raw, "source_type"),
+                                      "selected_created_at": value(selected, "created_at") or value(selected, "trade_date")}
+                            if raw is not None and selected is None:
+                                created = value(raw, "created_at") or value(raw, "trade_date")
+                                expiry = value(raw, "expires_at")
+                                def date_cmp(left: Any, right: str, operator: str) -> bool:
+                                    return bool(connection.execute(
+                                        f"SELECT datetime(?) {operator} datetime(?)", (left, right)
+                                    ).fetchone()[0])
+                                if table == "decision_signals" and value(raw, "source_type") not in (None, "analysis"):
+                                    source["status"] = "non_analysis_signal"
+                                elif table == "decision_signals" and value(raw, "status") not in (None, "active"):
+                                    source["status"] = "inactive_signal"
+                                elif created and date_cmp(created, current_text if table == "decision_signals" else current.astimezone(SHANGHAI_TZ).strftime("%Y-%m-%d %H:%M:%S"), ">"):
+                                    source["status"] = "future_dated"
+                                elif expiry and date_cmp(expiry, current_text, "<="):
+                                    source["status"] = "expired_signal"
+                                elif not created and not expiry:
+                                    source["status"] = "undated"
+                                elif not expiry and date_cmp(created, cutoff_text if table == "decision_signals" else history_cutoff_text, "<"):
+                                    source["status"] = "too_old"
+                                else:
+                                    source["status"] = "invalid_date_or_schema"
+                        except sqlite3.Error as exc:
+                            source = {"status": "query_failed", "error_class": type(exc).__name__}
+                    detail["sources"][table] = source
+                if detail["status"] == "unavailable":
+                    statuses = [v["status"] for v in detail["sources"].values()]
+                    detail["reason"] = ("no_valid_dated_reference" if any(v in statuses for v in ("expired_signal", "too_old", "undated", "inactive_signal", "future_dated", "non_analysis_signal", "invalid_date_or_schema"))
+                                        else "levels_missing" if "eligible" in statuses
+                                        else "query_failed" if "query_failed" in statuses
+                                        else "record_or_schema_missing")
+                if result[symbol].stop_loss is None:
+                    detail["affected_capabilities"].append("stop_loss_monitoring")
+                if result[symbol].target_price is None:
+                    detail["affected_capabilities"].append("target_price_monitoring")
+                diagnostics[symbol] = detail
+
     finally:
         connection.close()
     return result
@@ -4941,6 +4992,16 @@ def render_session_report(
         ),
         "- 数据等级护栏：L1 永远不会标记或展示为 Level-2。",
     ]
+    if reference.get("by_symbol"):
+        lines.extend(["", "## 持仓参考位诊断", "",
+                      "| 标的 | 状态/原因 | 最近分析时间 | 受影响能力 |",
+                      "| --- | --- | --- | --- |"])
+        for symbol, detail in reference["by_symbol"].items():
+            dates = "; ".join(str(v.get("latest_created_at") or "-")
+                              for v in detail.get("sources", {}).values())
+            lines.append(f"| {symbol} | {detail.get('status')} / {detail.get('reason') or '-'} | "
+                         f"{dates} | {', '.join(detail.get('affected_capabilities', [])) or '-'} |")
+        lines.append("")
     if quote_fetcher:
         lines.append(
             "- 港股实时源状态："
@@ -5562,7 +5623,8 @@ def run_session(
         now=started,
         candidates=candidate_plans,
     )
-    levels = load_reference_levels_batch(database_path, symbols, now=started)
+    reference_details: Dict[str, Any] = {}
+    levels = load_reference_levels_batch(database_path, symbols, now=started, diagnostics=reference_details)
     primary_reference_symbols = list(PRIMARY_SYMBOLS)
     covered_references = sum(
         1
@@ -5580,6 +5642,8 @@ def run_session(
             else 0.0
         ),
         "scope": "PRIMARY_PORTFOLIO_only",
+        "max_age_days": DEFAULT_REFERENCE_SIGNAL_MAX_AGE_DAYS,
+        "by_symbol": {symbol: reference_details.get(symbol, {}) for symbol in primary_reference_symbols},
         "status": (
             "available"
             if covered_references == len(primary_reference_symbols)

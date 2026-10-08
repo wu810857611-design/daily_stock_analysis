@@ -15,6 +15,8 @@ notification, or broker access.  This module has no order-placement capability.
 from __future__ import annotations
 
 import copy
+
+from src.services.review_fact_consistency import validate_review_facts
 import json
 import math
 import os
@@ -989,6 +991,7 @@ def _normalise_review_payload(raw: Any, candidates: Sequence[Mapping[str, Any]],
                 str(text).strip() for text in (item.get("inferences") or []) if str(text).strip()
             ],
             "view": str(item.get("view") or "").strip(),
+            "numeric_facts": copy.deepcopy(item.get("numeric_facts")),
         }
     return reviews
 
@@ -1173,6 +1176,9 @@ def _build_v4_evidence_contract(
     research = dict(research_evidence or {})
     fundamentals = research.get("fundamentals")
     fundamentals = dict(fundamentals) if isinstance(fundamentals, Mapping) else {}
+    valuation_research = (((fundamentals.get("data") or {}).get("valuation") or {}).get("data") or {})
+    valuation_available = valuation_available or any(_finite_float(valuation_research.get(field)) is not None
+                                                     for field in ("pe_ratio", "pb_ratio"))
     announcements_and_news = research.get("announcements_and_news")
     announcements_and_news = (
         dict(announcements_and_news)
@@ -2216,6 +2222,8 @@ class MarketScanService:
         research_available_count = 0
         research_status_counts = {"complete": 0, "partial": 0, "unavailable": 0}
         research_block_counts = {"fundamentals": 0, "news": 0, "announcements": 0}
+        research_field_counts = {key: 0 for key in ("pe_ratio", "pb_ratio", "dated_financial_report", "revenue",
+                                                   "net_profit_parent", "operating_cash_flow", "roe", "announcement_body_excerpt")}
         research_errors: Dict[str, List[str]] = {}
         review_payload = []
         self._begin_stage(
@@ -2309,6 +2317,20 @@ class MarketScanService:
                 research_status_counts[evidence_status] += 1
                 for key, has_block in block_available.items():
                     research_block_counts[key] += int(has_block)
+                def as_mapping(value):
+                    return value if isinstance(value, Mapping) else {}
+                fundamental_data = as_mapping(blocks["fundamentals"])
+                valuation_data = as_mapping(as_mapping(fundamental_data.get("valuation")).get("data"))
+                financial_report = as_mapping(as_mapping(as_mapping(fundamental_data.get("earnings")).get("data")).get("financial_report"))
+                for field in ("pe_ratio", "pb_ratio"):
+                    research_field_counts[field] += int(_finite_float(valuation_data.get(field)) is not None)
+                for field in ("revenue", "net_profit_parent", "operating_cash_flow", "roe"):
+                    research_field_counts[field] += int(_finite_float(financial_report.get(field)) is not None)
+                research_field_counts["dated_financial_report"] += int(bool(financial_report.get("report_date")))
+                research_field_counts["announcement_body_excerpt"] += int(any(
+                    isinstance(item, Mapping) and item.get("body_excerpt_available") is True
+                    for item in (blocks["announcements"] or [])
+                ))
                 errors = research_evidence.get("errors")
                 if isinstance(errors, list) and errors:
                     research_errors[code] = [str(item) for item in errors[:3]]
@@ -2553,6 +2575,8 @@ class MarketScanService:
                 count_candidate_rejection("hard_risk_veto", candidate_market)
             elif "reject" in {qwen["verdict"], deepseek["verdict"]}:
                 count_candidate_rejection("model_reject_veto", candidate_market)
+            elif any((r.get("numeric_consistency") or {}).get("status") == "inconsistent" for r in (qwen, deepseek)):
+                count_candidate_rejection("numeric_fact_inconsistent", candidate_market)
             elif disagreement:
                 if (
                     one_pass_one_watch
@@ -2751,6 +2775,7 @@ class MarketScanService:
             "research_partial_count": research_status_counts["partial"],
             "research_unavailable_count": research_status_counts["unavailable"],
             "research_block_coverage": research_block_counts,
+            "research_field_coverage": research_field_counts,
             "actionable_count": actionable_count,
             "history_rejection_reasons": history_rejection_counts,
             "candidate_rejection_reasons": candidate_rejection_reasons,
@@ -2846,6 +2871,12 @@ class MarketScanService:
                 "最终是否执行仍由用户人工决定。"
             ),
         }
+        for item in candidates:
+            errors = {label: detail for label in ("qwen", "deepseek")
+                      if (detail := (item.get(f"{label}_review") or {}).get("numeric_consistency") or {}).get("status") == "inconsistent"}
+            if errors:
+                item["action_reason"] = "模型关键数值与输入事实不一致，禁止进入可执行建议"
+                item["numeric_fact_errors"] = errors
         self._stage_name = "completed"
         self._write_runtime_state(status="completed")
         result["diagnostics"]["runtime"] = self.runtime_diagnostics()
@@ -2913,6 +2944,15 @@ class MarketScanService:
             if isinstance(diagnostics, Mapping):
                 reason_code = str(diagnostics.get("error_code") or reason_code)
             return {}, f"{label}_review_failed:{reason_code}"
+        inputs = {str(item["code"]): item for item in payload}
+        for code, review in reviews.items():
+            errors = validate_review_facts(review, inputs[code])
+            review["numeric_consistency"] = {"status": "inconsistent" if errors else "checked", "errors": errors, "original_verdict": review["verdict"]}
+            if errors:
+                # Do not retain an eligibility vote based on contradictory facts.
+                review.update(verdict="reject" if review["verdict"] == "reject" else "watch", verdict_schema_valid=False,
+                              watch_reason_code="other", entry_timing_only=False)
+                review["risks"].append("模型关键数值与可信输入不一致，禁止进入可执行建议")
         missing = [code for code in market_by_code if code not in reviews]
         if missing:
             return reviews, f"{label}_review_missing:{','.join(missing)}"
@@ -3271,6 +3311,7 @@ def render_market_scan_markdown(result: Mapping[str, Any]) -> str:
                 f"{funnel.get('research_complete_count', 0)} / {funnel.get('research_partial_count', 0)} / "
                 f"{funnel.get('research_unavailable_count', 0)}",
                 f"- 研究有效覆盖（基本面/新闻/官方公告索引）：{json.dumps(funnel.get('research_block_coverage') or {}, ensure_ascii=False)}",
+                f"- 研究字段覆盖（正文摘录不等于全文审查）：{json.dumps(funnel.get('research_field_coverage') or {}, ensure_ascii=False)}",
                 f"- 双模型完成/同时通过：{funnel.get('dual_model_reviewed_count', 0)} / "
                 f"{funnel.get('dual_model_pass_count', 0)}",
                 f"- 可进入盘中买入区复核：{funnel.get('actionable_count', 0)}",
@@ -3304,6 +3345,7 @@ def render_market_scan_markdown(result: Mapping[str, Any]) -> str:
                 f"- 支撑/压力：{candidate.get('support', '-')} / {candidate.get('resistance', '-')}",
                 f"- 模型分歧：{'是' if candidate.get('model_disagreement') else '否'}",
                 f"- 最终原因：{candidate.get('action_reason') or '-'}",
+                f"- 研究字段缺口：{json.dumps((candidate.get('research_evidence') or {}).get('missing_fields') or [], ensure_ascii=False)}",
                 "",
                 "### 已核验事实",
                 "",
@@ -3313,6 +3355,9 @@ def render_market_scan_markdown(result: Mapping[str, Any]) -> str:
                 f"- 价格/涨跌/成交额：{facts.get('price', '-')} / "
                 f"{facts.get('change_pct', '-')}% / {facts.get('amount', '-')}",
                 f"- PE/PB：{facts.get('pe', '-')} / {facts.get('pb', '-')}",
+                "",
+                f"- 模型数值校验：通义={(candidate.get('qwen_review') or {}).get('numeric_consistency', {}).get('status', '未完成')}；"
+                f"DeepSeek={(candidate.get('deepseek_review') or {}).get('numeric_consistency', {}).get('status', '未完成')}",
                 "",
                 "### 规则推断（不是事实）",
                 "",

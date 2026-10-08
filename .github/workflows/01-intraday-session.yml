@@ -228,7 +228,7 @@ jobs:
           restore-keys: |
             paper-close-state-
 
-      - name: 缓存缺失时恢复最新收盘数据库备份
+      - name: 参考位缺失或过期时恢复最新收盘数据库备份
         if: steps.market_calendar.outputs.should_run == 'true'
         shell: bash
         env:
@@ -236,8 +236,8 @@ jobs:
           STATE_BRANCH: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          if [ -f data/stock_analysis.db ]; then
-            echo "✅ 已从 Actions cache 恢复收盘数据库"
+          if python3 scripts/reference_levels_audit.py --db data/stock_analysis.db --output reports/reference_restore_before.json; then
+            echo "✅ 缓存收盘数据库的持仓参考位通过现有有效期校验"
           else
             STATE_TMP_DIR="$(mktemp -d)"
             gh api --method GET \
@@ -248,8 +248,11 @@ jobs:
               python3 - "$STATE_TMP_DIR/artifacts.json" "$STATE_BRANCH" <<'PY'
           import json
           import sys
+          from datetime import datetime, timedelta, timezone
+          from scripts.intraday_session import DEFAULT_REFERENCE_SIGNAL_MAX_AGE_DAYS
 
           path, branch = sys.argv[1:3]
+          cutoff = datetime.now(timezone.utc) - timedelta(days=DEFAULT_REFERENCE_SIGNAL_MAX_AGE_DAYS)
           with open(path, encoding="utf-8") as handle:
               artifacts = json.load(handle).get("artifacts", [])
           candidates = [
@@ -257,6 +260,7 @@ jobs:
               if not item.get("expired")
               and item.get("name") == "paper-close-state"
               and (item.get("workflow_run") or {}).get("head_branch") == branch
+              and datetime.fromisoformat(item["created_at"].replace("Z", "+00:00")) >= cutoff
           ]
           candidates.sort(key=lambda item: item.get("created_at", ""), reverse=True)
           print(candidates[0]["id"] if candidates else "")
@@ -296,7 +300,7 @@ jobs:
           PY
               echo "✅ 已从同分支最新 paper-close-state artifact 恢复数据库"
             else
-              echo "::warning::没有可恢复的收盘数据库；本轮仅执行日内涨跌监控并明确降级"
+              echo "::warning::没有近期可恢复的收盘数据库；保留现有安全有效期，缺失参考位继续降级"
             fi
           fi
 
@@ -313,6 +317,8 @@ jobs:
               connection.close()
           PY
             echo "✅ 收盘数据库完整性校验通过"
+            python3 scripts/reference_levels_audit.py --db data/stock_analysis.db --output reports/reference_restore_after.json \
+              || echo "::warning::上游收盘分析未补齐有效持仓参考位；详见 reference_restore_after.json，不启用过期计划"
           fi
 
       - name: 恢复全市场候选计划缓存
