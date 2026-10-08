@@ -434,6 +434,7 @@ def build_snapshot(
     trade_date: str,
     min_coverage: float = DEFAULT_MIN_COVERAGE,
     analysis_since: Optional[str] = None,
+    require_dated_close: bool = False,
 ) -> Dict[str, Any]:
     """Build one tracker-compatible snapshot or raise ``CoverageError``."""
 
@@ -482,11 +483,15 @@ def build_snapshot(
         elif values.get("raw_action") in (None, ""):
             reasons.append("no_action_in_signal_or_analysis")
 
+        if require_dated_close and values is not None:
+            if values.get("raw_result", {}).get("close_analysis_date") != trade_date:
+                reasons.append("analysis_close_date_missing_or_mismatched")
+
         price: Optional[float] = None
         price_source: Optional[str] = None
         if symbol in daily_prices:
             price, price_source = daily_prices[symbol]
-        elif values is not None:
+        elif values is not None and not require_dated_close:
             price, price_source = _fallback_price(values)
         if price is None:
             if symbol in stale_price_dates:
@@ -528,6 +533,7 @@ def build_snapshot(
             "min_coverage": float(min_coverage),
             "source_counts": source_counts,
             "analysis_since": analysis_since,
+            "require_dated_close": require_dated_close,
         },
     }
     if coverage < min_coverage:
@@ -568,6 +574,8 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_MIN_COVERAGE,
         help="minimum usable requested-symbol fraction (0, 1], default: 0.8",
     )
+    parser.add_argument("--require-dated-close", action="store_true",
+                        help="require stock_daily close dated exactly to --trade-date")
     parser.add_argument("--output", default="-", help="output JSON path, or - for stdout")
     return parser
 
@@ -588,6 +596,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 trade_date=args.trade_date,
                 min_coverage=args.min_coverage,
                 analysis_since=args.analysis_since,
+                require_dated_close=args.require_dated_close,
             )
         _write_snapshot(args.output, snapshot)
     except CoverageError as exc:

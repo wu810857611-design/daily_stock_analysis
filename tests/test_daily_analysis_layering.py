@@ -53,7 +53,7 @@ def test_primary_pool_is_complete_first_and_watch_pools_are_disjoint() -> None:
     holdings_call = text.index('run_analysis_layer "P2_ACCOUNT_HOLDINGS"')
     candidate_call = text.index('run_analysis_layer "P3_CANDIDATES"')
     assert primary_call < coverage_check < family_call < holdings_call < candidate_call
-    assert '--stocks "$PRIMARY_STOCKS"' in text
+    assert '--stocks "$ACTIVE_PRIMARY_STOCKS"' in text
     assert "--min-coverage 1.0" in text
 
 
