@@ -364,8 +364,10 @@ class StockAnalysisPipeline:
             logger.info(f"{stock_name}({code}) 开始从数据源获取数据...")
             close_date = getattr(self, "close_analysis_date", None)
             if close_date:
+                # Yahoo's end is exclusive; other providers may include it.
+                # Query through the next-day boundary, then trim before storage.
                 df, source_name = self.fetcher_manager.get_daily_data(
-                    code, days=30, end_date=close_date.isoformat()
+                    code, days=30, end_date=(close_date + timedelta(days=1)).isoformat()
                 )
                 if df is not None and not df.empty:
                     df = df[pd.to_datetime(df["date"]).dt.date <= close_date]

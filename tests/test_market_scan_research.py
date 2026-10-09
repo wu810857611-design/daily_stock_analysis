@@ -110,6 +110,13 @@ def test_news_zero_results_differs_from_provider_failure(configured):
 
 def test_searxng_hanging_instance_does_not_block_next_instance(configured, monkeypatch):
     _, service = configured
+    # Exercise failover, with time for the timed-out process to be reaped
+    # before starting the second instance. Total-budget exhaustion is covered
+    # separately; this fixture does not change production timeout settings.
+    from src.config import get_config
+    config = get_config()
+    config.fundamental_stage_timeout_seconds = 1.0
+    monkeypatch.setattr("src.config.get_config", lambda: config)
     provider = SearXNGSearchProvider(["https://hung.invalid", "https://working.invalid"])
     def instance(query, base_url, *args, **kwargs):
         if "hung" in base_url:

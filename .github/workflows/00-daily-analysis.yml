@@ -953,12 +953,25 @@ jobs:
       - name: 检出代码
         uses: actions/checkout@v5
 
-      - name: 兜底检查19:15全市场扫描
+      - name: 设置 Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: 安装轻量交易日依赖
+        run: python -m pip install 'exchange-calendars>=4.13.0'
+
+      - name: 兜底检查19:27全市场扫描
         env:
           GH_TOKEN: ${{ github.token }}
+          CLOSE_EVENT_SCHEDULE: ${{ github.event.schedule }}
         run: |
+          gh api --method GET "/repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+            > close-watchdog-run.json
           python3 scripts/market_scan_watchdog.py \
             --slot close \
+            --close-run-metadata close-watchdog-run.json \
+            --close-schedule "$CLOSE_EVENT_SCHEDULE" \
             --repo "$GITHUB_REPOSITORY" \
             --ref "$GITHUB_REF_NAME" \
             --output close-scan-watchdog.json
@@ -968,6 +981,8 @@ jobs:
         uses: actions/upload-artifact@v6
         with:
           name: close-scan-watchdog-${{ github.run_number }}-${{ github.run_attempt }}
-          path: close-scan-watchdog.json
+          path: |
+            close-scan-watchdog.json
+            close-watchdog-run.json
           if-no-files-found: warn
           retention-days: 30

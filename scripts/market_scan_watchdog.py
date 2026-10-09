@@ -8,7 +8,7 @@ import json
 import os
 import sys
 import time
-from datetime import datetime, time as datetime_time
+from datetime import date, datetime, time as datetime_time
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 from urllib import error, parse, request
@@ -388,9 +388,23 @@ def run_watchdog(
     sync_timeout_seconds: float = 120.0,
     sync_poll_seconds: float = 10.0,
     observe_only: bool = False,
+    session_date: date | None = None,
 ) -> dict[str, Any]:
     now = now_fn().astimezone(SHANGHAI_TZ)
     resolved_slot = resolve_slot(slot, now)
+    if session_date is not None:
+        if resolved_slot != "close" or session_date > now.date():
+            raise ValueError("dated watchdog requires a completed close session")
+        target, latest = target_at(resolved_slot, datetime.combine(session_date, datetime_time(), SHANGHAI_TZ))
+        if now > latest:
+            # Do this before calendar/API calls or waiting. A delayed close run
+            # must never become the next session's watchdog, even in observe mode.
+            return {"status": "skipped_late", "slot": resolved_slot,
+                    "trade_date": session_date.isoformat(),
+                    "observed_at": now.isoformat(timespec="seconds"),
+                    "latest_at": latest.isoformat()}
+    else:
+        target, latest = target_at(resolved_slot, now)
     calendar = dict(session_gate(now))
     if not calendar.get("should_run"):
         return {
@@ -401,11 +415,10 @@ def run_watchdog(
             "active_markets": list(calendar.get("active_markets") or []),
             "market_states": dict(calendar.get("market_states") or {}),
         }
-    target, latest = target_at(resolved_slot, now)
     while now < target:
         sleep_fn(min(60.0, (target - now).total_seconds()))
         now = now_fn().astimezone(SHANGHAI_TZ)
-    if now > latest and not observe_only:
+    if now > latest and (session_date is not None or not observe_only):
         return {
             "status": "skipped_late",
             "slot": resolved_slot,
@@ -475,6 +488,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ref", default="main")
     parser.add_argument("--workflow", default="02-market-scan.yml")
     parser.add_argument("--output", type=Path)
+    parser.add_argument("--close-run-metadata", type=Path,
+                        help="anchor the close watchdog to the original workflow run")
+    parser.add_argument("--close-schedule", default="")
     parser.add_argument("--sync-latest-path", type=Path)
     parser.add_argument("--sync-timeout-seconds", type=float, default=120.0)
     parser.add_argument("--sync-poll-seconds", type=float, default=10.0)
@@ -487,11 +503,23 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.close_run_metadata is not None and args.slot != "close":
+        parser.error("--close-run-metadata requires --slot close")
     token = str(os.getenv("GH_TOKEN") or "").strip()
     if not token:
         raise SystemExit("GH_TOKEN is required for market-scan watchdog")
     client = GitHubActionsClient(repo=args.repo, token=token)
+    session_date = None
+    if args.close_run_metadata is not None:
+        from src.services.close_analysis_context import resolve_close_context
+        metadata = json.loads(args.close_run_metadata.read_text(encoding="utf-8"))
+        context = resolve_close_context(
+            event="schedule", schedule=args.close_schedule, created_at=metadata["created_at"],
+            now=datetime.now(SHANGHAI_TZ), budget_minutes=1,
+        )
+        session_date = date.fromisoformat(context["trade_date"])
     result = run_watchdog(
         slot=args.slot,
         now_fn=lambda: datetime.now(SHANGHAI_TZ),
@@ -503,6 +531,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         sync_timeout_seconds=args.sync_timeout_seconds,
         sync_poll_seconds=args.sync_poll_seconds,
         observe_only=args.observe_only,
+        session_date=session_date,
     )
     serialised = json.dumps(result, ensure_ascii=False)
     print(serialised)
