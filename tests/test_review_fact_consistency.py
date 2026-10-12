@@ -45,6 +45,124 @@ def test_missing_echo_and_missing_source_are_not_default_pass():
     assert not validate_review_facts({'facts': ['日跌0.28%']}, negative)
 
 
+@pytest.mark.parametrize('change', [1.05769, 1.30612, 3.103, 3.717, 2.069, 2.954, 2.412, 2.37515, -1.05769])
+@pytest.mark.parametrize('label', ['日涨跌幅', '日内涨跌幅', '日涨跌'])
+def test_neutral_change_labels_preserve_actual_sign(change, label):
+    candidate = {**CANDIDATE, 'change_pct': change}
+    review = {'numeric_facts': numeric_facts(candidate), 'facts': [f'{label}{change}%']}
+    assert validate_review_facts(review, candidate, require_echo=True) == []
+
+
+@pytest.mark.parametrize('claim,change', [
+    ('日跌0.28%', -0.27972), ('日内跌幅0.28%', -0.27972),
+    ('当日跌幅0.28%', -0.27972), ('日涨幅0.28%', 0.27972),
+])
+def test_explicit_direction_remains_checked(claim, change):
+    candidate = {**CANDIDATE, 'change_pct': change}
+    assert validate_review_facts({'facts': [claim]}, candidate) == []
+    assert validate_review_facts({'facts': [claim]}, {**candidate, 'change_pct': -change})
+
+
+@pytest.mark.parametrize('claim', ['日涨-0.28%', '日跌0%', '日跌+0.28%'])
+def test_explicit_downward_or_contradictory_direction_cannot_pass_positive_input(claim):
+    assert validate_review_facts({'facts': [claim]}, CANDIDATE)
+
+
+def test_rounding_does_not_allow_opposite_neutral_direction():
+    candidate = {**CANDIDATE, 'change_pct': 0.2}
+    assert validate_review_facts({'facts': ['日涨跌幅-0.1%']}, candidate)
+
+
+@pytest.mark.parametrize('candidate', [
+    {**CANDIDATE, 'amount': 339629533.0, 'change_pct': 1.05769, 'pe': 47.90730029},
+    {**CANDIDATE, 'amount': 522609577.0, 'change_pct': 1.30612},
+    {**CANDIDATE, 'amount': 716082323.0, 'change_pct': 3.103},
+    {**CANDIDATE, 'amount': 703023966.0, 'change_pct': 3.717},
+])
+def test_program_rendered_contract_can_be_repeated_without_false_mismatch(candidate):
+    contract = fact_contract(candidate)
+    assert validate_review_facts({'numeric_facts': contract['values'], 'facts': [contract['rendered']]},
+                                 candidate, require_echo=True) == []
+
+
+@pytest.mark.parametrize('claim', ['成交额3.3963e8港元', '成交额3.3963E+8HKD', '成交额3.3963亿港元'])
+def test_scientific_amount_and_printed_precision_are_converted_before_checking(claim):
+    candidate = {**CANDIDATE, 'amount': 339629533.0}
+    assert validate_review_facts({'facts': [claim]}, candidate) == []
+
+
+def test_one_decimal_pe_sentence_does_not_relax_structured_echo():
+    candidate = {**CANDIDATE, 'pe': 47.90730029}
+    correct = numeric_facts(candidate)
+    assert validate_review_facts({'numeric_facts': correct, 'facts': ['PE 47.9倍']}, candidate,
+                                 require_echo=True) == []
+    errors = validate_review_facts({'numeric_facts': {**correct, 'pe': 47.9}}, candidate, require_echo=True)
+    assert any(item['error'] == 'structured_mismatch' for item in errors)
+    assert validate_review_facts({'numeric_facts': correct, 'facts': ['PE 479倍']}, candidate, require_echo=True)
+
+
+@pytest.mark.parametrize('field', ['pe', 'pb'])
+def test_only_missing_optional_valuation_may_be_echoed_as_null(field):
+    contract = fact_contract(CANDIDATE)
+    assert field in contract['nullable_missing_fields']
+    assert validate_review_facts({'numeric_facts': {**contract['values'], field: None}}, CANDIDATE,
+                                 require_echo=True) == []
+    for fabricated in [0, 1.2, 'null']:
+        errors = validate_review_facts({'numeric_facts': {**contract['values'], field: fabricated}},
+                                       CANDIDATE, require_echo=True)
+        assert any(item['error'] == 'unsupported_numeric_fact' and item['observed'] == fabricated
+                   for item in errors)
+    assert validate_review_facts({'numeric_facts': contract['values'], 'facts': [f'{field.upper()} 1.2倍']},
+                                 CANDIDATE, require_echo=True)
+
+
+def test_null_does_not_replace_known_valuation_or_add_unknown_fields():
+    candidate = {**CANDIDATE, 'pb': 1.2}
+    assert validate_review_facts({'numeric_facts': {**numeric_facts(candidate), 'pb': None}}, candidate,
+                                 require_echo=True)
+    assert validate_review_facts({'numeric_facts': {**numeric_facts(CANDIDATE), 'invented': None}},
+                                 CANDIDATE, require_echo=True)
+
+
+@pytest.mark.parametrize('claim', ['成交额0e9999亿港元', '当前价1e999港元', '日涨跌幅1e999%', '成交额3.3963e6港元'])
+def test_nonfinite_or_wrong_scale_claims_fail_without_crashing(claim):
+    assert validate_review_facts({'facts': [claim]}, CANDIDATE)
+
+
+@pytest.mark.parametrize('claim', ['成交额0e308港元', '当前价0e308港元', '日涨跌幅0e308%'])
+def test_coarse_zero_cannot_erase_nonzero_source_facts(claim):
+    assert validate_review_facts({'numeric_facts': numeric_facts(CANDIDATE), 'facts': [claim]},
+                                 CANDIDATE, require_echo=True)
+
+
+@pytest.mark.parametrize('label', ['qwen', 'deepseek'])
+def test_actual_review_batches_accept_neutral_scientific_and_nullable_contracts(monkeypatch, label):
+    calls = []
+    monkeypatch.setenv('MARKET_SCAN_QWEN_MODEL', 'fixture')
+    monkeypatch.setenv('MARKET_SCAN_DEEPSEEK_MODEL', 'fixture')
+    monkeypatch.setenv('LLM_DASHSCOPE_API_KEY', 'offline-fixture')
+    monkeypatch.setenv('LLM_DEEPSEEK_API_KEY', 'offline-fixture')
+    monkeypatch.delenv('LLM_DASHSCOPE_MODELS', raising=False)
+    monkeypatch.delenv('LLM_DEEPSEEK_MODELS', raising=False)
+    candidates = [{**CANDIDATE, 'code': f'HK{index:05}', 'amount': 339629533.0, 'change_pct': 1.05769}
+                  for index in range(12)]
+    def completion(**kwargs):
+        calls.append(kwargs)
+        batch = json.loads(kwargs['messages'][1]['content'])['candidates']
+        reviews = [{'code': item['code'], 'verdict': 'pass',
+                    'numeric_facts': {**item['numeric_fact_contract']['values'], 'pb': None},
+                    'facts': [item['numeric_fact_contract']['rendered']]}
+                   for item in batch]
+        return {'choices': [{'finish_reason': 'stop', 'message': {'content': json.dumps({'reviews': reviews})}}]}
+    monkeypatch.setitem(sys.modules, 'litellm', SimpleNamespace(completion=completion))
+    reviewer = build_litellm_reviewer(label)
+    assert len(reviewer(candidates)['reviews']) == 12
+    assert reviewer.diagnostics['completed_candidate_count'] == 12
+    assert reviewer.diagnostics['status'] == 'completed'
+    assert all(request['status'] == 'completed' for request in reviewer.diagnostics['requests'])
+    assert len(calls) == len(reviewer.diagnostics['batches'])
+
+
 @pytest.mark.parametrize('recovers', [True, False])
 def test_numeric_misread_retries_within_existing_budget(monkeypatch, recovers):
     calls = []

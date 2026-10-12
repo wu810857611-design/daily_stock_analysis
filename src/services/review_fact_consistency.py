@@ -40,6 +40,7 @@ def fact_contract(candidate: Mapping[str, Any]) -> dict:
         unit = "%" if field == "change_pct" else currency if field in {"price", "amount"} else "倍"
         rendered.append(f"{labels[field]} {value:g}{unit}")
     return {"values": values,
+            "nullable_missing_fields": [field for field in ("pe", "pb") if field not in values],
             "units": {"price": currency, "amount": currency, "change_pct": "percentage_points", "pe": "multiple", "pb": "multiple"},
             "rendered": "；".join(rendered)}
 
@@ -49,18 +50,50 @@ def _matches(field: str, expected: Any, observed: Any) -> bool:
         return observed == expected
     if not isinstance(observed, (int, float)) or isinstance(observed, bool) or not math.isfinite(observed):
         return False
-    # Two decimal places for percentage points/prices/ratios. Amount prose can
-    # round to 0.01 billion (0.005 * 1e8); structured amounts use tighter bounds.
+    # Structured echoes retain the existing tolerance; prose display precision
+    # is handled separately and never substitutes for these source values.
     return math.isclose(expected, observed, rel_tol=1e-6, abs_tol=0.0051 if field != "amount" else 0.51)
 
 
+_NUMBER = r"[+-]?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?"
 _CLAIMS = {
-    "change_pct": r"(?:日(?:内)?(?:涨跌幅|涨幅|跌幅|涨跌)|日涨|日跌|当日涨幅|当日跌幅)\s*(?:约|为|达|达到|了|：|:|=)?\s*([+-]?\d+(?:\.\d+)?)\s*[%％]",
-    "price": r"(?:快照价|最新价|现价|当前价)\s*(?:约|为|：|:|=)?\s*([+-]?\d+(?:\.\d+)?)\s*(港元|港币|人民币|元|HKD|CNY)?",
-    "amount": r"成交额\s*(?:约|为|：|:|=)?\s*([+-]?\d+(?:\.\d+)?)\s*(亿|万)?\s*(港元|港币|人民币|元|HKD|CNY)?",
-    "pe": r"(?:(?<![A-Za-z])PE(?![A-Za-z])(?:\(TTM\))?|市盈率(?:\(TTM\))?)\s*(?:约|为|：|:|=)?\s*([+-]?\d+(?:\.\d+)?)",
-    "pb": r"(?:(?<![A-Za-z])PB(?![A-Za-z])|市净率)\s*(?:约|为|：|:|=)?\s*([+-]?\d+(?:\.\d+)?)",
+    "change_pct": rf"(?P<label>日(?:内)?(?:涨跌幅|涨幅|跌幅|涨跌)|日涨|日跌|当日涨幅|当日跌幅)\s*(?:约|为|达|达到|了|：|:|=)?\s*(?P<number>{_NUMBER})\s*[%％]",
+    "price": rf"(?:快照价|最新价|现价|当前价)\s*(?:约|为|：|:|=)?\s*({_NUMBER})\s*(港元|港币|人民币|元|HKD|CNY)?",
+    "amount": rf"成交额\s*(?:约|为|：|:|=)?\s*({_NUMBER})\s*(亿|万)?\s*(港元|港币|人民币|元|HKD|CNY)?",
+    "pe": rf"(?:(?<![A-Za-z])PE(?![A-Za-z])(?:\(TTM\))?|市盈率(?:\(TTM\))?)\s*(?:约|为|：|:|=)?\s*({_NUMBER})",
+    "pb": rf"(?:(?<![A-Za-z])PB(?![A-Za-z])|市净率)\s*(?:约|为|：|:|=)?\s*({_NUMBER})",
 }
+
+
+def _prose_matches(field: str, expected: float, observed: float, literal: str,
+                   multiplier: float = 1) -> bool:
+    """Compare a labelled claim at its printed precision, after unit conversion.
+
+    Structured echoes still use _matches. A rounded sentence is not a new
+    source value, and cannot replace the original input used by trading gates.
+    """
+    if not math.isfinite(observed):
+        return False
+    # A coarse zero (e.g. 0e308) must not erase a nonzero source value.
+    # Retain the original small rounding allowance for literal zero.
+    if observed == 0:
+        return _matches(field, expected, observed)
+    parts = literal.lower().split("e")
+    decimals = len(parts[0].split(".")[1]) if "." in parts[0] else 0
+    try:
+        exponent = int(parts[1]) if len(parts) == 2 else 0
+    except ValueError:
+        return False
+    if not -308 <= exponent <= 308:
+        return False
+    rounding = 0.5 * (10.0 ** (exponent - decimals)) * multiplier
+    if not math.isfinite(rounding):
+        return False
+    if expected * observed < 0:
+        return False
+    base = 0.51 if field == "amount" else 0.0051
+    return math.isclose(expected, observed, rel_tol=1e-6,
+                        abs_tol=max(base, rounding) + 1e-12)
 
 
 def validate_review_facts(review: Mapping[str, Any], candidate: Mapping[str, Any], *, require_echo: bool = False) -> list[dict]:
@@ -75,28 +108,42 @@ def validate_review_facts(review: Mapping[str, Any], candidate: Mapping[str, Any
                 if not _matches(field, value, echoed.get(field)):
                     errors.append({"field": field, "expected": value, "observed": echoed.get(field), "error": "structured_mismatch"})
             for field in set(echoed) - set(expected):
-                errors.append({"field": field, "error": "unsupported_numeric_fact"})
+                if field in {"pe", "pb"} and echoed[field] is None:
+                    continue
+                errors.append({"field": field, "observed": echoed[field],
+                               "error": "unsupported_numeric_fact"})
     texts = [str(review.get(key) or "") for key in ("thesis", "view")]
     for key in ("facts", "risks", "inferences", "invalidators"):
         values = review.get(key) or []
         texts.extend([values] if isinstance(values, str) else [str(value) for value in values])
     for text in texts:
         for field, pattern in _CLAIMS.items():
-            if field not in expected:
-                continue
             for match in re.finditer(pattern, text, flags=re.IGNORECASE):
-                value = float(match.group(1))
-                if field == "change_pct" and any(word in match.group(0) for word in ("日跌", "跌幅")):
-                    value = -abs(value)
+                literal = match.group("number") if field == "change_pct" else match.group(1)
+                value = float(literal)
+                if field not in expected:
+                    errors.append({"field": field, "observed": value,
+                                   "error": "unsupported_snapshot_claim", "claim": match.group(0)})
+                    continue
+                direction = 0
+                if field == "change_pct":
+                    label = match.group("label")
+                    if label in {"日跌", "日跌幅", "日内跌幅", "当日跌幅"}:
+                        direction = -1
+                        value = -abs(value)
+                    elif label in {"日涨", "日涨幅", "日内涨幅", "当日涨幅"}:
+                        direction = 1
                 if field == "amount":
                     multiplier = {"亿": 1e8, "万": 1e4}.get(match.group(2), 1)
                     value *= multiplier
-                    valid = math.isclose(expected[field], value, rel_tol=1e-6,
-                                         abs_tol=0.0051 * multiplier)
+                    valid = _prose_matches(field, expected[field], value, literal, multiplier)
                     currency = match.group(3)
                 else:
-                    valid = _matches(field, expected[field], value)
+                    valid = _prose_matches(field, expected[field], value, literal)
                     currency = match.group(2) if field == "price" else None
+                if field == "change_pct" and direction:
+                    if direction * expected[field] < 0 or (direction > 0 and value < 0):
+                        valid = False
                 if currency:
                     currency = "HKD" if currency.lower() in {"港元", "港币", "hkd"} else "CNY"
                     if currency != expected.get("currency"):

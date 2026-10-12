@@ -126,6 +126,7 @@ MARKET_SCAN_REVIEW_SYSTEM_PROMPT = """
 
 输入 numeric_fact_contract 由程序生成：change_pct 单位是百分数的百分点，0.27972 表示0.27972%，绝不能乘100；price/amount单位依currency为CNY或HKD。
 每条review必须返回 numeric_facts，逐字段复述契约values（缺失值不得补造），并核对自己的facts、推断和风险描述没有数字或币种矛盾。
+values中未提供的PE/PB应省略；仅nullable_missing_fields列出的缺失PE/PB可回传null，绝不能填0或猜测数字。numeric_facts须保留原始数值精度；文字摘要可按实际显示位数舍入，可使用科学计数法，但不得改变方向、单位或币种。
 不得改写程序计算的观察买入区、止损和目标价。发现停牌、监管、财务造假、退市、
 重大数据质量问题或流动性无法执行时 hard_risk=true。缺少可靠Level-2时，不得把
 “主力抢筹、洗盘、诱多”写成事实。做T必须有分时、盘口、波动、胜率及扣费后正期望，
@@ -159,7 +160,7 @@ material_fundamental_or_event_risk、hard_risk、other 中选择。只有当唯�
 输出严格 JSON，必须为每个输入代码且仅输出一条 review；`facts`、`inferences`、
 `risks`、`invalidators` 各最多两条，`thesis` 和 `view` 各最多 120 个汉字：
 {"reviews":[{"code":"...","verdict":"pass|watch|reject","confidence":0到1,
-"hard_risk":false,"entry_timing_only":false,"numeric_facts":该候选numeric_fact_contract.values完整对象（包括已提供的pe/pb，不增加缺失字段）,
+"hard_risk":false,"entry_timing_only":false,"numeric_facts":该候选numeric_fact_contract.values完整对象（包括已提供的pe/pb，nullable_missing_fields仅可省略或填null）,
 "watch_reason_code":"passed|non_critical_data_gap|trend_or_entry_uncertain|risk_reward_insufficient|material_fundamental_or_event_risk|hard_risk|other",
 "thesis":"一句话审慎观点","risks":["..."],
 "invalidators":["..."],"facts":["..."],"inferences":["..."],"view":"..."}]}。
