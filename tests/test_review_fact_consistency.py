@@ -129,6 +129,12 @@ def test_nonfinite_or_wrong_scale_claims_fail_without_crashing(claim):
     assert validate_review_facts({'facts': [claim]}, CANDIDATE)
 
 
+@pytest.mark.parametrize('claim', ['成交额0e308港元', '当前价0e308港元', '日涨跌幅0e308%'])
+def test_coarse_zero_cannot_erase_nonzero_source_facts(claim):
+    assert validate_review_facts({'numeric_facts': numeric_facts(CANDIDATE), 'facts': [claim]},
+                                 CANDIDATE, require_echo=True)
+
+
 @pytest.mark.parametrize('label', ['qwen', 'deepseek'])
 def test_actual_review_batches_accept_neutral_scientific_and_nullable_contracts(monkeypatch, label):
     calls = []

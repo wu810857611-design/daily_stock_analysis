@@ -74,6 +74,10 @@ def _prose_matches(field: str, expected: float, observed: float, literal: str,
     """
     if not math.isfinite(observed):
         return False
+    # A coarse zero (e.g. 0e308) must not erase a nonzero source value.
+    # Retain the original small rounding allowance for literal zero.
+    if observed == 0:
+        return _matches(field, expected, observed)
     parts = literal.lower().split("e")
     decimals = len(parts[0].split(".")[1]) if "." in parts[0] else 0
     try:
