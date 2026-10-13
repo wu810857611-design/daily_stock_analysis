@@ -1,5 +1,10 @@
 name: 每日股票分析
 
+run-name: >-
+  close | mode=${{ inputs.mode || 'full' }} |
+  date=${{ inputs.trade_date || 'auto' }} |
+  source=${{ inputs.trigger_source || github.event_name }}
+
 on:
   # 定时触发（GitHub cron 使用 UTC）
   schedule:
@@ -24,6 +29,16 @@ on:
         required: false
         default: false
         type: boolean
+      trade_date:
+        description: '收盘归属日，空值自动解析原始run；不能覆盖日期安全窗口'
+        required: false
+        default: ''
+        type: string
+      trigger_source:
+        description: '触发来源，仅用于审计'
+        required: false
+        default: manual
+        type: string
 
 # 并发控制：同一时间只运行一个分析任务
 concurrency:
@@ -35,7 +50,57 @@ permissions:
   actions: read
 
 jobs:
+  close-admission:
+    runs-on: ubuntu-latest
+    environment: STOCK_LIST
+    timeout-minutes: 8
+    outputs:
+      should_run: ${{ steps.admit.outputs.should_run }}
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v5
+      - name: 设置轻量 Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: 安装轻量交易日依赖
+        if: github.event_name == 'schedule' || inputs.mode == 'full' || inputs.mode == 'stocks-only'
+        run: python -m pip install 'exchange-calendars>=4.13.0'
+      - name: 收盘归属日防重准入
+        id: admit
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED_MODE: ${{ inputs.mode || 'full' }}
+          REQUESTED_DATE: ${{ inputs.trade_date }}
+          EVENT_SCHEDULE: ${{ github.event.schedule }}
+          CLOSE_BUDGET: ${{ vars.ANALYSIS_TIMEOUT_MINUTES || '90' }}
+        run: |
+          set -euo pipefail
+          if [ "$REQUESTED_MODE" != "full" ] && [ "$REQUESTED_MODE" != "stocks-only" ]; then
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          mkdir -p data/daily_analysis
+          gh api --method GET "/repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+            > data/daily_analysis/admission_run.json
+          python3 scripts/close_run_guard.py \
+            --repo "$GITHUB_REPOSITORY" --ref "$GITHUB_REF_NAME" \
+            --event "$GITHUB_EVENT_NAME" --schedule "${EVENT_SCHEDULE:-}" \
+            --trade-date "${REQUESTED_DATE:-}" --budget-minutes "$CLOSE_BUDGET" \
+            --run-metadata data/daily_analysis/admission_run.json \
+            --output data/daily_analysis/close_admission.json --github-output "$GITHUB_OUTPUT"
+      - name: 上传收盘防重审计
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: close-admission-${{ github.run_number }}-${{ github.run_attempt }}
+          path: data/daily_analysis/
+          if-no-files-found: warn
+          retention-days: 30
   analyze:
+    needs: close-admission
+    if: needs.close-admission.outputs.should_run == 'true'
     runs-on: ubuntu-latest
     # 兼容误将 STOCK_LIST 配到同名 Environment variables 的场景；
     # 推荐位置仍是 Settings -> Secrets and variables -> Actions -> Repository variables。
@@ -194,6 +259,7 @@ jobs:
       - name: 执行股票分析
         env:
           GH_TOKEN: ${{ github.token }}
+          CLOSE_REQUESTED_DATE: ${{ inputs.trade_date }}
           CLOSE_EVENT_NAME: ${{ github.event_name }}
           CLOSE_EVENT_SCHEDULE: ${{ github.event.schedule }}
           # ==========================================
@@ -722,6 +788,7 @@ jobs:
             > data/daily_analysis/run_metadata.json
           python3 scripts/close_analysis_context.py \
             --event "$CLOSE_EVENT_NAME" --schedule "$CLOSE_EVENT_SCHEDULE" \
+            --trade-date "${CLOSE_REQUESTED_DATE:-}" \
             --run-metadata data/daily_analysis/run_metadata.json \
             --budget-minutes "$ANALYSIS_TIMEOUT_MINUTES" \
             --output data/daily_analysis/close_context.json
@@ -943,7 +1010,8 @@ jobs:
           fi
 
   close-scan-watchdog:
-    if: github.event_name == 'schedule' && github.event.schedule == '0 10 * * 1-5'
+    needs: close-admission
+    if: needs.close-admission.outputs.should_run == 'true' && ((github.event_name == 'schedule' && github.event.schedule == '0 10 * * 1-5') || (github.event_name == 'workflow_dispatch' && (inputs.mode == 'full' || inputs.mode == 'stocks-only')))
     runs-on: ubuntu-latest
     timeout-minutes: 120
     permissions:
@@ -964,7 +1032,8 @@ jobs:
       - name: 兜底检查19:27全市场扫描
         env:
           GH_TOKEN: ${{ github.token }}
-          CLOSE_EVENT_SCHEDULE: ${{ github.event.schedule }}
+          CLOSE_EVENT_SCHEDULE: ${{ github.event.schedule || '0 10 * * 1-5' }}
+          CLOSE_EVENT_NAME: ${{ github.event_name }}
         run: |
           gh api --method GET "/repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
             > close-watchdog-run.json
@@ -972,6 +1041,7 @@ jobs:
             --slot close \
             --close-run-metadata close-watchdog-run.json \
             --close-schedule "$CLOSE_EVENT_SCHEDULE" \
+            --close-event "$CLOSE_EVENT_NAME" \
             --repo "$GITHUB_REPOSITORY" \
             --ref "$GITHUB_REF_NAME" \
             --output close-scan-watchdog.json

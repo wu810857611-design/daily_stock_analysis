@@ -33,7 +33,7 @@ def close_open_markets(trade_date: str) -> set[str]:
 
 
 def resolve_close_context(*, event: str, schedule: str, created_at: str,
-                          now: datetime, budget_minutes: int) -> dict:
+                          now: datetime, budget_minutes: int, requested_date: str = "") -> dict:
     """Use original run creation + known cron, including for rerun attempts.
 
     GitHub can create a scheduled run after midnight, so its local creation
@@ -54,6 +54,8 @@ def resolve_close_context(*, event: str, schedule: str, created_at: str,
     target = anchor.date()
     if anchor.time() < CLOSE_TIME:
         target -= timedelta(days=1)
+    if requested_date and requested_date != "auto" and date.fromisoformat(requested_date) != target:
+        raise ValueError("requested close date does not match the original run's bounded slot")
     # No weekend/holiday rolling: a different close session is not this run.
     reference = close_reference_time(target.isoformat(), now=anchor)
     close_reference_time(target.isoformat(), now=observed)

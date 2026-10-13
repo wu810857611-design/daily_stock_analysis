@@ -16,6 +16,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--event", required=True)
     parser.add_argument("--schedule", default="")
+    parser.add_argument("--trade-date", default="")
     parser.add_argument("--run-metadata", required=True)
     parser.add_argument("--budget-minutes", type=int, required=True)
     parser.add_argument("--output", required=True)
@@ -25,6 +26,7 @@ def main(argv=None):
         context = resolve_close_context(
             event=args.event, schedule=args.schedule, created_at=metadata["created_at"],
             now=datetime.now(SHANGHAI), budget_minutes=args.budget_minutes,
+            requested_date=args.trade_date,
         )
         pools = priority_analysis_pools()
         primary = list(pools["P0_PRIMARY"])

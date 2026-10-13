@@ -711,6 +711,8 @@ def test_workflows_wire_two_layer_resilience_and_idempotency():
         "16 2 * * 1-5",
         "58 4 * * 1-5",
         "46 5 * * 1-5",
+        "8 10 * * 1-5",
+        "46 11 * * 1-5",
     }
     assert "intraday_supervisor.py" in supervisor_text
     assert "--workflow 01-intraday-session.yml" in supervisor_text
