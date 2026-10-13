@@ -31,6 +31,8 @@ SUPERVISOR_SCHEDULE_TO_SESSION = {
     "16 2 * * 1-5": "morning",
     "58 4 * * 1-5": "afternoon",
     "46 5 * * 1-5": "afternoon",
+    "8 10 * * 1-5": "close",
+    "46 11 * * 1-5": "close",
 }
 ACTIVE_RUN_STATUSES = {"queued", "in_progress", "waiting", "pending", "requested"}
 FAILED_CONCLUSIONS = {"failure", "cancelled", "timed_out", "action_required"}
@@ -43,7 +45,7 @@ def resolve_supervisor_session(*, event_name: str, event_schedule: str, requeste
         except KeyError as exc:
             raise ValueError(f"unsupported supervisor schedule: {event_schedule}") from exc
     requested = str(requested_session or "auto").strip().lower()
-    if requested in SESSION_WINDOWS:
+    if requested in {*SESSION_WINDOWS, "close"}:
         return requested
     if requested == "auto":
         return "morning" if now.hour < 12 else "afternoon"
@@ -143,17 +145,16 @@ class GitHubActionsClient:
     def dispatch(self, workflow: str, ref: str, *, session: str, trade_date: str) -> None:
         workflow_path = parse.quote(workflow, safe="")
         url = f"https://api.github.com/repos/{self.repo}/actions/workflows/" f"{workflow_path}/dispatches"
+        inputs = ({"mode": "full", "force_run": "false", "trade_date": trade_date,
+                   "trigger_source": "supervisor"} if session == "close" else {
+                    "session": session, "trade_date": trade_date,
+                    "trigger_source": "supervisor", "max_cycles": "0"})
         status, _body = self._call(
             "POST",
             url,
             {
                 "ref": ref,
-                "inputs": {
-                    "session": session,
-                    "trade_date": trade_date,
-                    "trigger_source": "supervisor",
-                    "max_cycles": "0",
-                },
+                "inputs": inputs,
             },
         )
         if status not in {201, 204}:
@@ -162,6 +163,10 @@ class GitHubActionsClient:
 
 def _base_result(*, now: datetime, session: str, calendar: Mapping[str, Any]) -> dict[str, Any]:
     trade_date = now.date().isoformat()
+    if session == "close":
+        return {"schema_version": 1, "observed_at": now.isoformat(timespec="seconds"),
+                "trade_date": trade_date, "session": session, "session_key": f"{trade_date}:close",
+                "status": "unknown", "alert_required": False, "alert_code": "", "error": ""}
     window = SESSION_WINDOWS[session]
     return {
         "schema_version": 1,
@@ -205,7 +210,11 @@ def evaluate_supervisor(
     ref: str,
     state: MutableMapping[str, Any],
     session_gate: Callable[[datetime], Mapping[str, Any]] = evaluate_market_sessions,
+    trade_date: str = "",
 ) -> dict[str, Any]:
+    if session == "close":
+        from src.services.close_scheduler import evaluate_close_supervisor
+        return evaluate_close_supervisor(now=now, client=client, ref=ref, state=state, trade_date=trade_date)
     observed = now.astimezone(SHANGHAI_TZ)
     calendar = dict(session_gate(observed))
     result = _base_result(now=observed, session=session, calendar=calendar)
@@ -362,10 +371,11 @@ def render_system_alert(result: Mapping[str, Any]) -> tuple[str, str]:
     session = str(result.get("session") or "unknown")
     trade_date = str(result.get("trade_date") or "unknown")
     code = str(result.get("alert_code") or result.get("status") or "unknown")
-    title = f"SYSTEM：盘中调度故障 - {trade_date} {session}"
+    label = "收盘" if session == "close" else "盘中"
+    title = f"SYSTEM：{label}调度故障 - {trade_date} {session}"
     content = "\n".join(
         [
-            "# 盘中调度故障",
+            f"# {label}调度故障",
             "",
             f"- 交易日：{trade_date}",
             f"- 时段：{session}",
@@ -547,6 +557,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--report", type=Path, default=Path("reports/intraday_supervisor.json"))
     parser.add_argument("--github-output", default="")
+    parser.add_argument("--run-metadata", type=Path)
     return parser
 
 
@@ -559,9 +570,30 @@ def main(argv: Sequence[str] | None = None) -> int:
         requested_session=args.session,
         now=now,
     )
+    if session == "close":
+        args.workflow = "00-daily-analysis.yml"
+    close_date = ""
+    context_error = ""
+    if session == "close" and args.event_name == "schedule":
+        from datetime import timedelta
+        from src.services.close_scheduler import run_time
+        from src.services.close_analysis_context import CLOSE_TIME
+        try:
+            if args.run_metadata is None:
+                raise ValueError("scheduled close supervisor requires original run metadata")
+            created = run_time(json.loads(args.run_metadata.read_text()).get("created_at"))
+            if created is None or created > now:
+                raise ValueError("invalid original close supervisor timestamp")
+            target = created.date() - timedelta(days=int(created.time() < CLOSE_TIME))
+            close_date = target.isoformat()
+        except (ValueError, OSError, TypeError) as exc:
+            context_error = f"{type(exc).__name__}: {exc}"
     token = str(os.getenv("GH_TOKEN") or "").strip()
     state = load_state(args.state)
-    if not token:
+    if context_error:
+        result = _fault(_base_result(now=now, session=session, calendar={}),
+                        "close_context_failed", context_error)
+    elif not token:
         calendar = dict(evaluate_market_sessions(now))
         result = _fault(
             _base_result(now=now, session=session, calendar=calendar),
@@ -577,6 +609,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             workflow=args.workflow,
             ref=args.ref,
             state=state,
+            trade_date=close_date,
         )
     current_alert_key = _alert_key(result) if result.get("alert_required") else ""
     pending_ok, pending_outcomes = retry_pending_alerts(

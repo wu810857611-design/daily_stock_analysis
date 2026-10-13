@@ -7,11 +7,14 @@
 ## 云端运行节奏
 
 - `00-daily-analysis.yml`：交易日北京时间 18:00 为收盘分析和模拟记账的计划触发时间，
-  目前入口只有 GitHub 原生 `schedule`，没有独立外部定时入口。GitHub 高负载时可能
-  延迟甚至丢弃定时任务，18:00 不代表实际启动或完成时间；验收须检查 Actions run
-  是否存在及其创建时间、实际提交、状态和产物。`03` 只保障盘中任务，`00` 内部的
-  收盘扫描 watchdog 也必须等 `00` 启动后才能工作，不能补救 `00` 自身漏触发。
-  这是收盘触发的现有限制，数值校验和收盘归属日修复不能视为已解除该限制。
+  支持 cron-job.org 外部 `workflow_dispatch`，保留 GitHub 原生 `schedule` 辅助兜底。
+  外部任务需在该服务实际保存并启用，合并代码本身不代表外部配置已完成。
+  GitHub 高负载时可能延迟甚至丢弃定时任务，18:00 不代表实际启动或完成时间。
+  两入口共享原有 `stock-analysis` 串行组；收盘准入在恢复数据库和分析前检查同归属日
+  已执行的任务，重复运行只上传审计，失败任务与rerun不能自动重做。GitHub API失败、
+  截断历史或日期不明时拒绝进入生产；显式`trade_date`只能核对原始run归属日，不能
+  覆盖时间窗。外部收盘也保留19:27收盘扫描兜底，重复入口不会重复产生扫描或记账。
+  验收须核对原始创建时间、实际提交、归属日、PRIMARY覆盖及产物，不能只看绿色状态。
   调度语义参见 [GitHub schedule 官方说明](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#schedule)。
 - `01-intraday-session.yml`：外部 cron-job.org 仍是主要精准触发源，在交易日
   北京时间 09:20 以 `workflow_dispatch` 触发 `session=morning`，12:50 触发
@@ -83,6 +86,31 @@ Longbridge 官方字段中的 `timestamp` 是“最新价格时间”而不是�
 行情。GitHub 任务摘要会明确标记“未执行”。触发迟到不能被解释为盘中监控成功；
 若需要有服务等级保证的实时监控，必须迁移到持久云端运行器或合法行情商的实时
 推送服务。
+
+### 收盘外部定时入口与缺跑告警
+
+沿用已配置盘中任务的cron-job.org账户、POST和既有GitHub鉴权，不在仓库或报告保存令牌。
+新增三项工作日任务，时区Asia/Shanghai；现有上午、下午四项无需修改：
+
+| 时间 | Actions工作流 | inputs |
+| --- | --- | --- |
+| 18:00 | `00-daily-analysis.yml` | `mode=full`、`force_run=false`、`trigger_source=cron_job_org` |
+| 18:08 | `03-intraday-supervisor.yml` | `session=close`、`trigger_source=cron_job_org_supervisor` |
+| 19:46 | `03-intraday-supervisor.yml` | `session=close`、`trigger_source=cron_job_org_supervisor` |
+
+三项请求的body均为`{"ref":"main","inputs":{...}}`，URL沿用GitHub工作流dispatch接口，
+仅替换工作流文件名。18:08检查原入口是否真实形成run；缺跑且未超过19:30时只补请求一次，
+固定携带归属日且不force。补请求同时发送真实SYSTEM缺跑通知，不能宣称分析已经完成。
+已有queued/running任务不再派发；失败或取消只告警，不重新分析。19:46检查完成、排队超时、
+运行超时和晚窗缺失；超过19:30不再补请求。两市场均休市时正常跳过，日历/API无法确认时
+告警并拒绝补跑。原生Supervisor增加同样两个检查时间，并按原始run创建时间处理跨午夜。
+告警复用现有Supervisor状态缓存/备份、去重和失败重试；不会发送测试PushPlus。
+
+外部任务启用服务自带的HTTP失败通知，可在GitHubdispatch接口拒绝请求时独立告警。
+如果GitHub接受请求但整个Actions执行平台停摆，托管在Actions中的Supervisor也可能不能
+及时执行；HTTP204只证明请求已接受。这一边界不能冒充端到端完成或实时告警保证。
+新收盘产物的生产验证仍必须检查全部开市PRIMARY的同日收盘价、分析与有效参考位覆盖。
+
 
 ## 决策规则
 
