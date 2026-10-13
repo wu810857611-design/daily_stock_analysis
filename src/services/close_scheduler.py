@@ -30,9 +30,6 @@ def close_runs(runs, trade_date):
         raise ValueError("close run history is truncated; cannot establish an earlier owner")
     matching = []
     for run in runs:
-        created = run_time(run.get("created_at"))
-        if created is None or not start <= created < end:
-            continue
         if run.get("event") not in {"schedule", "workflow_dispatch"}:
             continue
         title = str(run.get("display_title") or run.get("run_name") or "")
@@ -41,6 +38,11 @@ def close_runs(runs, trade_date):
         if mode and mode.group(1).strip() not in {"full", "stocks-only"}:
             continue
         if marked and marked.group(1).strip() not in {"", "auto", trade_date}:
+            continue
+        created = run_time(run.get("created_at"))
+        if created is None:
+            raise ValueError("invalid close run creation timestamp; cannot establish ownership")
+        if not start <= created < end:
             continue
         # A cancellation before a runner starts has not claimed an analysis.
         if run.get("conclusion") == "cancelled" and not run.get("run_started_at"):
@@ -58,7 +60,10 @@ def admit_close_run(*, context, current, runs):
         return {**result, "status": "market_closed"}
     # Execution order matters: an older-created native run may stay queued
     # while an external invocation actually completes first.
-    prior = [r for r in close_runs(runs, context["trade_date"])
+    matching = close_runs(runs, context["trade_date"])
+    if any(r.get("status") not in ACTIVE | {"completed"} for r in matching):
+        raise ValueError("unknown close run status; cannot establish ownership")
+    prior = [r for r in matching
              if int(r["id"]) != int(current["id"])
              and (r.get("status") == "completed" or r.get("status") == "in_progress")]
     prior.sort(key=lambda r: (str(r.get("run_started_at") or r.get("created_at") or ""), int(r["id"])))

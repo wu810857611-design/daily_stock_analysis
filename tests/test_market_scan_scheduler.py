@@ -775,8 +775,9 @@ def test_workflows_wire_active_watchdogs_and_slot_guard() -> None:
     close_watchdog = daily["jobs"]["close-scan-watchdog"]
     assert close_watchdog["permissions"]["actions"] == "write"
     assert close_watchdog["if"] == (
-        "github.event_name == 'schedule' && "
-        "github.event.schedule == '0 10 * * 1-5'"
+        "needs.close-admission.outputs.should_run == 'true' && "
+        "((github.event_name == 'schedule' && github.event.schedule == '0 10 * * 1-5') || "
+        "(github.event_name == 'workflow_dispatch' && (inputs.mode == 'full' || inputs.mode == 'stocks-only')))"
     )
 
 

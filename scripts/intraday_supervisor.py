@@ -581,7 +581,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         try:
             if args.run_metadata is None:
                 raise ValueError("scheduled close supervisor requires original run metadata")
-            created = run_time(json.loads(args.run_metadata.read_text()).get("created_at"))
+            metadata = json.loads(args.run_metadata.read_text())
+            if not isinstance(metadata, Mapping):
+                raise ValueError("close supervisor run metadata must be an object")
+            created = run_time(metadata.get("created_at"))
             if created is None or created > now:
                 raise ValueError("invalid original close supervisor timestamp")
             target = created.date() - timedelta(days=int(created.time() < CLOSE_TIME))

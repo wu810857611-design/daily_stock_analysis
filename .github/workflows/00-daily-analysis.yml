@@ -1011,7 +1011,7 @@ jobs:
 
   close-scan-watchdog:
     needs: close-admission
-    if: needs.close-admission.outputs.should_run == 'true' && (github.event_name == 'schedule' || inputs.mode == 'full' || inputs.mode == 'stocks-only')
+    if: needs.close-admission.outputs.should_run == 'true' && ((github.event_name == 'schedule' && github.event.schedule == '0 10 * * 1-5') || (github.event_name == 'workflow_dispatch' && (inputs.mode == 'full' || inputs.mode == 'stocks-only')))
     runs-on: ubuntu-latest
     timeout-minutes: 120
     permissions:
@@ -1033,6 +1033,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           CLOSE_EVENT_SCHEDULE: ${{ github.event.schedule || '0 10 * * 1-5' }}
+          CLOSE_EVENT_NAME: ${{ github.event_name }}
         run: |
           gh api --method GET "/repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
             > close-watchdog-run.json
@@ -1040,6 +1041,7 @@ jobs:
             --slot close \
             --close-run-metadata close-watchdog-run.json \
             --close-schedule "$CLOSE_EVENT_SCHEDULE" \
+            --close-event "$CLOSE_EVENT_NAME" \
             --repo "$GITHUB_REPOSITORY" \
             --ref "$GITHUB_REF_NAME" \
             --output close-scan-watchdog.json

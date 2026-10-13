@@ -491,6 +491,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--close-run-metadata", type=Path,
                         help="anchor the close watchdog to the original workflow run")
     parser.add_argument("--close-schedule", default="")
+    parser.add_argument("--close-event", default="schedule", choices=("schedule", "workflow_dispatch"))
     parser.add_argument("--sync-latest-path", type=Path)
     parser.add_argument("--sync-timeout-seconds", type=float, default=120.0)
     parser.add_argument("--sync-poll-seconds", type=float, default=10.0)
@@ -516,7 +517,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         from src.services.close_analysis_context import resolve_close_context
         metadata = json.loads(args.close_run_metadata.read_text(encoding="utf-8"))
         context = resolve_close_context(
-            event="schedule", schedule=args.close_schedule, created_at=metadata["created_at"],
+            event=args.close_event, schedule=args.close_schedule, created_at=metadata["created_at"],
             now=datetime.now(SHANGHAI_TZ), budget_minutes=1,
         )
         session_date = date.fromisoformat(context["trade_date"])

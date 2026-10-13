@@ -126,8 +126,17 @@ def test_dates_modes_and_midnight_are_matched_without_next_day_rollover():
             run(3, display_title="close | mode=market-only | date=auto"),
             run(4, display_title="close | mode=full | date=2026-10-13"),
             run(5, created_at="2026-10-13T01:00:00Z"),
-            run(6, event="push"), run(7, created_at="not-a-date")]
+            run(6, event="push")]
     assert [r["id"] for r in close_runs(rows, "2026-10-12")] == [1, 2]
+
+
+def test_uncertain_creation_or_run_status_fails_closed_instead_of_claiming():
+    context = {"trade_date": "2026-10-12", "open_markets": ["hk"]}
+    with pytest.raises(ValueError, match="creation timestamp"):
+        admit_close_run(context=context, current=run(2), runs=[run(created_at="not-a-date")])
+    with pytest.raises(ValueError, match="unknown close run status"):
+        admit_close_run(context=context, current=run(2), runs=[run(status="unrecognised")])
+    assert evaluate(Client([run(created_at="not-a-date")]))["alert_code"] == "github_api_failed"
 
 
 def test_later_created_external_owner_blocks_an_older_created_delayed_native_run():
@@ -198,10 +207,11 @@ def test_close_dispatch_http_payload_cannot_force_or_dispatch_intraday():
     assert payload == {"ref": "main", "inputs": {"mode": "full", "force_run": "false", "trade_date": "2026-10-12", "trigger_source": "supervisor"}}
 
 
-@pytest.mark.parametrize("valid", [True, False])
-def test_actual_supervisor_cli_keeps_midnight_day_or_alerts_invalid_metadata(tmp_path, monkeypatch, valid):
+@pytest.mark.parametrize("payload", [{"created_at": "2026-10-12T19:35:00Z"}, {}, [], "invalid"])
+def test_actual_supervisor_cli_keeps_midnight_day_or_alerts_invalid_metadata(tmp_path, monkeypatch, payload):
     metadata = tmp_path / "metadata.json"
-    metadata.write_text(json.dumps({"created_at": "2026-10-12T19:35:00Z"} if valid else {}))
+    valid = isinstance(payload, dict) and bool(payload.get("created_at"))
+    metadata.write_text(json.dumps(payload))
     state, report = tmp_path / "state.json", tmp_path / "report.json"
     client = Client([run(conclusion="failure")])
     monkeypatch.setenv("GH_TOKEN", "offline-placeholder")
