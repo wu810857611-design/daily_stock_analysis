@@ -15,7 +15,7 @@ from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
 from src.services.research_execution import ResearchCallError, run_isolated
-from src.services.research_evidence import announcement_excerpt, recent_valuation
+from src.services.research_evidence import announcement_document_url, announcement_excerpt, recent_valuation
 
 
 def meaningful(value: Any) -> bool:
@@ -268,7 +268,8 @@ class ScanResearchCollector:
             # body is inaccessible, and never claim an excerpt is full review.
             for item in announcements["items"][:1]:
                 try:
-                    document = cached_call(budget, lambda: announcement_excerpt(item["url"], code,
+                    document_url = announcement_document_url(item["url"], code, item["published_date"])
+                    document = cached_call(budget, lambda: announcement_excerpt(document_url, code,
                                              str(candidate.get("name") or "")), f"official_document:{item['url']}:{code}")
                     item.update(document)
                     item["fetched_at"] = next((e.get("fetched_at", "") for e in reversed(events)
