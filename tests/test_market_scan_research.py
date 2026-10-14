@@ -278,6 +278,29 @@ def test_official_body_excerpt_does_not_claim_full_review(configured, monkeypatc
     assert "announcement_body" not in result["missing_fields"]
 
 
+def test_collector_passes_verified_index_as_https_pdf_and_keeps_both_sources(configured, monkeypatch):
+    ak, _ = configured
+    date = datetime.now().strftime("%Y-%m-%d")
+    index = ("http://www.cninfo.com.cn/new/disclosure/detail?stockCode=603259"
+             f"&announcementId=1225599531&orgId=fixture&announcementTime={date}")
+    expected = f"https://static.cninfo.com.cn/finalpage/{date}/1225599531.PDF"
+    monkeypatch.setattr(ak, "stock_zh_a_disclosure_report_cninfo", lambda **kwargs: pd.DataFrame([{
+        "代码": "603259", "公告标题": "药明康德公告", "公告时间": date, "公告链接": index,
+    }]))
+    def excerpt(url, code, name):
+        assert url == expected and code == "603259" and name == "药明康德"
+        return {"document_source": url, "excerpt": "药明康德公告摘录",
+                "body_excerpt_available": True, "content_reviewed": False}
+    monkeypatch.setattr("src.services.market_scan_research.announcement_excerpt", excerpt)
+    result = ScanResearchCollector(2)(CANDIDATE)
+    item = result["announcements"]["items"][0]
+    assert item["url"] == index and item["document_source"] == expected
+    assert result["announcements"]["body_excerpt_count"] == 1
+    assert result["announcements"]["content_reviewed"] is False
+    assert "announcement_body" not in result["missing_fields"]
+    assert result["status"] == "partial"
+
+
 def test_successful_cache_retains_fetch_time_and_expires(configured):
     collector = ScanResearchCollector(2)
     collector(CANDIDATE)
