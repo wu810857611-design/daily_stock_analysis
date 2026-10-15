@@ -134,6 +134,14 @@ def test_searxng_hanging_instance_does_not_block_next_instance(configured, monke
 
 def test_bounded_searxng_discovery_retains_actual_cache_time(configured, monkeypatch):
     _, service = configured
+    # This checks cache provenance, not deadline exhaustion. Leave enough time
+    # for the real fork boundary on a busy runner; production budgets are not
+    # changed, and timeout/fallback behavior has separate regressions.
+    from src.config import get_config
+    config = get_config()
+    config.fundamental_stage_timeout_seconds = 2.0
+    config.fundamental_fetch_timeout_seconds = 0.5
+    monkeypatch.setattr("src.config.get_config", lambda: config)
     provider = SearXNGSearchProvider(use_public_instances=True)
     saved_at = time.time() - 4000
     def discover(cls):
