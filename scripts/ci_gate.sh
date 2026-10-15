@@ -25,8 +25,9 @@ offline_test_suite() {
   echo "==> backend-gate: offline test suite"
   # A healthy full suite completes in minutes.  Bound it so a deadlocked test
   # cannot leave a PR permanently in progress, and keep the last started test
-  # visible in completed CI logs for diagnosis.
-  timeout 900 python -m pytest -vv -m "not network"
+  # visible in completed CI logs for diagnosis. TERM alone can leave timeout
+  # waiting on a deadlocked process; force cleanup and emit per-test stacks.
+  timeout --kill-after=30s 900 python -m pytest -vv -o faulthandler_timeout=120 -m "not network"
 }
 
 run_all() {
