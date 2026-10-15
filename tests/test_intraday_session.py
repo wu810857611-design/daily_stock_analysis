@@ -2896,6 +2896,53 @@ class StateMachineTests(unittest.TestCase):
 
 
 class PushOutcomeTests(unittest.TestCase):
+    def test_numeric_research_quality_reaches_entry_cash_gate_without_changing_gates(self):
+        now = datetime(2026, 10, 15, 9, 30, 57, tzinfo=TZ)
+        candidate = {
+            "scope": "simulation", "symbol": "HK00883", "name": "中国海洋石油",
+            "entry_low": 24.3063, "entry_high": 24.6166, "plan_price": 24.4614,
+            "stop_loss": 23.625, "target_price": 26.3852,
+            "confidence": 0.72, "data_quality": 0.85,
+            "expected_holding_days": 20, "position_state": "flat",
+            "market_costs": {"entry_fee_bps": 10, "entry_slippage_bps": 15,
+                             "exit_fee_bps": 10, "exit_slippage_bps": 15},
+        }
+        state = intraday_session_module._empty_state(now)
+        shadow = synthetic_shadow_state()
+        def enqueue(at, *, stale=False, plan=None):
+            return enqueue_adaptive_plan_reviews(
+                state, now=at, quotes=[quote("HK00883", 24.58, -0.5663, at, stale=stale)],
+                candidates=[plan or candidate], confidence_multipliers={"HK00883": 0.75},
+            )
+        self.assertEqual(enqueue(now, stale=True), 0)
+        self.assertEqual(enqueue(now, plan={**candidate, "data_quality": 0.1}), 0)
+        self.assertEqual(enqueue(now), 1)
+        event = state["event_ledger"][-1]
+        self.assertEqual(event["payload"]["data_quality"], "fresh_l1")
+        self.assertEqual(event["payload"]["research_data_quality"], 0.85)
+        self.assertEqual(event["payload"]["confidence"], 0.54)
+        self.assertEqual(process_actionable_decisions(
+            state, now=now, raw_events=[event], levels={}, shadow_state=shadow,
+            signal_recorder=record_shadow_signal), 0)
+        self.assertEqual(event["decision_result"], "no_operation_insufficient_cash_for_explicit_buy")
+        self.assertEqual(state["outbox"], [])
+        self.assertEqual(enqueue(now + timedelta(minutes=1)), 0)
+
+        # Reproduce a persisted event from the old producer: it was blocked,
+        # never sized or delivered, but its active dedupe state survived.
+        event["payload"]["data_quality"] = 0.85
+        event["decision_result"] = "no_operation_unreliable_data"
+        self.assertEqual(enqueue(now + timedelta(minutes=2), stale=True), 0)
+        self.assertEqual(enqueue(now + timedelta(minutes=2)), 1)
+        replacement = state["event_ledger"][-1]
+        self.assertEqual(replacement["payload"]["plan_fingerprint"], event["payload"]["plan_fingerprint"])
+        self.assertEqual(replacement["payload"]["data_quality"], "fresh_l1")
+        self.assertEqual(enqueue(now + timedelta(minutes=3)), 0)
+        replacement["payload"]["data_quality"] = 0.85
+        replacement["decision_result"] = "no_operation_unreliable_data"
+        replacement["decision_event_id"] = "already-decided-must-not-replay"
+        self.assertEqual(enqueue(now + timedelta(minutes=4)), 0)
+
     @staticmethod
     def _decision_event(now, *, action_code):
         return {

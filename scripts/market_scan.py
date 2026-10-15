@@ -102,6 +102,7 @@ def _parse_enabled_markets(value: str) -> tuple[str, ...]:
 
 
 from src.services.review_fact_consistency import fact_contract, validate_review_facts
+from src.services.research_execution import ResearchCallError, run_isolated
 
 
 MARKET_SCAN_REVIEW_SYSTEM_PROMPT = """
@@ -354,6 +355,40 @@ def _review_error_record(exc: Exception) -> Dict[str, Any]:
     return record
 
 
+def _isolated_review_request(callback: Callable[[], Mapping[str, Any]], timeout: float) -> Mapping[str, Any]:
+    """Enforce the SDK's per-request wall clock and transport only safe results.
+
+    A socket/read timeout alone can be bypassed by a hanging SDK or a response
+    that keeps yielding bytes. Reuse the research worker's kill/reap boundary;
+    retain the review timeout rather than the research-only four-second cap.
+    """
+    def execute() -> tuple[bool, Any]:
+        try:
+            return True, callback()
+        except Exception as exc:
+            return False, _review_error_record(exc)
+
+    try:
+        ok, value = run_isolated(execute, timeout, network_timeout_seconds=timeout)
+    except ResearchCallError as exc:
+        timed_out = exc.error_class == "TimeoutError"
+        raise ReviewProviderError(
+            "provider_timeout" if timed_out else "provider_isolation_failed",
+            retryable=timed_out, provider_error_type=exc.error_class,
+        ) from None
+    if ok:
+        return value
+    if value["error"] == "ReviewResponseError":
+        details = {key: item for key, item in value.items()
+                   if key not in {"error", "error_code", "retryable"}}
+        raise ReviewResponseError(value["error_code"], **details)
+    raise ReviewProviderError(
+        value["error_code"], retryable=value["retryable"],
+        status_code=value.get("status_code"),
+        provider_error_type=value.get("provider_error_type", value["error"]),
+    )
+
+
 def build_litellm_reviewer(label: str) -> Optional[Callable[[Sequence[Mapping[str, Any]]], Any]]:
     """Review bounded batches with classified, same-channel recovery."""
 
@@ -521,15 +556,19 @@ def build_litellm_reviewer(label: str) -> Optional[Callable[[Sequence[Mapping[st
                         "model_role": "primary" if model_index == 0 else "fallback",
                         "candidate_count": len(batch),
                         "status": "running",
+                        "timeout_seconds": round(min(REVIEW_REQUEST_TIMEOUT_SECONDS, remaining), 3),
                     }
                     diagnostics["requests"].append(record)
                     batch_summary["attempt_count"] = batch_attempt
+                    request_started = time.monotonic()
                     try:
-                        payload = request_batch(
-                            batch, min(REVIEW_REQUEST_TIMEOUT_SECONDS, remaining), model
+                        request_timeout = min(REVIEW_REQUEST_TIMEOUT_SECONDS, remaining)
+                        payload = _isolated_review_request(
+                            lambda: request_batch(batch, request_timeout, model), request_timeout
                         )
                     except Exception as exc:  # noqa: BLE001 - bounded and classified.
                         last_error = exc
+                        record["elapsed_seconds"] = round(time.monotonic() - request_started, 3)
                         record.update(status="failed", **_review_error_record(exc))
                         batch_summary.setdefault("failure_codes", []).append(
                             record["error_code"]
@@ -549,6 +588,8 @@ def build_litellm_reviewer(label: str) -> Optional[Callable[[Sequence[Mapping[st
                             ) from exc
                         time.sleep(REVIEW_RETRY_BACKOFF_SECONDS)
                         continue
+                    finally:
+                        record.setdefault("elapsed_seconds", round(time.monotonic() - request_started, 3))
                     # A late response never becomes a usable review, even if the
                     # SDK exceeded its request timeout before returning.
                     if time.monotonic() >= deadline:

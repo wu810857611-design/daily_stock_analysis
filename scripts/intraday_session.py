@@ -2749,7 +2749,20 @@ def enqueue_adaptive_plan_reviews(
             and entry_state.get("status") == "active"
             and entry_state.get("fingerprint") == fingerprint
         ):
-            continue
+            previous_event = next((
+                event for event in reversed(state.get("event_ledger", []))
+                if event.get("event_id") == entry_state.get("event_id")
+            ), {})
+            old_quality = (previous_event.get("payload") or {}).get("data_quality")
+            if (previous_event.get("decision_result") == "no_operation_unreliable_data"
+                    and isinstance(old_quality, (int, float)) and not isinstance(old_quality, bool)
+                    and not previous_event.get("decision_event_id")):
+                # A numeric research score was formerly mistaken for quote
+                # quality. Re-evaluate only after the current plan and fresh
+                # quote passed the original gates above; keep the same plan ID.
+                entry_state.update(status="cleared", cleared_at=_iso(now))
+            else:
+                continue
 
         policy_state = symbol_state.setdefault(
             "adaptive_policy",
@@ -2827,7 +2840,10 @@ def enqueue_adaptive_plan_reviews(
             payload={
                 "signal_time": _iso(now),
                 "quote_time": quote.provider_timestamp,
-                "data_quality": payload.get("data_quality"),
+                # _candidate_plan_payload already required a fresh timestamped
+                # L1 quote and evaluated the research score independently.
+                "data_quality": "fresh_l1",
+                "research_data_quality": payload.get("data_quality"),
                 "source": quote.source,
                 "market": payload.get("market"),
                 "entry_low": payload.get("_entry_low"),

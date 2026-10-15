@@ -89,10 +89,11 @@ def test_hanging_news_provider_advances_to_next_with_existing_news_filters(confi
     # exhaustion has its own test; production settings are unchanged.
     from src.config import get_config
     config = get_config()
-    config.fundamental_stage_timeout_seconds = 1.0
+    config.fundamental_stage_timeout_seconds = 3.0
+    config.fundamental_fetch_timeout_seconds = 0.5
     monkeypatch.setattr("src.config.get_config", lambda: config)
     service._providers = [Provider("Hung", hanging), Provider("EmptySuccess", no_news)]
-    result = ScanResearchCollector(2)(CANDIDATE)
+    result = ScanResearchCollector(5)(CANDIDATE)
     assert result["announcements_and_news"]["status"] == "no_results"
     assert not any(error == "news:provider_error" for error in result["errors"])
     assert any(event["provider"] == "Hung" and event["error_class"] == "TimeoutError" for event in result["diagnostics"])
@@ -115,7 +116,8 @@ def test_searxng_hanging_instance_does_not_block_next_instance(configured, monke
     # separately; this fixture does not change production timeout settings.
     from src.config import get_config
     config = get_config()
-    config.fundamental_stage_timeout_seconds = 1.0
+    config.fundamental_stage_timeout_seconds = 3.0
+    config.fundamental_fetch_timeout_seconds = 0.5
     monkeypatch.setattr("src.config.get_config", lambda: config)
     provider = SearXNGSearchProvider(["https://hung.invalid", "https://working.invalid"])
     def instance(query, base_url, *args, **kwargs):
@@ -124,7 +126,7 @@ def test_searxng_hanging_instance_does_not_block_next_instance(configured, monke
         return no_news()
     monkeypatch.setattr(provider, "_do_search", instance)
     service._providers = [provider]
-    result = ScanResearchCollector(2)(CANDIDATE)
+    result = ScanResearchCollector(5)(CANDIDATE)
     assert result["announcements_and_news"]["status"] == "no_results"
     assert any(e["provider"] == "SearXNG:hung.invalid" and e["error_class"] == "TimeoutError"
                for e in result["diagnostics"])
@@ -134,6 +136,14 @@ def test_searxng_hanging_instance_does_not_block_next_instance(configured, monke
 
 def test_bounded_searxng_discovery_retains_actual_cache_time(configured, monkeypatch):
     _, service = configured
+    # This checks cache provenance, not deadline exhaustion. Leave enough time
+    # for the real fork boundary on a busy runner; production budgets are not
+    # changed, and timeout/fallback behavior has separate regressions.
+    from src.config import get_config
+    config = get_config()
+    config.fundamental_stage_timeout_seconds = 2.0
+    config.fundamental_fetch_timeout_seconds = 0.5
+    monkeypatch.setattr("src.config.get_config", lambda: config)
     provider = SearXNGSearchProvider(use_public_instances=True)
     saved_at = time.time() - 4000
     def discover(cls):
