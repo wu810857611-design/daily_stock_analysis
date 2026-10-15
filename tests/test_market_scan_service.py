@@ -2139,6 +2139,9 @@ def test_market_scan_workflow_is_independent_simulation_with_fixed_state_artifac
 def test_structured_reviewers_disable_thinking_and_avoid_json_truncation(
     monkeypatch: Any,
 ) -> None:
+    # This test inspects request policy in the parent; real worker deadlines
+    # and SDK hangs are exercised separately in test_market_scan_review_deadline.
+    monkeypatch.setattr(market_scan, "run_isolated", lambda callback, *_a, **_k: callback())
     calls: list[Dict[str, Any]] = []
 
     def fake_completion(**kwargs: Any) -> Any:
@@ -2274,6 +2277,9 @@ def test_reviewer_smoke_is_isolated_from_scan_state_and_notifications(
 
 
 def _install_review_completion(monkeypatch: Any, completion: Any) -> None:
+    # Retry-policy unit tests deliberately keep their scripted SDK counters in
+    # this process. Dedicated tests run the actual kill/reap boundary.
+    monkeypatch.setattr(market_scan, "run_isolated", lambda callback, *_a, **_k: callback())
     monkeypatch.setitem(sys.modules, "litellm", SimpleNamespace(completion=completion))
     monkeypatch.setenv("MARKET_SCAN_QWEN_MODEL", "test-qwen")
     monkeypatch.setenv("LLM_DASHSCOPE_API_KEY", "offline-qwen-secret")

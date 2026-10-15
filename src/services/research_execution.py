@@ -23,18 +23,20 @@ class ResearchCallError(RuntimeError):
         super().__init__(f"{error_class}: {detail}"[:500])
 
 
-def _execute(callback: Callable[[], Any], path: str, budget: float) -> None:
+def _execute(callback: Callable[[], Any], path: str, budget: float,
+             network_timeout: float | None) -> None:
     os.setsid()
     # Request defaults live only in this disposable process. SDKs that bypass
     # requests are still subject to the parent process's total deadline.
-    socket.setdefaulttimeout(min(4.0, budget))
+    read_limit = min(4.0 if network_timeout is None else network_timeout, budget)
+    socket.setdefaulttimeout(read_limit)
     import requests
 
     original_request = requests.sessions.Session.request
 
     def bounded_request(self: Any, *args: Any, **kwargs: Any) -> Any:
         configured = kwargs.get("timeout")
-        limits = (min(3.0, budget), min(4.0, budget))
+        limits = (min(3.0, budget) if network_timeout is None else read_limit, read_limit)
         if isinstance(configured, (int, float)):
             limits = tuple(min(item, configured) for item in limits)
         elif isinstance(configured, tuple) and len(configured) == 2:
@@ -54,13 +56,14 @@ def _execute(callback: Callable[[], Any], path: str, budget: float) -> None:
     Path(path).write_bytes(serialized)
 
 
-def run_isolated(callback: Callable[[], Any], timeout_seconds: float) -> Any:
+def run_isolated(callback: Callable[[], Any], timeout_seconds: float, *,
+                 network_timeout_seconds: float | None = None) -> Any:
     """Finish, kill and reap one provider call within its total deadline.
 
     A small result file avoids pipe send/receive deadlocks for DataFrames.
     Only this process's own, locally written pickle is ever deserialized.
     """
-    if timeout_seconds <= 0:
+    if timeout_seconds <= 0 or (network_timeout_seconds is not None and network_timeout_seconds <= 0):
         raise ResearchCallError("BudgetExhausted")
     if "fork" not in multiprocessing.get_all_start_methods():
         raise ResearchCallError("IsolationUnsupported")
@@ -68,7 +71,7 @@ def run_isolated(callback: Callable[[], Any], timeout_seconds: float) -> Any:
     with tempfile.TemporaryDirectory(prefix="scan-research-") as directory:
         path = str(Path(directory) / "result")
         process = multiprocessing.get_context("fork").Process(
-            target=_execute, args=(callback, path, timeout_seconds), daemon=False,
+            target=_execute, args=(callback, path, timeout_seconds, network_timeout_seconds), daemon=False,
         )
         try:
             process.start()

@@ -13,6 +13,14 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 
 
+class AnnouncementEvidenceError(ValueError):
+    """Stable, public guard reason retained across the isolated worker."""
+
+    def __init__(self, reason: str) -> None:
+        self.error_class = reason
+        super().__init__(reason)
+
+
 def recent_valuation(frame: Any, now: datetime, max_age_days: int, fields: dict[str, str]) -> dict:
     if not isinstance(frame, pd.DataFrame) or frame.empty:
         return {}
@@ -52,23 +60,26 @@ def announcement_document_url(url: str, code: str, published_date: str) -> str:
     if (parsed.scheme not in {"http", "https"} or parsed.username or parsed.password
             or parsed.port not in (None, 80 if parsed.scheme == "http" else 443)
             or parsed.fragment):
-        raise ValueError("untrusted_announcement_index")
+        raise AnnouncementEvidenceError("untrusted_announcement_index")
     query = parse_qs(parsed.query, keep_blank_values=True)
     if any(len(query.get(key, [])) != 1 for key in ("stockCode", "announcementId", "announcementTime")):
-        raise ValueError("invalid_announcement_index_parameters")
+        raise AnnouncementEvidenceError("invalid_announcement_index_parameters")
     identity = code[2:] if code.startswith("HK") else code
     announcement_id = query["announcementId"][0]
     date_text = query["announcementTime"][0]
     if query["stockCode"][0] != identity or not re.fullmatch(r"[0-9]{1,20}", announcement_id):
-        raise ValueError("announcement_index_identity_mismatch")
+        raise AnnouncementEvidenceError("announcement_index_identity_mismatch")
     if not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}(?: [0-9]{2}:[0-9]{2}:[0-9]{2})?", date_text):
-        raise ValueError("invalid_announcement_index_date")
-    document_date = datetime.fromisoformat(date_text).date()
-    published = datetime.fromisoformat(published_date)
+        raise AnnouncementEvidenceError("invalid_announcement_index_date")
+    try:
+        document_date = datetime.fromisoformat(date_text).date()
+        published = datetime.fromisoformat(published_date)
+    except ValueError:
+        raise AnnouncementEvidenceError("invalid_announcement_index_date") from None
     if published.tzinfo is not None:
         published = published.astimezone(ZoneInfo("Asia/Shanghai"))
     if document_date != published.date():
-        raise ValueError("announcement_index_date_mismatch")
+        raise AnnouncementEvidenceError("announcement_index_date_mismatch")
     return f"https://static.cninfo.com.cn/finalpage/{document_date.isoformat()}/{announcement_id}.PDF"
 
 
@@ -85,24 +96,24 @@ def announcement_excerpt(url: str, code: str, name: str) -> dict:
     if parsed.scheme != "https" or parsed.hostname not in {
         "static.cninfo.com.cn", "www.cninfo.com.cn", "www.hkexnews.hk"
     } or parsed.username or parsed.password or parsed.port not in (None, 443):
-        raise ValueError("untrusted_announcement_document")
+        raise AnnouncementEvidenceError("untrusted_announcement_document")
     with requests.get(url, stream=True, timeout=(1.5, 2), allow_redirects=False) as response:
         response.raise_for_status()
         if response.status_code != 200:
-            raise ValueError("announcement_redirect_or_non_document")
+            raise AnnouncementEvidenceError("announcement_redirect_or_non_document")
         data = bytearray()
         for chunk in response.iter_content(32768):
             data.extend(chunk)
             if len(data) > 2 * 1024 * 1024:
-                raise ValueError("announcement_document_too_large")
+                raise AnnouncementEvidenceError("announcement_document_too_large")
         if not data.startswith(b"%PDF"):
-            raise ValueError("announcement_not_pdf")
+            raise AnnouncementEvidenceError("announcement_not_pdf")
     reader = PdfReader(io.BytesIO(data))
     text = "\n".join((page.extract_text() or "")[:10000] for page in islice(reader.pages, 3))
     compact = "".join(text.split())
     identity = code[2:] if code.startswith("HK") else code
     if len(compact) < 80 or not (identity in compact or (name and name in compact)):
-        raise ValueError("announcement_document_identity_or_text_missing")
+        raise AnnouncementEvidenceError("announcement_document_identity_or_text_missing")
     return {"excerpt": text[:2000], "document_source": url,
             "extraction": "official_pdf_first_three_pages", "document_bytes": len(data),
             "content_reviewed": False, "body_excerpt_available": True}

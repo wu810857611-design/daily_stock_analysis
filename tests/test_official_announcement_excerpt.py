@@ -101,3 +101,15 @@ def test_document_identity_required_and_excerpt_is_partial(monkeypatch):
     assert result["body_excerpt_available"] and result["content_reviewed"] is False
     with pytest.raises(ValueError, match="identity"):
         announcement_excerpt("https://static.cninfo.com.cn/a.pdf", "600000", "浦发银行")
+
+
+@pytest.mark.parametrize("data,reason", [
+    (b"<html>not a document</html>", "announcement_not_pdf"),
+    (b"%PDF" + b"x" * (2 * 1024 * 1024), "announcement_document_too_large"),
+])
+def test_isolated_document_failure_keeps_exact_public_guard_reason(monkeypatch, data, reason):
+    from src.services.research_execution import ResearchCallError, run_isolated
+    monkeypatch.setattr("requests.get", lambda *args, **kwargs: Response(data))
+    with pytest.raises(ResearchCallError) as caught:
+        run_isolated(lambda: announcement_excerpt("https://static.cninfo.com.cn/a.pdf", "601857", "中国石油"), 1)
+    assert caught.value.error_class == reason
