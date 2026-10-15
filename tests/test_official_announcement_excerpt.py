@@ -106,7 +106,7 @@ def test_document_identity_required_and_excerpt_is_partial(monkeypatch):
 @pytest.mark.parametrize("data,reason", [
     (b"<html>not a document</html>", "announcement_not_pdf"),
     (b"%PDF" + b"x" * (2 * 1024 * 1024), "announcement_document_too_large"),
-])
+], ids=["non_pdf", "oversized_pdf"])
 def test_isolated_document_failure_keeps_exact_public_guard_reason(monkeypatch, data, reason):
     from src.services.research_execution import ResearchCallError, run_isolated
     monkeypatch.setattr("requests.get", lambda *args, **kwargs: Response(data))
