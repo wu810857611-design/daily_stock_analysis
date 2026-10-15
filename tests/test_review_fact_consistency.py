@@ -137,6 +137,9 @@ def test_coarse_zero_cannot_erase_nonzero_source_facts(claim):
 
 @pytest.mark.parametrize('label', ['qwen', 'deepseek'])
 def test_actual_review_batches_accept_neutral_scientific_and_nullable_contracts(monkeypatch, label):
+    # Keep scripted SDK counters in-process; the actual isolated numeric-error
+    # transport and recovery are covered by test_market_scan_review_deadline.
+    monkeypatch.setattr('scripts.market_scan.run_isolated', lambda callback, *_a, **_k: callback())
     calls = []
     monkeypatch.setenv('MARKET_SCAN_QWEN_MODEL', 'fixture')
     monkeypatch.setenv('MARKET_SCAN_DEEPSEEK_MODEL', 'fixture')
@@ -165,6 +168,7 @@ def test_actual_review_batches_accept_neutral_scientific_and_nullable_contracts(
 
 @pytest.mark.parametrize('recovers', [True, False])
 def test_numeric_misread_retries_within_existing_budget(monkeypatch, recovers):
+    monkeypatch.setattr('scripts.market_scan.run_isolated', lambda callback, *_a, **_k: callback())
     calls = []
     monkeypatch.setenv('MARKET_SCAN_QWEN_MODEL', 'fixture')
     monkeypatch.setenv('LLM_DASHSCOPE_API_KEY', 'offline-fixture')

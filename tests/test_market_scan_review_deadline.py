@@ -99,3 +99,31 @@ def test_review_network_cap_is_not_replaced_by_research_four_second_default(monk
     assert run_isolated(lambda: requests.get("https://offline.invalid"), 10) == (3, 4)
     assert run_isolated(lambda: requests.get("https://offline.invalid"), 10,
                         network_timeout_seconds=8) == (8, 8)
+
+
+@pytest.mark.parametrize("recovers", [True, False])
+def test_real_worker_preserves_numeric_rejection_and_retries_without_relaxing_validation(monkeypatch, tmp_path, recovers):
+    calls = tmp_path / "numeric_attempts"
+    def completion(**kwargs):
+        count = int(calls.read_text()) + 1 if calls.exists() else 1
+        calls.write_text(str(count))
+        batch = json.loads(kwargs["messages"][1]["content"])["candidates"]
+        item = batch[0]
+        return {"choices": [{"finish_reason": "stop", "message": {"content": json.dumps({
+            "reviews": [{"code": item["code"], "verdict": "pass",
+                         "numeric_facts": item["numeric_fact_contract"]["values"],
+                         "facts": ["日涨0.28%" if recovers and count > 1 else "日涨27.97%"]}],
+        })}}]}
+    configure(monkeypatch, completion)
+    reviewer = market_scan.build_litellm_reviewer("deepseek")
+    candidate = {"code": "HK01548", "price": 43.02, "change_pct": 0.27972, "amount": 1649000000}
+    if recovers:
+        assert reviewer([candidate])["reviews"][0]["facts"] == ["日涨0.28%"]
+        assert calls.read_text() == "2"
+    else:
+        with pytest.raises(ValueError, match="response_numeric_fact_mismatch"):
+            reviewer([candidate])
+        assert reviewer.diagnostics["completed_candidate_count"] == 0
+    error = reviewer.diagnostics["requests"][0]["numeric_errors"]["HK01548"][0]
+    assert error["field"] == "change_pct" and error["expected"] == 0.27972
+    assert not multiprocessing.active_children()
