@@ -41,12 +41,13 @@ class ResearchBudget:
         self.retry_max = min(2, max(1, retry_max))
         self.request_timeout = max(0.001, request_timeout)
 
-    def call(self, callback: Callable[[], Any], provider: str) -> Any:
+    def call(self, callback: Callable[[], Any], provider: str, *, reserve_for_fallback: bool = True) -> Any:
         last_error = ResearchCallError("BudgetExhausted")
         for attempt in range(1, self.retry_max + 1):
             remaining = self.deadline - time.monotonic()
-            # Reserve half the remaining stage for subsequent fallback sources.
-            budget = min(self.request_timeout, max(0.0, remaining / 2))
+            # Reserve half for subsequent sources; the final document has no
+            # fallback and may use the remainder within the same request cap.
+            budget = min(self.request_timeout, max(0.0, remaining / (2 if reserve_for_fallback else 1)))
             if budget < 0.05:
                 raise ResearchCallError("BudgetExhausted", self.stage)
             started = time.monotonic()
@@ -112,7 +113,8 @@ class ScanResearchCollector:
                                   min(config.fundamental_fetch_timeout_seconds, stage_limit / 2))
 
         def cached_call(budget: ResearchBudget, callback: Callable[[], Any], key: str,
-                        cache_validator: Callable[[Any], bool] | None = None) -> Any:
+                        cache_validator: Callable[[Any], bool] | None = None, *,
+                        reserve_for_fallback: bool = True) -> Any:
             cached = self._cache.get(key)
             if cached and ttl > 0 and 0 <= time.monotonic() - cached[0] < ttl and (
                 cache_validator is None or cache_validator(cached[2])
@@ -126,7 +128,7 @@ class ScanResearchCollector:
                 if cache_validator is not None and not cache_validator(result):
                     raise ResearchCallError("InvalidPayload", "no valid symbol financial fields")
                 return result
-            result = budget.call(checked_callback, key)
+            result = budget.call(checked_callback, key, reserve_for_fallback=reserve_for_fallback)
             cacheable = not result.empty if hasattr(result, "empty") else meaningful(result)
             if cacheable and cache_validator is not None:
                 cacheable = cache_validator(result)
@@ -270,7 +272,8 @@ class ScanResearchCollector:
                 try:
                     document_url = announcement_document_url(item["url"], code, item["published_date"])
                     document = cached_call(budget, lambda: announcement_excerpt(document_url, code,
-                                             str(candidate.get("name") or "")), f"official_document:{item['url']}:{code}")
+                                             str(candidate.get("name") or "")), f"official_document:{item['url']}:{code}",
+                                           reserve_for_fallback=False)
                     item.update(document)
                     item["fetched_at"] = next((e.get("fetched_at", "") for e in reversed(events)
                                                 if e.get("provider") == f"official_document:{item['url']}:{code}"), "")

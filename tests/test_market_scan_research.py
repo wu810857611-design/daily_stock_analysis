@@ -288,6 +288,42 @@ def test_official_body_excerpt_does_not_claim_full_review(configured, monkeypatc
     assert "announcement_body" not in result["missing_fields"]
 
 
+def test_terminal_document_uses_remaining_stage_without_reserving_unused_fallback(configured, monkeypatch):
+    ak, _ = configured
+    from src.config import get_config
+    config = get_config()
+    config.enable_fundamental_pipeline = False
+    config.fundamental_stage_timeout_seconds = 3.0
+    config.fundamental_fetch_timeout_seconds = 2.0
+    monkeypatch.setattr("src.config.get_config", lambda: config)
+    def slow_index(**kwargs):
+        time.sleep(1.0)
+        return announcements(**kwargs)
+    def slow_body(*args):
+        time.sleep(1.2)
+        return {"body_excerpt_available": True, "content_reviewed": False, "excerpt": "正式公告摘录"}
+    monkeypatch.setattr(ak, "stock_zh_a_disclosure_report_cninfo", slow_index)
+    monkeypatch.setattr("src.services.market_scan_research.announcement_excerpt", slow_body)
+    result = ScanResearchCollector(5)(CANDIDATE)
+    assert result["announcements"]["body_excerpt_count"] == 1
+    events = [e for e in result["diagnostics"] if e["stage"] == "announcements"]
+    body = events[-1]
+    assert body["provider"].startswith("official_document:") and body["result"] == "success"
+    assert 1.2 < body["timeout_budget"] <= 2.0
+    assert sum(e["elapsed"] for e in events) < 3.0
+    assert result["announcements"]["content_reviewed"] is False
+    assert not multiprocessing.active_children()
+
+
+def test_terminal_call_still_obeys_original_request_cap_and_kills_hung_worker():
+    events = []
+    budget = ResearchBudget(1.0, "603259", "announcements", events, request_timeout=0.15)
+    with pytest.raises(ResearchCallError, match="TimeoutError"):
+        budget.call(hanging, "official_document:fixture", reserve_for_fallback=False)
+    assert events[-1]["timeout_budget"] == 0.15
+    assert not multiprocessing.active_children()
+
+
 def test_collector_passes_verified_index_as_https_pdf_and_keeps_both_sources(configured, monkeypatch):
     ak, _ = configured
     date = datetime.now().strftime("%Y-%m-%d")

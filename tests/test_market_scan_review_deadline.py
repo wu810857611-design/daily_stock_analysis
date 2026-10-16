@@ -126,4 +126,5 @@ def test_real_worker_preserves_numeric_rejection_and_retries_without_relaxing_va
         assert reviewer.diagnostics["completed_candidate_count"] == 0
     error = reviewer.diagnostics["requests"][0]["numeric_errors"]["HK01548"][0]
     assert error["field"] == "change_pct" and error["expected"] == 0.27972
+    assert error["text_field"] == "facts" and error["claim_context"] == "日涨27.97%"
     assert not multiprocessing.active_children()

@@ -11,6 +11,43 @@ from tests.test_market_scan_service import _service
 CANDIDATE = {'code': 'HK01548', 'price': 43.02, 'change_pct': 0.27972, 'amount': 1649000000}
 
 
+@pytest.mark.parametrize('claim,amount', [
+    ('成交额1,199,779,572HKD', 1199779572.0),
+    ('成交额2,732,004,233元', 2732004233.0),
+    ('成交额1,199.779572万港元', 11997795.72),
+    ('成交额1,199.779572e6港元', 1199779572.0),
+])
+def test_grouped_amount_is_parsed_in_full_before_unit_and_precision_checks(claim, amount):
+    candidate = {**CANDIDATE, 'amount': amount}
+    if claim.endswith('元') and not claim.endswith('港元'):
+        candidate['code'] = '300903'
+    assert validate_review_facts({'numeric_facts': numeric_facts(candidate), 'facts': [claim]},
+                                 candidate, require_echo=True) == []
+
+
+@pytest.mark.parametrize('claim', [
+    '成交额1,199,779,572人民币', '成交额1,199,779,572万港元',
+    '成交额1,190,779,572港元', '成交额1,19,779,572港元',
+])
+def test_grouping_does_not_relax_currency_scale_value_or_format(claim):
+    candidate = {**CANDIDATE, 'amount': 1199779572.0}
+    assert validate_review_facts({'numeric_facts': numeric_facts(candidate), 'facts': [claim]},
+                                 candidate, require_echo=True)
+
+
+def test_known_close_errors_still_fail_and_retain_original_date_context():
+    candidate = {**CANDIDATE, 'code': 'HK02020', 'price': 77.95, 'amount': 1199779572.0, 'pe': 756.96238168}
+    for claim in ['成交额11.9998亿HKD', '现价约8', '2026年10月13日的历史PE 756倍，不是今日估值']:
+        errors = validate_review_facts({'numeric_facts': numeric_facts(candidate), 'risks': [claim]},
+                                       candidate, require_echo=True)
+        assert errors
+        assert errors[0]['text_field'] == 'risks' and errors[0]['claim_context'] == claim
+    # Recording historical context is diagnostic only: do not bypass a
+    # conflict or claim we can automatically establish historical truth.
+    assert validate_review_facts({'numeric_facts': {**numeric_facts(candidate), 'amount': 1199980000}},
+                                 candidate, require_echo=True)
+
+
 def test_percent_is_percentage_points_and_rounding_is_allowed():
     review = {'numeric_facts': numeric_facts(CANDIDATE),
               'facts': ['快照价43.02港元，日涨0.28%，成交额16.49亿港元']}
@@ -154,7 +191,8 @@ def test_actual_review_batches_accept_neutral_scientific_and_nullable_contracts(
         batch = json.loads(kwargs['messages'][1]['content'])['candidates']
         reviews = [{'code': item['code'], 'verdict': 'pass',
                     'numeric_facts': {**item['numeric_fact_contract']['values'], 'pb': None},
-                    'facts': [item['numeric_fact_contract']['rendered']]}
+                    'facts': [item['numeric_fact_contract']['rendered'],
+                              f"成交额{item['numeric_fact_contract']['values']['amount']:,.0f}HKD"]}
                    for item in batch]
         return {'choices': [{'finish_reason': 'stop', 'message': {'content': json.dumps({'reviews': reviews})}}]}
     monkeypatch.setitem(sys.modules, 'litellm', SimpleNamespace(completion=completion))

@@ -55,7 +55,10 @@ def _matches(field: str, expected: Any, observed: Any) -> bool:
     return math.isclose(expected, observed, rel_tol=1e-6, abs_tol=0.0051 if field != "amount" else 0.51)
 
 
-_NUMBER = r"[+-]?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?"
+# Consume the entire grouped token before validating its grouping. Otherwise
+# "1,199,779,572" is silently read as 1, and malformed groups can match a prefix.
+_NUMBER = r"[+-]?\d+(?:,\d+)*(?:\.\d+)?(?:[eE][+-]?\d+)?"
+_VALID_NUMBER = re.compile(r"[+-]?(?:\d+|\d{1,3}(?:,\d{3})+)(?:\.\d+)?(?:[eE][+-]?\d+)?")
 _CLAIMS = {
     "change_pct": rf"(?P<label>日(?:内)?(?:涨跌幅|涨幅|跌幅|涨跌)|日涨|日跌|当日涨幅|当日跌幅)\s*(?:约|为|达|达到|了|：|:|=)?\s*(?P<number>{_NUMBER})\s*[%％]",
     "price": rf"(?:快照价|最新价|现价|当前价)\s*(?:约|为|：|:|=)?\s*({_NUMBER})\s*(港元|港币|人民币|元|HKD|CNY)?",
@@ -78,7 +81,7 @@ def _prose_matches(field: str, expected: float, observed: float, literal: str,
     # Retain the original small rounding allowance for literal zero.
     if observed == 0:
         return _matches(field, expected, observed)
-    parts = literal.lower().split("e")
+    parts = literal.replace(",", "").lower().split("e")
     decimals = len(parts[0].split(".")[1]) if "." in parts[0] else 0
     try:
         exponent = int(parts[1]) if len(parts) == 2 else 0
@@ -112,18 +115,26 @@ def validate_review_facts(review: Mapping[str, Any], candidate: Mapping[str, Any
                     continue
                 errors.append({"field": field, "observed": echoed[field],
                                "error": "unsupported_numeric_fact"})
-    texts = [str(review.get(key) or "") for key in ("thesis", "view")]
+    texts = [(key, str(review.get(key) or "")) for key in ("thesis", "view")]
     for key in ("facts", "risks", "inferences", "invalidators"):
         values = review.get(key) or []
-        texts.extend([values] if isinstance(values, str) else [str(value) for value in values])
-    for text in texts:
+        texts.extend((key, value) for value in
+                     ([values] if isinstance(values, str) else [str(value) for value in values]))
+    for text_field, text in texts:
         for field, pattern in _CLAIMS.items():
             for match in re.finditer(pattern, text, flags=re.IGNORECASE):
                 literal = match.group("number") if field == "change_pct" else match.group(1)
-                value = float(literal)
+                context_start = max(0, match.start() - 120)
+                context = {"text_field": text_field,
+                           "claim_context": text[context_start:min(match.end() + 120, context_start + 480)]}
+                if not _VALID_NUMBER.fullmatch(literal):
+                    errors.append({"field": field, "error": "invalid_numeric_format",
+                                   "claim": match.group(0), **context})
+                    continue
+                value = float(literal.replace(",", ""))
                 if field not in expected:
                     errors.append({"field": field, "observed": value,
-                                   "error": "unsupported_snapshot_claim", "claim": match.group(0)})
+                                   "error": "unsupported_snapshot_claim", "claim": match.group(0), **context})
                     continue
                 direction = 0
                 if field == "change_pct":
@@ -150,5 +161,5 @@ def validate_review_facts(review: Mapping[str, Any], candidate: Mapping[str, Any
                         valid = False
                 if not valid:
                     errors.append({"field": field, "expected": expected[field], "observed": value,
-                                   "error": "snapshot_claim_mismatch", "claim": match.group(0)})
+                                   "error": "snapshot_claim_mismatch", "claim": match.group(0), **context})
     return errors
