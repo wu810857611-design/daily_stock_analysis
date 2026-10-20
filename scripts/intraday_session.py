@@ -44,6 +44,7 @@ from scripts.intraday_monitor import (  # noqa: E402
     evaluate_quote,
     send_pushplus,
     _symbol_aliases,
+    _history_reference_blocked,
 )
 from scripts.adaptive_signal_policy import (  # noqa: E402
     CONSIDER_ENTRY,
@@ -1597,6 +1598,13 @@ def load_reference_levels_batch(
                     except sqlite3.Error:
                         history = None
 
+            history_blocked = _history_reference_blocked(
+                connection, history, aliases, now=current,
+                max_signal_age_days=max_signal_age_days,
+            )
+            if history_blocked:
+                history = None
+
             def value(row: Optional[sqlite3.Row], field: str) -> Any:
                 return row[field] if row is not None and field in row.keys() else None
 
@@ -1667,9 +1675,11 @@ def load_reference_levels_batch(
                         except sqlite3.Error as exc:
                             source = {"status": "query_failed", "error_class": type(exc).__name__}
                     detail["sources"][table] = source
+                if history_blocked:
+                    detail["sources"]["analysis_history"]["status"] = "linked_signal_ineligible"
                 if detail["status"] == "unavailable":
                     statuses = [v["status"] for v in detail["sources"].values()]
-                    detail["reason"] = ("no_valid_dated_reference" if any(v in statuses for v in ("expired_signal", "too_old", "undated", "inactive_signal", "future_dated", "non_analysis_signal", "invalid_date_or_schema"))
+                    detail["reason"] = ("no_valid_dated_reference" if any(v in statuses for v in ("expired_signal", "too_old", "undated", "inactive_signal", "future_dated", "non_analysis_signal", "invalid_date_or_schema", "linked_signal_ineligible"))
                                         else "levels_missing" if "eligible" in statuses
                                         else "query_failed" if "query_failed" in statuses
                                         else "record_or_schema_missing")

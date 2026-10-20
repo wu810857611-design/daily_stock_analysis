@@ -1481,6 +1481,55 @@ class TencentBatchTests(unittest.TestCase):
 
 
 class ReferenceLevelTests(unittest.TestCase):
+    def test_linked_expired_or_inactive_report_cannot_restore_levels_via_history(self):
+        from scripts.intraday_monitor import load_reference_levels
+        now = datetime(2026, 10, 20, 9, 20, tzinfo=TZ)
+        for status, expiry in (
+            ("active", "2026-10-19 10:30:00"),
+            ("expired", "2026-10-19 10:30:00"),
+            ("invalidated", "2026-10-23 10:30:00"),
+        ):
+            with self.subTest(status=status, expiry=expiry), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "reference.db"
+                with sqlite3.connect(path) as connection:
+                    connection.executescript("""
+                        CREATE TABLE decision_signals (
+                            id INTEGER PRIMARY KEY, stock_code TEXT, source_type TEXT,
+                            status TEXT, stop_loss REAL, target_price REAL,
+                            created_at TEXT, expires_at TEXT, source_report_id INTEGER
+                        );
+                        CREATE TABLE analysis_history (
+                            id INTEGER PRIMARY KEY, code TEXT, stop_loss REAL,
+                            take_profit REAL, created_at TEXT
+                        );
+                        INSERT INTO analysis_history VALUES
+                            (855, 'HK.00981', 48, 68, '2026-10-16 10:30:00');
+                    """)
+                    connection.execute(
+                        "INSERT INTO decision_signals VALUES "
+                        "(818, '00981.HK', 'analysis', ?, 48, 68, "
+                        "'2026-10-16 10:30:00', ?, 855)", (status, expiry),
+                    )
+                diagnostics = {}
+                batch = load_reference_levels_batch(path, ["HK00981"], now=now, diagnostics=diagnostics)
+                single = load_reference_levels(path, "HK00981", now=now)
+                for levels in (batch["HK00981"], single):
+                    self.assertIsNone(levels.stop_loss)
+                    self.assertIsNone(levels.target_price)
+                detail = diagnostics["HK00981"]
+                self.assertEqual(detail["status"], "unavailable")
+                self.assertEqual(detail["sources"]["analysis_history"]["status"], "linked_signal_ineligible")
+
+                # The identical report remains usable before its explicit expiry.
+                with sqlite3.connect(path) as connection:
+                    connection.execute("UPDATE decision_signals SET status='active', expires_at='2026-10-23 10:30:00', target_price=NULL")
+                batch = load_reference_levels_batch(path, ["HK00981"], now=now)
+                single = load_reference_levels(path, "HK00981", now=now)
+                for levels in (batch["HK00981"], single):
+                    self.assertEqual(levels.stop_loss, 48)
+                    self.assertEqual(levels.target_price, 68)
+                    self.assertEqual(levels.target_source, "analysis_history")
+
     def test_batch_loader_rejects_expired_signal_and_uses_fresh_history(self):
         now = datetime(2026, 7, 28, 10, 0, tzinfo=TZ)
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -3097,6 +3146,32 @@ class PushOutcomeTests(unittest.TestCase):
         )
         self.assertIn("signal_persist_failure_observed", result["issues"])
         self.assertIn("pushplus_send_failed", result["issues"])
+
+    def test_strict_verifier_uses_same_session_confirmed_hk_holiday_only(self):
+        state = {"provider": {
+            "quote_fetcher": {"longbridge_configured": True},
+            "integration_verification": {"started_at": "2026-10-19T09:20:52+08:00"},
+            "pushplus_session": {"configured": True, "status": "no_action_no_send"},
+        }}
+        calendar = {
+            "session_date": "2026-10-19", "calendar_degraded": False,
+            "should_run": True, "status": "partial_market_open",
+            "active_markets": ["cn"], "market_states": {"cn": "open_session_day", "hk": "closed"},
+        }
+        result = verify_state(state, market_calendar=calendar)
+        self.assertTrue(result["passed"])
+        self.assertFalse(result["market_data"]["hk_required"])
+        for changes in (
+            {"session_date": "2026-10-16"}, {"calendar_degraded": True},
+            {"market_states": {"hk": "calendar_unavailable"}},
+            {"active_markets": ["cn", "hk"], "market_states": {"hk": "open_session_day"}},
+        ):
+            with self.subTest(changes=changes):
+                result = verify_state(state, market_calendar={**calendar, **changes})
+                self.assertFalse(result["passed"])
+                self.assertTrue(result["market_data"]["hk_required"])
+        state["provider"]["pushplus_session"]["status"] = "send_failed"
+        self.assertIn("pushplus_send_failed", verify_state(state, market_calendar=calendar)["issues"])
 
 
 class CycleTests(unittest.TestCase):

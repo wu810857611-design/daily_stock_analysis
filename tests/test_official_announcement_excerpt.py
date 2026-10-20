@@ -103,6 +103,37 @@ def test_document_identity_required_and_excerpt_is_partial(monkeypatch):
         announcement_excerpt("https://static.cninfo.com.cn/a.pdf", "600000", "浦发银行")
 
 
+@pytest.mark.parametrize("code,name,header", [
+    ("HK01658", "邮储银行", "POSTAL SAV\nINGS BANK O\nF CHINA CO.\n, LTD.\n 1658\n董事會會議通告"),
+    ("HK01093", "石药集团", "΅ ˾ \u0eee j 1093 \x81\nCSPC PHARMACEUTICAL GROUP LIMITED\n自願公告"),
+])
+def test_hk_real_pdf_headers_accept_zero_omitted_standalone_code(monkeypatch, code, name, header):
+    from types import SimpleNamespace
+    monkeypatch.setattr("requests.get", lambda *args, **kwargs: Response(b"%PDF fixture"))
+    text = header + "\n" + "香港交易及結算所有限公司對本公告的內容概不負責。" * 6
+    monkeypatch.setattr("pypdf.PdfReader", lambda stream: SimpleNamespace(pages=[
+        SimpleNamespace(extract_text=lambda: text),
+    ]))
+    result = announcement_excerpt("https://static.cninfo.com.cn/a.pdf", code, name)
+    assert result["body_excerpt_available"] and result["content_reviewed"] is False
+    with pytest.raises(ValueError, match="identity"):
+        announcement_excerpt("https://static.cninfo.com.cn/a.pdf", "HK09988", "阿里巴巴")
+
+
+@pytest.mark.parametrize("numeric_text", [
+    "截至2026年10月20日收入1093萬元", "Revenue 1093", "1093.25", "11093", "10930", "101093",
+])
+def test_hk_short_code_does_not_match_prose_prices_or_other_codes(monkeypatch, numeric_text):
+    from types import SimpleNamespace
+    monkeypatch.setattr("requests.get", lambda *args, **kwargs: Response(b"%PDF fixture"))
+    text = numeric_text + "\n" + "另一家公司的正式公告正文以及財務數據。" * 8
+    monkeypatch.setattr("pypdf.PdfReader", lambda stream: SimpleNamespace(pages=[
+        SimpleNamespace(extract_text=lambda: text),
+    ]))
+    with pytest.raises(ValueError, match="identity"):
+        announcement_excerpt("https://static.cninfo.com.cn/a.pdf", "HK01093", "石药集团")
+
+
 @pytest.mark.parametrize("data,reason", [
     (b"<html>not a document</html>", "announcement_not_pdf"),
     (b"%PDF" + b"x" * (2 * 1024 * 1024), "announcement_document_too_large"),

@@ -112,7 +112,23 @@ def announcement_excerpt(url: str, code: str, name: str) -> dict:
     text = "\n".join((page.extract_text() or "")[:10000] for page in islice(reader.pages, 3))
     compact = "".join(text.split())
     identity = code[2:] if code.startswith("HK") else code
-    if len(compact) < 80 or not (identity in compact or (name and name in compact)):
+    identity_present = bool(re.search(
+        rf"(?<![A-Za-z0-9]){re.escape(identity)}(?![A-Za-z0-9])", compact
+    )) or bool(name and name in compact)
+    if code.startswith("HK") and re.fullmatch(r"[0-9]{5}", identity):
+        # HK issuer headers commonly omit leading zeroes. PDF embedded fonts
+        # can corrupt the surrounding label, so admit a short code-only header
+        # line, never an arbitrary number inside prose, a price or a date.
+        short_code = str(int(identity))
+        header_code = re.compile(
+            rf"[^0-9\u4e00-\u9fff]{{0,24}}(?<![A-Za-z0-9])0*{short_code}"
+            rf"(?![A-Za-z0-9])[^0-9A-Za-z\u4e00-\u9fff]{{0,8}}"
+        )
+        identity_present = identity_present or any(
+            header_code.fullmatch(line.strip()) for line in text[:1600].splitlines()
+            if not re.search(r"[A-Za-z]{2,}", line)
+        )
+    if len(compact) < 80 or not identity_present:
         raise AnnouncementEvidenceError("announcement_document_identity_or_text_missing")
     return {"excerpt": text[:2000], "document_source": url,
             "extraction": "official_pdf_first_three_pages", "document_bytes": len(data),
