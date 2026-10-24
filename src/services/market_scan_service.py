@@ -3030,6 +3030,19 @@ def default_a_snapshot_loader() -> Mapping[str, Any]:
             )
             if not isinstance(frame, pd.DataFrame) or frame.empty:
                 raise MarketScanError("provider returned an empty full-market snapshot")
+            if provider_name == "stock_zh_a_spot_tx" and "zxj" in frame.columns:
+                # AkShare returns Tencent's raw rank-list schema. Volume is in
+                # lots (as with Eastmoney); turnover is 10,000 CNY, market cap
+                # 100,000,000 CNY. Adapt before the unchanged capability gate.
+                frame = frame.rename(columns={
+                    "zxj": "price", "zdf": "change_pct", "turnover": "amount",
+                    "hsl": "turnover_rate", "lb": "volume_ratio",
+                    "pe_ttm": "pe", "pn": "pb", "zsz": "total_mv",
+                    "zdf_d60": "change_60d",
+                }).copy()
+                for field, multiplier in (("amount", 10000), ("total_mv", 100000000)):
+                    if field in frame.columns:
+                        frame[field] = pd.to_numeric(frame[field], errors="coerce") * multiplier
             capability_contract = _require_snapshot_contract(frame, market=MARKET_A)
             return {
                 "records": frame,

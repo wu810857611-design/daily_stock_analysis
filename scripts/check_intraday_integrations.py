@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -13,7 +14,9 @@ from typing import Any, Mapping, Sequence
 PASS_PUSHPLUS_STATUSES = {"actionable_sent", "no_action_no_send"}
 
 
-def verify_state(state: Mapping[str, Any]) -> dict[str, Any]:
+def verify_state(
+    state: Mapping[str, Any], *, market_calendar: Mapping[str, Any] | None = None
+) -> dict[str, Any]:
     provider = state.get("provider") or {}
     quote_fetcher = provider.get("quote_fetcher") or {}
     integration = provider.get("integration_verification") or {}
@@ -30,13 +33,34 @@ def verify_state(state: Mapping[str, Any]) -> dict[str, Any]:
     hk_degraded_cycles = int(integration.get("hk_degraded_cycles") or 0)
     hk_reasons = dict(integration.get("hk_degradation_reasons") or {})
 
-    if not quote_fetcher.get("longbridge_configured"):
+    hk_required = True
+    if market_calendar is not None:
+        try:
+            session_date = datetime.fromisoformat(str(integration["started_at"])).date().isoformat()
+            valid_calendar = (
+                market_calendar.get("session_date") == session_date
+                and market_calendar.get("calendar_degraded") is False
+                and market_calendar.get("status") in {"open", "partial_market_open"}
+                and market_calendar.get("should_run") is True
+            )
+        except (KeyError, TypeError, ValueError):
+            valid_calendar = False
+        if not valid_calendar:
+            issues.append("market_calendar_evidence_invalid")
+        elif (
+            (market_calendar.get("market_states") or {}).get("hk") == "closed"
+            and "hk" not in (market_calendar.get("active_markets") or [])
+            and hk_requested == 0 and hk_cycles == 0
+        ):
+            hk_required = False
+
+    if hk_required and not quote_fetcher.get("longbridge_configured"):
         issues.append("longbridge_not_configured")
-    if not quote_fetcher.get("hk_realtime_entitled"):
+    if hk_required and not quote_fetcher.get("hk_realtime_entitled"):
         issues.append("longbridge_realtime_permission_unverified")
-    if quote_fetcher.get("longbridge_auth_blocked"):
+    if hk_required and quote_fetcher.get("longbridge_auth_blocked"):
         issues.append("longbridge_oauth_auth_blocked")
-    if hk_requested <= 0 or hk_cycles <= 0:
+    if hk_required and (hk_requested <= 0 or hk_cycles <= 0):
         issues.append("no_hk_quote_cycle_checked")
     if hk_requested > 0 and hk_live != hk_requested:
         issues.append("hk_live_snapshot_coverage_incomplete")
@@ -70,6 +94,7 @@ def verify_state(state: Mapping[str, Any]) -> dict[str, Any]:
     return {
         "passed": not issues,
         "market_data": {
+            "hk_required": hk_required,
             "longbridge_configured": bool(
                 quote_fetcher.get("longbridge_configured")
             ),
@@ -188,6 +213,8 @@ def render_markdown(result: Mapping[str, Any]) -> str:
             "## 盘中行情与推送严格验证",
             "",
             f"- 结论：{verdict}",
+            ("- 港股验收：正常检查" if market.get("hk_required", True)
+             else "- 港股验收：同一会话交易日历确认休市，实时权限及行情轮次不适用"),
             (
                 "- Longbridge：实时权限 "
                 f"{'已验证' if market['hk_realtime_entitled'] else '未验证'}；"
@@ -271,6 +298,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=Path("data/intraday/session_state.json"),
     )
+    parser.add_argument("--calendar-report", type=Path)
     return parser
 
 
@@ -281,7 +309,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     except (OSError, json.JSONDecodeError) as exc:
         print(f"盘中严格验证失败：无法读取状态文件（{type(exc).__name__}）")
         return 2
-    result = verify_state(state)
+    calendar = None
+    if args.calendar_report is not None:
+        try:
+            calendar = json.loads(args.calendar_report.read_text(encoding="utf-8"))
+            if not isinstance(calendar, dict):
+                raise ValueError("invalid calendar report")
+        except (OSError, ValueError) as exc:
+            print(f"盘中严格验证失败：无法读取交易日历证据（{type(exc).__name__}）")
+            return 2
+    result = verify_state(state, market_calendar=calendar)
     markdown = render_markdown(result)
     print(markdown)
     summary_path = os.getenv("GITHUB_STEP_SUMMARY", "").strip()

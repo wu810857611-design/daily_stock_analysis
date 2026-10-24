@@ -695,7 +695,8 @@ jobs:
             echo "A股与港股均休市；严格集成验收安全跳过，未调用行情或 PushPlus。"
             exit 0
           fi
-          python3 scripts/check_intraday_integrations.py
+          python3 scripts/check_intraday_integrations.py \
+            --calendar-report reports/market_session_gate.json
 
       - name: 打包盘中状态
         if: ${{ always() && steps.market_calendar.outputs.should_run == 'true' }}

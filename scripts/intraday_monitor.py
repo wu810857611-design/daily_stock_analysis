@@ -199,6 +199,7 @@ def _latest_row(
     fresh_only: bool = False,
     now: Optional[datetime] = None,
     max_signal_age_days: int = DEFAULT_REFERENCE_SIGNAL_MAX_AGE_DAYS,
+    source_report_id: Optional[int] = None,
 ) -> Optional[sqlite3.Row]:
     columns = _table_columns(connection, table)
     if code_column not in columns:
@@ -207,6 +208,11 @@ def _latest_row(
     placeholders = ",".join("?" for _ in alias_list)
     filters = [f'UPPER("{code_column}") IN ({placeholders})']
     parameters: List[Any] = alias_list
+    if source_report_id is not None:
+        if "source_report_id" not in columns:
+            return None
+        filters.append("source_report_id = ?")
+        parameters.append(source_report_id)
     if analysis_only and "source_type" in columns:
         filters.append("(source_type IS NULL OR source_type = 'analysis')")
     if analysis_only and "status" in columns:
@@ -301,6 +307,45 @@ def _row_text(row: Optional[sqlite3.Row], field: str) -> str:
     return str(row[field] or "").strip()
 
 
+def _history_reference_blocked(
+    connection: sqlite3.Connection, history: Optional[sqlite3.Row],
+    aliases: Iterable[str], *, now: Optional[datetime], max_signal_age_days: int,
+) -> bool:
+    """A historical report cannot outlive its explicitly linked analysis signal.
+
+    Unlinked legacy history retains its existing age limit. Once a report has
+    an exported signal, only that signal's active validity admits its levels.
+    """
+    columns = _table_columns(connection, "decision_signals")
+    if history is None or "id" not in history.keys() or not {
+        "stock_code", "source_report_id"
+    }.issubset(columns):
+        return False
+    alias_list = list(aliases)
+    placeholders = ",".join("?" for _ in alias_list)
+    source_filter = (
+        " AND (source_type IS NULL OR source_type = 'analysis')"
+        if "source_type" in columns else ""
+    )
+    try:
+        linked = connection.execute(
+            f"SELECT rowid FROM decision_signals WHERE UPPER(stock_code) IN ({placeholders}) "
+            f"AND source_report_id = ?{source_filter} ORDER BY rowid DESC LIMIT 1",
+            [*alias_list, history["id"]],
+        ).fetchone()
+        if linked is None:
+            return False
+        eligible = _latest_row(
+            connection, table="decision_signals", code_column="stock_code",
+            aliases=alias_list, analysis_only=True, now=now,
+            max_signal_age_days=max_signal_age_days, source_report_id=history["id"],
+        )
+        return eligible is None
+    except sqlite3.Error:
+        # A known linkage schema must never silently bypass signal validity.
+        return True
+
+
 def load_reference_levels(
     database_path: Path,
     symbol: str,
@@ -337,6 +382,11 @@ def load_reference_levels(
             now=now,
             max_signal_age_days=max_signal_age_days,
         )
+        if _history_reference_blocked(
+            connection, history, aliases, now=now,
+            max_signal_age_days=max_signal_age_days,
+        ):
+            history = None
         signal_stop = _row_float(signal, "stop_loss")
         signal_target = _row_float(signal, "target_price")
         history_stop = _row_float(history, "stop_loss")

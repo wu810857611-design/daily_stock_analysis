@@ -270,6 +270,37 @@ def test_default_snapshot_provider_timeout_falls_through_to_next_source(
     assert "MarketScanDeadlineExceeded" in payload["provider_errors"][0]
 
 
+def test_tencent_raw_rank_schema_maps_fields_and_cny_units_before_l1(monkeypatch):
+    # Tencent getBoardRankList / AkShare stock_zh_a_spot_tx raw response.
+    frame = pd.DataFrame([{
+        "code": "sh600519", "name": "贵州茅台", "zxj": "1331.88", "zdf": "0.52",
+        "volume": "34136.00", "turnover": "452540", "hsl": "0.27", "lb": "0.92",
+        "pe_ttm": "20.45", "pn": "6.63", "zsz": "16649.59", "zdf_d60": "0.33",
+    }])
+    def unavailable():
+        raise RuntimeError("upstream unavailable")
+    monkeypatch.setitem(sys.modules, "akshare", SimpleNamespace(
+        stock_zh_a_spot_em=unavailable, stock_zh_a_spot_tx=lambda: frame,
+        stock_zh_a_spot=unavailable,
+    ))
+    monkeypatch.setattr(market_scan_service_module, "_call_with_hard_timeout", lambda callback, **kwargs: callback())
+    payload = default_a_snapshot_loader()
+    assert payload["source"] == "akshare.stock_zh_a_spot_tx"
+    normal = market_scan_service_module._normalise_snapshot(
+        payload["records"], market=MARKET_A, now=NOW,
+    ).iloc[0]
+    assert normal["code"] == "600519"
+    assert normal["price"] == 1331.88 and normal["change_pct"] == 0.52
+    assert normal["amount"] == 4525400000 and normal["volume"] == 34136
+    assert normal["total_mv"] == pytest.approx(1664959000000)
+    assert normal["pe"] == 20.45 and normal["pb"] == 6.63
+    assert normal["turnover_rate"] == 0.27 and normal["volume_ratio"] == 0.92
+    # An unparseable mandatory amount still rejects this provider.
+    frame.loc[0, "turnover"] = "--"
+    with pytest.raises(market_scan_service_module.MarketScanError, match="low_coverage=amount"):
+        default_a_snapshot_loader()
+
+
 def test_critical_snapshot_timeout_fails_closed_without_cache(tmp_path: Path) -> None:
     def hanging_snapshot() -> Any:
         time.sleep(0.2)
