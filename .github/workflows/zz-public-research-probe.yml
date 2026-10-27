@@ -74,6 +74,20 @@ jobs:
                       checks.append(row)
                       print("PUBLIC_SOURCE_PROBE " + json.dumps(row), flush=True)
           
+          def exact_issuer_lookup():
+              import requests
+              url = 'https://www.cninfo.com.cn/new/information/topSearch/query'
+              with requests.post(url, data={'keyWord': '300473', 'maxNum': '10'},
+                                 headers={'Referer': 'https://www.cninfo.com.cn/'},
+                                 stream=True, timeout=(1.5, 2), allow_redirects=False) as response:
+                  response.raise_for_status()
+                  raw = bytearray()
+                  for chunk in response.iter_content(8192):
+                      raw.extend(chunk)
+                      if len(raw) > 65536:
+                          raise ValueError('lookup_response_too_large')
+                  return {'http_status': response.status_code, 'raw_payload': json.loads(raw)}
+          check('exact_issuer_lookup', '300473', exact_issuer_lookup)
           check("known_rejected_pdf", "HK02331", lambda: announcement_excerpt(
               "https://static.cninfo.com.cn/finalpage/2026-10-26/1225623347.PDF", "HK02331", "李宁"))
           
