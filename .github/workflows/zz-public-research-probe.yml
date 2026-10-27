@@ -1,0 +1,105 @@
+name: Public research source diagnostic (read only)
+on:
+  push:
+    branches: [agent/diagnose-public-research-20261027]
+    paths: [.github/workflows/zz-public-research-probe.yml]
+permissions:
+  contents: read
+  actions: read
+jobs:
+  public-sources:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Install public document dependencies
+        run: python -m pip install 'requests>=2,<3' 'pandas>=2,<4' 'pypdf>=5,<7'
+      - name: Read production workflow metadata
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p reports
+          gh api --method GET "/repos/${GITHUB_REPOSITORY}/actions/workflows?per_page=100" > reports/workflows.json
+      - name: Probe official public sources with original four second caps
+        run: |
+          python - <<'PY'
+          import json
+          import time
+          from datetime import datetime
+          from pathlib import Path
+          from zoneinfo import ZoneInfo
+          from src.services.research_execution import run_isolated
+          from src.services.research_evidence import cninfo_issuers, cninfo_announcement_index, announcement_excerpt
+          
+          checks = []
+          def check(stage, symbol, callback):
+              started = time.monotonic()
+              row = {"stage": stage, "symbol": symbol, "read_only": True}
+              try:
+                  result = run_isolated(callback, 4)
+                  row.update(status="success")
+                  if stage == "issuers":
+                      row["issuer_count"] = len(result)
+                  elif stage == "index":
+                      row["query"] = result["query"]
+                      row["row_count"] = len(result["rows"])
+                      row["rows"] = result["rows"][:3]
+                  else:
+                      row.update({key: value for key, value in result.items() if key != "excerpt"})
+                      row["excerpt_characters"] = len(result.get("excerpt", ""))
+              except Exception as exc:
+                  result = None
+                  row.update(status="failed", error_class=getattr(exc, "error_class", type(exc).__name__),
+                             error_detail=str(exc)[:500], evidence_diagnostics=getattr(exc, "evidence_diagnostics", {}))
+              row["elapsed_seconds"] = round(time.monotonic() - started, 3)
+              checks.append(row)
+              print("PUBLIC_SOURCE_PROBE " + json.dumps(row, ensure_ascii=False), flush=True)
+              return result
+          
+          now = datetime.now(ZoneInfo("Asia/Shanghai"))
+          for code in ("300473", "HK02331"):
+              issuers = check("issuers", code, lambda code=code: cninfo_issuers(code.startswith("HK")))
+              if issuers is not None:
+                  org_id = issuers.get(code.removeprefix("HK"))
+                  if org_id:
+                      check("index", code, lambda code=code, org_id=org_id: cninfo_announcement_index(code, org_id, now, 3))
+                  else:
+                      row = {"stage": "issuer_lookup", "symbol": code, "status": "failed", "error_class": "announcement_issuer_not_found"}
+                      checks.append(row)
+                      print("PUBLIC_SOURCE_PROBE " + json.dumps(row), flush=True)
+          
+          check("known_rejected_pdf", "HK02331", lambda: announcement_excerpt(
+              "https://static.cninfo.com.cn/finalpage/2026-10-26/1225623347.PDF", "HK02331", "李宁"))
+          
+          states_path = Path("reports/workflows.json")
+          if states_path.exists():
+              try:
+                  payload = json.loads(states_path.read_text())
+                  states = [dict(id=w["id"], name=w["name"], path=w["path"], state=w["state"])
+                            for w in payload.get("workflows", [])
+                            if w.get("path", "").split("/")[-1] in {
+                                "00-daily-analysis.yml", "01-intraday-session.yml", "02-market-scan.yml", "03-intraday-supervisor.yml"}]
+                  Path("reports/production_workflow_states.json").write_text(json.dumps(states, ensure_ascii=False, indent=2))
+                  print("PRODUCTION_WORKFLOW_STATES " + json.dumps(states, ensure_ascii=False), flush=True)
+              except (ValueError, KeyError, TypeError) as exc:
+                  print("WORKFLOW_METADATA_ERROR " + type(exc).__name__, flush=True)
+          
+          Path("reports/public_source_probe.json").write_text(json.dumps({
+              "tested_commit": "fc0ac36a560089a93fdb6395cb040a91d08aa14c",
+              "diagnostic_at": now.isoformat(), "context": "standalone_GitHub_runner_read_only_not_production",
+              "checks": checks}, ensure_ascii=False, indent=2))
+          if any(row["status"] != "success" for row in checks):
+              raise SystemExit(1)
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: public-research-source-diagnostic
+          path: reports/
+          retention-days: 7
