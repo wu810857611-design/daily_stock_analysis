@@ -2,9 +2,6 @@ name: 双模型结构化输出验收（不扫描、不推送）
 
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - 'agent/test-model-upgrade-20261027'
 
 permissions:
   contents: read
@@ -47,29 +44,8 @@ jobs:
 
       - name: 仅验证双模型结构化输出
         run: |
-          python - <<'PY'
-          import json
-          from pathlib import Path
-          from scripts import market_scan_reviewer_smoke as smoke
-          
-          reviewers = {}
-          original_builder = smoke.build_litellm_reviewer
-          
-          def capture_reviewer(label):
-              reviewer = original_builder(label)
-              reviewers[label] = reviewer
-              return reviewer
-          
-          smoke.build_litellm_reviewer = capture_reviewer
-          result = smoke.run_smoke()
-          result["request_diagnostics"] = {
-              label: getattr(reviewer, "diagnostics", {})
-              for label, reviewer in reviewers.items()
-          }
-          smoke._atomic_write_json(Path("reports/reviewer_smoke.json"), result)
-          print(json.dumps(result, ensure_ascii=False, indent=2))
-          raise SystemExit(0 if result["success"] else 2)
-          PY
+          python scripts/market_scan_reviewer_smoke.py \
+            --output reports/reviewer_smoke.json
 
       - name: 上传非敏感验收结果
         if: always()
