@@ -630,6 +630,8 @@ class TencentBatchQuoteFetcher:
                             "stale_or_untradeable": 0,
                             "missing": route_requested,
                             "failed": True,
+                            "rejections": {"request_failed": route_requested},
+                            "rejected_quotes": [],
                         }
                     )
                     print(
@@ -640,6 +642,25 @@ class TencentBatchQuoteFetcher:
                         file=sys.stderr,
                     )
                     continue
+                rejections: Dict[str, int] = {}
+                rejected_quotes = []
+                for symbol in unresolved:
+                    quote = parsed[symbol]
+                    if _quote_has_live_snapshot(quote):
+                        continue
+                    timestamp = _parse_iso(quote.provider_timestamp)
+                    age = (fetched_at.astimezone(SHANGHAI_TZ) - timestamp).total_seconds() if timestamp is not None else None
+                    reason = (
+                        "missing_price" if quote.price is None else
+                        "missing_provider_timestamp" if timestamp is None else
+                        "future_provider_timestamp" if age < -30 else
+                        "stale_provider_timestamp" if age > self.freshness_seconds else
+                        "untradeable_quote"
+                    )
+                    rejections[reason] = rejections.get(reason, 0) + 1
+                    rejected_quotes.append({"symbol": symbol, "reason": reason,
+                        "provider_timestamp": quote.provider_timestamp, "fetched_at": quote.fetched_at,
+                        "age_seconds": round(age, 3) if age is not None else None})
                 route_stats.append(
                     {
                         "route": route_name,
@@ -671,6 +692,8 @@ class TencentBatchQuoteFetcher:
                             if parsed[symbol].price is None
                         ),
                         "failed": False,
+                        "rejections": rejections,
+                        "rejected_quotes": rejected_quotes,
                     }
                 )
                 next_unresolved: List[str] = []
@@ -718,6 +741,10 @@ class TencentBatchQuoteFetcher:
                 int(item["stale_or_untradeable"]) for item in route_stats
             ),
             "route_missing": sum(int(item["missing"]) for item in route_stats),
+            "route_rejections": {
+                reason: sum(item["rejections"].get(reason, 0) for item in route_stats)
+                for reason in sorted({reason for item in route_stats for reason in item["rejections"]})
+            },
         }
         return results
 
@@ -4628,6 +4655,9 @@ def run_cycle(
                     ),
                 ):
                     verification[key] = int(verification.get(key) or 0) + increment
+                rejection_counts = verification.setdefault("tencent_route_rejections", {})
+                for reason, count in (baseline_diagnostics.get("route_rejections") or {}).items():
+                    rejection_counts[reason] = int(rejection_counts.get(reason) or 0) + int(count)
                 # Backward-compatible aliases for older report consumers.
                 verification["primary_fallback_requests"] = int(
                     verification.get("primary_fallback_requests") or 0

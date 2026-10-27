@@ -1479,6 +1479,28 @@ class TencentBatchTests(unittest.TestCase):
         self.assertTrue(parsed["300408"].is_stale)
         self.assertIsNone(parsed["300408"].provider_timestamp)
 
+    def test_tencent_delayed_and_future_quotes_retain_rejection_evidence(self):
+        now = datetime(2026, 10, 27, 14, 0, tzinfo=TZ)
+        payload = "\n".join([
+            tencent_record("hk01347", "华虹", 65, 64, "20261027134500"),
+            tencent_record("hk00981", "中芯", 75, 74, "20261027140100"),
+            tencent_record("sz300408", "三环", 40, 39, ""),
+        ])
+        fetcher = TencentBatchQuoteFetcher(
+            opener=lambda *args, **kwargs: FakeResponse(payload), retry_backoff_seconds=0,
+        )
+        quotes = fetcher.fetch(["HK01347", "HK00981", "300408"], now=now)
+        self.assertTrue(all(quote.is_stale for quote in quotes.values()))
+        self.assertEqual(fetcher.last_diagnostics["fallback_covered"], 0)
+        self.assertEqual(fetcher.last_diagnostics["route_rejections"], {
+            "stale_provider_timestamp": 2, "future_provider_timestamp": 2,
+            "missing_provider_timestamp": 2,
+        })
+        item = fetcher.last_diagnostics["route_stats"][0]["rejected_quotes"][0]
+        self.assertEqual(item["symbol"], "HK01347")
+        self.assertEqual(item["age_seconds"], 900)
+        self.assertIn("13:45:00", item["provider_timestamp"])
+
 
 class ReferenceLevelTests(unittest.TestCase):
     def test_linked_expired_or_inactive_report_cannot_restore_levels_via_history(self):

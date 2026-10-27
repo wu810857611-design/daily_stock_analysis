@@ -122,6 +122,7 @@ def test_hk_real_pdf_headers_accept_zero_omitted_standalone_code(monkeypatch, co
 
 @pytest.mark.parametrize("numeric_text", [
     "截至2026年10月20日收入1093萬元", "Revenue 1093", "1093.25", "11093", "10930", "101093",
+    "股份代號：1093.25", "報告提及其他公司股份代號：1093", "股份代號：10930",
 ])
 def test_hk_short_code_does_not_match_prose_prices_or_other_codes(monkeypatch, numeric_text):
     from types import SimpleNamespace
@@ -132,6 +133,41 @@ def test_hk_short_code_does_not_match_prose_prices_or_other_codes(monkeypatch, n
     ]))
     with pytest.raises(ValueError, match="identity"):
         announcement_excerpt("https://static.cninfo.com.cn/a.pdf", "HK01093", "石药集团")
+
+
+@pytest.mark.parametrize("header", ["（股份代號：2331）", "股票代码：２３３１", "股份代號: 02331"])
+def test_hk_labelled_header_accepts_exact_unpadded_issuer_code(monkeypatch, header):
+    from types import SimpleNamespace
+    monkeypatch.setattr("requests.get", lambda *args, **kwargs: Response(b"%PDF fixture"))
+    text = header + "\n" + "李寧有限公司董事會正式公告。" * 10
+    monkeypatch.setattr("pypdf.PdfReader", lambda stream: SimpleNamespace(pages=[
+        SimpleNamespace(extract_text=lambda: text),
+    ]))
+    result = announcement_excerpt("https://static.cninfo.com.cn/a.pdf", "HK02331", "李宁")
+    assert result["body_excerpt_available"] and result["content_reviewed"] is False
+    with pytest.raises(ValueError, match="identity"):
+        announcement_excerpt("https://static.cninfo.com.cn/a.pdf", "HK02330", "")
+
+
+@pytest.mark.parametrize("text,reason", [
+    ("", "announcement_document_text_missing"),
+    ("另一家公司的正式公告正文以及財務數據。" * 10, "announcement_document_identity_mismatch"),
+])
+def test_rejected_document_retains_bounded_public_evidence_across_worker(monkeypatch, text, reason):
+    from types import SimpleNamespace
+    from src.services.research_execution import ResearchCallError, run_isolated
+    monkeypatch.setattr("requests.get", lambda *args, **kwargs: Response(b"%PDF fixture"))
+    monkeypatch.setattr("pypdf.PdfReader", lambda stream: SimpleNamespace(pages=[
+        SimpleNamespace(extract_text=lambda: text),
+    ]))
+    with pytest.raises(ResearchCallError) as caught:
+        run_isolated(lambda: announcement_excerpt("https://static.cninfo.com.cn/a.pdf", "HK02331", ""), 1)
+    assert caught.value.error_class == reason
+    evidence = caught.value.evidence_diagnostics
+    assert evidence["document_source"] == "https://static.cninfo.com.cn/a.pdf"
+    assert evidence["document_bytes"] == len(b"%PDF fixture")
+    assert len(evidence["document_sha256"]) == 64
+    assert evidence["header_excerpt"] == text[:1600]
 
 
 @pytest.mark.parametrize("data,reason", [
