@@ -56,6 +56,40 @@ def test_percent_is_percentage_points_and_rounding_is_allowed():
     assert '0.27972%' in fact_contract(CANDIDATE)['rendered']
 
 
+@pytest.mark.parametrize('text_field', ['thesis', 'view', 'facts', 'risks', 'inferences', 'invalidators'])
+@pytest.mark.parametrize('claim', [
+    '2026-10-26新闻显示龙虎榜净卖出3.7亿元，占成交额6.29%，大资金流出明显',
+    '净卖出占当日成交额 6.29 ％，需关注流动性',
+    '净卖出佔總成交额6.29%，成交额58.7763亿元',
+])
+def test_turnover_share_is_not_a_snapshot_currency_amount(text_field, claim):
+    candidate = {'code': '002354', 'amount': 5877630000.0}
+    text = claim if text_field in {'thesis', 'view'} else [claim]
+    review = {'numeric_facts': numeric_facts(candidate), text_field: text}
+    assert validate_review_facts(review, candidate, require_echo=True) == []
+
+
+@pytest.mark.parametrize('claim', [
+    '成交额6.29元', '成交额6.29%', '占成交额6.29亿元',
+    '占成交额6.29%，成交额5.87763亿元',
+    '占成交额6.29%，当前价629元',
+    '占成交额1,19,779%',
+])
+def test_turnover_share_does_not_bypass_absolute_amount_or_other_claims(claim):
+    candidate = {'code': '002354', 'amount': 5877630000.0, 'price': 6.29}
+    review = {'numeric_facts': numeric_facts(candidate), 'risks': [claim]}
+    assert validate_review_facts(review, candidate, require_echo=True)
+
+
+def test_turnover_share_does_not_bypass_structured_amount_or_pe_precision():
+    candidate = {'code': '002009', 'amount': 5877630000.0, 'pe': 160.63}
+    review = {'numeric_facts': {**numeric_facts(candidate), 'amount': 6.29},
+              'risks': ['占成交额6.29%，PE160倍']}
+    errors = validate_review_facts(review, candidate, require_echo=True)
+    assert {(error['field'], error['error']) for error in errors} == {
+        ('amount', 'structured_mismatch'), ('pe', 'snapshot_claim_mismatch')}
+
+
 def test_dated_research_valuation_is_checked_without_replacing_entry_quote():
     candidate = {**CANDIDATE, "research_evidence": {"fundamentals": {"data": {
         "valuation": {"data": {"pe_ratio": 12.5, "pb_ratio": 1.2}, "status": "partial"}
@@ -191,6 +225,7 @@ def test_actual_review_batches_accept_neutral_scientific_and_nullable_contracts(
         batch = json.loads(kwargs['messages'][1]['content'])['candidates']
         reviews = [{'code': item['code'], 'verdict': 'pass',
                     'numeric_facts': {**item['numeric_fact_contract']['values'], 'pb': None},
+                    'risks': ['新闻净卖出占成交额6.29%'],
                     'facts': [item['numeric_fact_contract']['rendered'],
                               f"成交额{item['numeric_fact_contract']['values']['amount']:,.0f}HKD"]}
                    for item in batch]
