@@ -31,11 +31,11 @@ jobs:
           python - <<'PY'
           import json
           import time
-          from datetime import datetime
+          from datetime import datetime, timedelta
           from pathlib import Path
           from zoneinfo import ZoneInfo
           from src.services.research_execution import run_isolated
-          from src.services.research_evidence import cninfo_issuers, cninfo_announcement_index, announcement_excerpt
+          from src.services.research_evidence import cninfo_a_issuer, cninfo_issuers, cninfo_announcement_index, announcement_document_url, announcement_excerpt
           
           checks = []
           def check(stage, symbol, callback):
@@ -64,33 +64,30 @@ jobs:
           
           now = datetime.now(ZoneInfo("Asia/Shanghai"))
           for code in ("300473", "HK02331"):
-              issuers = check("issuers", code, lambda code=code: cninfo_issuers(code.startswith("HK")))
-              if issuers is not None:
-                  org_id = issuers.get(code.removeprefix("HK"))
-                  if org_id:
-                      check("index", code, lambda code=code, org_id=org_id: cninfo_announcement_index(code, org_id, now, 3))
-                  else:
-                      row = {"stage": "issuer_lookup", "symbol": code, "status": "failed", "error_class": "announcement_issuer_not_found"}
-                      checks.append(row)
-                      print("PUBLIC_SOURCE_PROBE " + json.dumps(row), flush=True)
-          
-          def exact_issuer_lookup():
-              import requests
-              url = 'https://www.cninfo.com.cn/new/information/topSearch/query'
-              with requests.post(url, data={'keyWord': '300473', 'maxNum': '10'},
-                                 headers={'Referer': 'https://www.cninfo.com.cn/'},
-                                 stream=True, timeout=(1.5, 2), allow_redirects=False) as response:
-                  response.raise_for_status()
-                  raw = bytearray()
-                  for chunk in response.iter_content(8192):
-                      raw.extend(chunk)
-                      if len(raw) > 65536:
-                          raise ValueError('lookup_response_too_large')
-                  return {'http_status': response.status_code, 'raw_payload': json.loads(raw)}
-          check('exact_issuer_lookup', '300473', exact_issuer_lookup)
-          check("known_rejected_pdf", "HK02331", lambda: announcement_excerpt(
-              "https://static.cninfo.com.cn/finalpage/2026-10-26/1225623347.PDF", "HK02331", "李宁"))
-          
+              if code.startswith("HK"):
+                  issuers = check("issuers", code, lambda code=code: cninfo_issuers(True))
+                  org_id = issuers.get(code[2:]) if issuers is not None else None
+              else:
+                  resolved = check("exact_a_issuer", code, lambda code=code: {"org_id": cninfo_a_issuer(code)})
+                  org_id = resolved.get("org_id") if resolved is not None else None
+              if not org_id:
+                  row = {"stage": "issuer_lookup", "symbol": code, "status": "failed", "error_class": "announcement_issuer_not_found"}
+                  checks.append(row)
+                  print("PUBLIC_SOURCE_PROBE " + json.dumps(row), flush=True)
+                  continue
+              index = check("index", code, lambda code=code, org_id=org_id: cninfo_announcement_index(code, org_id, now, 3))
+              if index is not None and index["rows"]:
+                  row = index["rows"][0]
+                  def read_indexed_body(row=row, code=code, org_id=org_id):
+                      if row["代码"] != code.removeprefix("HK") or row["orgId"] != org_id:
+                          raise ValueError("index_identity_mismatch")
+                      published = datetime.fromisoformat(row["公告时间"])
+                      if not now - timedelta(days=3) <= published <= datetime.now(now.tzinfo):
+                          raise ValueError("index_date_mismatch")
+                      url = announcement_document_url(row["公告链接"], code, row["公告时间"])
+                      return announcement_excerpt(url, code, "")
+                  check("indexed_body", code, read_indexed_body)
+
           states_path = Path("reports/workflows.json")
           if states_path.exists():
               try:
@@ -105,7 +102,7 @@ jobs:
                   print("WORKFLOW_METADATA_ERROR " + type(exc).__name__, flush=True)
           
           Path("reports/public_source_probe.json").write_text(json.dumps({
-              "tested_commit": "fc0ac36a560089a93fdb6395cb040a91d08aa14c",
+              "tested_commit": "ed0a1836a7016f61a7eaa5efb3722d99af2af76d",
               "diagnostic_at": now.isoformat(), "context": "standalone_GitHub_runner_read_only_not_production",
               "checks": checks}, ensure_ascii=False, indent=2))
           if any(row["status"] != "success" for row in checks):

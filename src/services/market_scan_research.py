@@ -16,7 +16,7 @@ from zoneinfo import ZoneInfo
 
 from src.services.research_execution import ResearchCallError, run_isolated
 from src.services.research_evidence import (
-    announcement_document_url, announcement_excerpt, cninfo_announcement_index, cninfo_issuers, recent_valuation,
+    announcement_document_url, announcement_excerpt, cninfo_a_issuer, cninfo_announcement_index, cninfo_issuers, recent_valuation,
 )
 
 
@@ -232,11 +232,23 @@ class ScanResearchCollector:
         try:
             offshore = code.startswith("HK")
             target = code[2:] if offshore else code
-            # Cache the map in this collector's parent, not a disposable worker's
-            # lru_cache. Each issuer query reads only one page, once, over HTTPS.
-            issuers = cached_call(budget, lambda: cninfo_issuers(offshore),
-                                  f"cninfo:issuers:{'hke' if offshore else 'szse'}")
-            org_id = issuers.get(target)
+            org_id = None
+            if not offshore:
+                try:
+                    org_id = cached_call(budget, lambda: cninfo_a_issuer(target),
+                                         f"cninfo:issuer_lookup:{code}")
+                except ResearchCallError as exc:
+                    # Conflicting official identities must not be resolved by
+                    # silently selecting a different endpoint's answer.
+                    if exc.error_class == "announcement_issuer_identity_ambiguous":
+                        raise
+                    errors.append(f"announcement_issuer_lookup:{exc.error_class}")
+            if org_id is None:
+                # The existing map remains HK's primary and A's bounded
+                # fallback. Cache it in the parent, never inside a worker.
+                issuers = cached_call(budget, lambda: cninfo_issuers(offshore),
+                                      f"cninfo:issuers:{'hke' if offshore else 'szse'}")
+                org_id = issuers.get(target)
             if not org_id:
                 raise ResearchCallError("announcement_issuer_not_found")
             announcement_key = f"cninfo:announcements:{code}:{now.date()}"
