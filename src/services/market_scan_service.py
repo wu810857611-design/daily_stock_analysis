@@ -2357,6 +2357,19 @@ class MarketScanService:
             )
             evidence_contracts[code] = evidence_contract
             payload.update(copy.deepcopy(evidence_contract))
+            # Rejected PDF headers and index rows are audit evidence, not
+            # company facts. Keep them in the artifact contract, never in
+            # either duplicate representation supplied to a model reviewer.
+            review_research = payload.get("research_evidence") or {}
+            review_research.pop("diagnostics", None)
+            for block in (review_research.get("announcements"),
+                          (payload.get("facts") or {}).get("official_announcements")):
+                if not isinstance(block, dict):
+                    continue
+                block.pop("rejected_rows", None)
+                for item in block.get("items") or []:
+                    if isinstance(item, dict):
+                        item.pop("body_diagnostics", None)
             payload["review_request"] = {
                 "proposed_action": "advance_to_intraday_entry_zone_review",
                 "deterministic_initial_position_fraction_range": [0.025, 0.10],

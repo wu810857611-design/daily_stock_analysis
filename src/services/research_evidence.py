@@ -2,12 +2,15 @@
 from __future__ import annotations
 
 import io
+import hashlib
+import json
 import math
 import re
+import unicodedata
 from itertools import islice
 from datetime import datetime, timedelta
 from typing import Any
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlencode, urlparse
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -16,9 +19,110 @@ import pandas as pd
 class AnnouncementEvidenceError(ValueError):
     """Stable, public guard reason retained across the isolated worker."""
 
-    def __init__(self, reason: str) -> None:
+    def __init__(self, reason: str, diagnostics: dict | None = None) -> None:
         self.error_class = reason
+        self.evidence_diagnostics = diagnostics or {}
         super().__init__(reason)
+
+
+def _cninfo_json(url: str, data: dict | None = None) -> dict:
+    """Read one official HTTPS response; the caller also enforces a killable deadline."""
+    import requests
+
+    method = requests.get if data is None else requests.post
+    kwargs = {} if data is None else {"data": data}
+    with method(url, headers={"Referer": "https://www.cninfo.com.cn/"},
+                stream=True, timeout=(1.5, 2), allow_redirects=False, **kwargs) as response:
+        response.raise_for_status()
+        if response.status_code != 200:
+            raise AnnouncementEvidenceError("announcement_index_redirect_or_non_json")
+        raw = bytearray()
+        for chunk in response.iter_content(32768):
+            raw.extend(chunk)
+            if len(raw) > 2 * 1024 * 1024:
+                raise AnnouncementEvidenceError("announcement_index_too_large")
+    try:
+        result = json.loads(raw)
+    except (ValueError, UnicodeError):
+        raise AnnouncementEvidenceError("announcement_index_invalid_json") from None
+    if not isinstance(result, dict):
+        raise AnnouncementEvidenceError("announcement_index_invalid_payload")
+    return result
+
+
+def cninfo_issuers(offshore: bool) -> dict[str, str]:
+    """Resolve exact official code/orgId pairs, including the HK issuer map."""
+    market = "hke" if offshore else "szse"
+    payload = _cninfo_json(f"https://www.cninfo.com.cn/new/data/{market}_stock.json")
+    rows = payload.get("stockList")
+    if not isinstance(rows, list) or not rows:
+        raise AnnouncementEvidenceError("announcement_issuer_map_invalid_payload")
+    result = {}
+    width = 5 if offshore else 6
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        code, org = str(row.get("code") or ""), str(row.get("orgId") or "")
+        if not re.fullmatch(rf"[0-9]{{{width}}}", code) or not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", org):
+            continue
+        if code in result and result[code] != org:
+            raise AnnouncementEvidenceError("announcement_issuer_identity_ambiguous")
+        result[code] = org
+    if not result:
+        raise AnnouncementEvidenceError("announcement_issuer_map_invalid_payload")
+    return result
+
+
+def cninfo_announcement_index(code: str, org_id: str, now: datetime, max_age_days: int) -> dict:
+    """Fetch the latest single page for one verified issuer, without duplicate pagination.
+
+    This is an index sample, never complete announcement coverage. Keep the
+    provider's count and pagination flag so a truncated result stays explicit.
+    """
+    offshore = code.startswith("HK")
+    identity = code[2:] if offshore else code
+    if (not re.fullmatch(r"[0-9]{5}" if offshore else r"[0-9]{6}", identity)
+            or not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", org_id)):
+        raise AnnouncementEvidenceError("announcement_query_identity_invalid")
+    start = (now - timedelta(days=max_age_days)).date().isoformat()
+    end = now.date().isoformat()
+    url = "https://www.cninfo.com.cn/new/hisAnnouncement/query"
+    query = {"pageNum": "1", "pageSize": "30", "column": "hke" if offshore else "szse",
+             "tabName": "fulltext", "plate": "", "stock": f"{identity},{org_id}",
+             "searchkey": "", "secid": "", "category": "", "trade": "",
+             "seDate": f"{start}~{end}", "sortName": "time", "sortType": "desc", "isHLtitle": "false"}
+    payload = _cninfo_json(url, query)
+    rows, total = payload.get("announcements"), payload.get("totalAnnouncement")
+    if isinstance(total, str) and re.fullmatch(r"[0-9]{1,10}", total):
+        total = int(total)
+    if (isinstance(total, bool) or not isinstance(total, int) or total < 0
+            or (rows is not None and not isinstance(rows, list))
+            or (total > 0 and not rows) or len(rows or []) > min(30, total)):
+        raise AnnouncementEvidenceError("announcement_index_invalid_payload")
+    result = []
+    for row in rows or []:
+        if not isinstance(row, dict):
+            raise AnnouncementEvidenceError("announcement_index_invalid_payload")
+        try:
+            stamp = row["announcementTime"]
+            if isinstance(stamp, bool) or not isinstance(stamp, (int, float)) or not math.isfinite(stamp):
+                raise ValueError
+            published = datetime.fromtimestamp(stamp / 1000, ZoneInfo("Asia/Shanghai")).isoformat()
+        except (KeyError, TypeError, ValueError, OverflowError, OSError):
+            published = ""
+        link = "https://www.cninfo.com.cn/new/disclosure/detail?" + urlencode({
+            "stockCode": str(row.get("secCode") or ""),
+            "announcementId": str(row.get("announcementId") or ""),
+            "orgId": str(row.get("orgId") or ""), "announcementTime": published[:10],
+        })
+        result.append({"代码": row.get("secCode"), "公告标题": row.get("announcementTitle"),
+                       "公告时间": published, "公告链接": link,
+                       "orgId": row.get("orgId")})
+    return {"rows": result, "query": {"source": url, "symbol": code, "org_id": org_id,
+            "from": start, "to": end, "page": 1, "page_size": 30,
+            "total_announcements": total, "returned_rows": len(result),
+            "has_more": bool(payload.get("hasMore")) or total > len(result),
+            "coverage": "latest_page_sample"}}
 
 
 def recent_valuation(frame: Any, now: datetime, max_age_days: int, fields: dict[str, str]) -> dict:
@@ -111,6 +215,9 @@ def announcement_excerpt(url: str, code: str, name: str) -> dict:
     reader = PdfReader(io.BytesIO(data))
     text = "\n".join((page.extract_text() or "")[:10000] for page in islice(reader.pages, 3))
     compact = "".join(text.split())
+    evidence = {"document_source": url, "document_sha256": hashlib.sha256(data).hexdigest(),
+                "document_bytes": len(data), "extracted_characters": len(compact),
+                "header_excerpt": text[:1600]}
     identity = code[2:] if code.startswith("HK") else code
     identity_present = bool(re.search(
         rf"(?<![A-Za-z0-9]){re.escape(identity)}(?![A-Za-z0-9])", compact
@@ -128,8 +235,17 @@ def announcement_excerpt(url: str, code: str, name: str) -> dict:
             header_code.fullmatch(line.strip()) for line in text[:1600].splitlines()
             if not re.search(r"[A-Za-z]{2,}", line)
         )
-    if len(compact) < 80 or not identity_present:
-        raise AnnouncementEvidenceError("announcement_document_identity_or_text_missing")
+        # A labelled issuer header is also unambiguous when its code omits
+        # leading zeroes; never admit an arbitrary number in body prose.
+        labelled_code = re.compile(
+            rf"(?:^|[\n(（])\s*(?:股份|股票)\s*代[號号码碼]\s*[:：]?\s*0*{short_code}(?![A-Za-z0-9.])"
+        )
+        identity_present = identity_present or bool(labelled_code.search(
+            unicodedata.normalize("NFKC", text[:1600])))
+    if len(compact) < 80:
+        raise AnnouncementEvidenceError("announcement_document_text_missing", evidence)
+    if not identity_present:
+        raise AnnouncementEvidenceError("announcement_document_identity_mismatch", evidence)
     return {"excerpt": text[:2000], "document_source": url,
             "extraction": "official_pdf_first_three_pages", "document_bytes": len(data),
             "content_reviewed": False, "body_excerpt_available": True}

@@ -15,7 +15,9 @@ from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
 from src.services.research_execution import ResearchCallError, run_isolated
-from src.services.research_evidence import announcement_document_url, announcement_excerpt, recent_valuation
+from src.services.research_evidence import (
+    announcement_document_url, announcement_excerpt, cninfo_announcement_index, cninfo_issuers, recent_valuation,
+)
 
 
 def meaningful(value: Any) -> bool:
@@ -76,6 +78,8 @@ class ResearchBudget:
                 last_error = exc
                 event.update(result="failed", error_class=exc.error_class,
                              elapsed=round(time.monotonic() - started, 3))
+                if exc.evidence_diagnostics:
+                    event["evidence_diagnostics"] = exc.evidence_diagnostics
                 self.events.append(event)
                 print(json.dumps({"event": "research_provider", **event}), flush=True)
                 if exc.error_class not in {"TimeoutError", "ConnectionError", "ConnectTimeout",
@@ -223,27 +227,25 @@ class ScanResearchCollector:
                                                      if isinstance(v, Mapping)) else "unavailable", "data": fundamental}
 
         announcements = {"status": "unavailable", "evidence_type": "official_announcement_index",
-                         "content_reviewed": False, "items": []}
+                         "content_reviewed": False, "items": [], "rejected_rows": []}
         budget = stage("announcements")
         try:
-            def fetch_announcements():
-                import akshare as ak
-                # HK has no stock-id map in AkShare: use a company-name query
-                # then verify the exact code below, never an unfiltered query.
-                offshore = code.startswith("HK")
-                if offshore and not candidate.get("name"):
-                    raise ResearchCallError("NotSupported", "HK announcement query requires company name")
-                return ak.stock_zh_a_disclosure_report_cninfo(
-                    symbol="" if offshore else code, market="港股" if offshore else "沪深京",
-                    keyword=str(candidate.get("name") or "") if offshore else "",
-                    start_date=(now - timedelta(days=config.news_max_age_days)).strftime("%Y%m%d"),
-                    end_date=now.strftime("%Y%m%d"),
-                )
+            offshore = code.startswith("HK")
+            target = code[2:] if offshore else code
+            # Cache the map in this collector's parent, not a disposable worker's
+            # lru_cache. Each issuer query reads only one page, once, over HTTPS.
+            issuers = cached_call(budget, lambda: cninfo_issuers(offshore),
+                                  f"cninfo:issuers:{'hke' if offshore else 'szse'}")
+            org_id = issuers.get(target)
+            if not org_id:
+                raise ResearchCallError("announcement_issuer_not_found")
             announcement_key = f"cninfo:announcements:{code}:{now.date()}"
-            frame = cached_call(budget, fetch_announcements, announcement_key)
+            index = cached_call(budget, lambda: cninfo_announcement_index(
+                code, org_id, now, config.news_max_age_days), announcement_key)
+            announcements["query"] = index["query"]
             items = []
             invalid_rows = 0
-            for row in frame.to_dict("records"):
+            for row in index["rows"]:
                 url = str(row.get("公告链接") or "")
                 host = (urlparse(url).hostname or "").lower()
                 date = str(row.get("公告时间") or "")
@@ -254,14 +256,19 @@ class ScanResearchCollector:
                 if published is not None and published.tzinfo is None:
                     published = published.replace(tzinfo=ZoneInfo("Asia/Shanghai"))
                 identity = str(row.get("代码") or "").strip().zfill(5 if code.startswith("HK") else 6)
-                target = code[2:] if code.startswith("HK") else code
-                if identity != target:
-                    continue
-                if (not row.get("公告标题")
+                reason = ""
+                if identity != target or str(row.get("orgId") or "") != org_id:
+                    reason = "identity_mismatch"
+                elif (not row.get("公告标题")
                         or host not in {"www.cninfo.com.cn", "static.cninfo.com.cn", "www.hkexnews.hk"}
                         or urlparse(url).scheme not in {"http", "https"} or published is None
                         or not now - timedelta(days=config.news_max_age_days) <= published <= datetime.now(now.tzinfo)):
+                    reason = "invalid_title_source_or_date"
+                if reason:
                     invalid_rows += 1
+                    if len(announcements["rejected_rows"]) < 10:
+                        announcements["rejected_rows"].append({"reason": reason, "code": identity,
+                            "title": str(row.get("公告标题") or "")[:300], "url": url[:1000], "published_date": date[:100]})
                     continue
                 items.append({"title": str(row["公告标题"]), "url": url,
                               "published_date": published.isoformat(), "source": "cninfo"})
@@ -271,6 +278,7 @@ class ScanResearchCollector:
             for item in announcements["items"][:1]:
                 try:
                     document_url = announcement_document_url(item["url"], code, item["published_date"])
+                    item["document_source"] = document_url
                     document = cached_call(budget, lambda: announcement_excerpt(document_url, code,
                                              str(candidate.get("name") or "")), f"official_document:{item['url']}:{code}",
                                            reserve_for_fallback=False)
@@ -279,6 +287,8 @@ class ScanResearchCollector:
                                                 if e.get("provider") == f"official_document:{item['url']}:{code}"), "")
                 except Exception as exc:
                     item["body_status"] = getattr(exc, "error_class", type(exc).__name__)
+                    if getattr(exc, "evidence_diagnostics", None):
+                        item["body_diagnostics"] = exc.evidence_diagnostics
                     errors.append(f"announcement_body:{item['body_status']}")
             announcements["body_excerpt_count"] = sum(bool(item.get("body_excerpt_available")) for item in announcements["items"])
             if not items:

@@ -18,8 +18,9 @@ from typing import Any, Callable
 
 
 class ResearchCallError(RuntimeError):
-    def __init__(self, error_class: str, detail: str = "") -> None:
+    def __init__(self, error_class: str, detail: str = "", evidence_diagnostics: dict | None = None) -> None:
         self.error_class = error_class
+        self.evidence_diagnostics = evidence_diagnostics or {}
         super().__init__(f"{error_class}: {detail}"[:500])
 
 
@@ -52,7 +53,18 @@ def _execute(callback: Callable[[], Any], path: str, budget: float,
         if len(serialized) > 16 * 1024 * 1024:
             raise ValueError("research result exceeds 16 MiB")
     except BaseException as exc:
-        serialized = pickle.dumps(("error", getattr(exc, "error_class", type(exc).__name__), str(exc)[:400]))
+        # Only the official PDF reader attaches this bounded, public evidence.
+        public = getattr(exc, "evidence_diagnostics", {})
+        diagnostics = {}
+        if isinstance(public, dict):
+            for key, limit in (("document_source", 1000), ("document_sha256", 64), ("header_excerpt", 1600)):
+                if isinstance(public.get(key), str):
+                    diagnostics[key] = public[key][:limit]
+            for key in ("document_bytes", "extracted_characters"):
+                if isinstance(public.get(key), int) and not isinstance(public[key], bool):
+                    diagnostics[key] = public[key]
+        serialized = pickle.dumps(("error", getattr(exc, "error_class", type(exc).__name__),
+                                   str(exc)[:400], diagnostics))
     Path(path).write_bytes(serialized)
 
 
@@ -82,7 +94,7 @@ def run_isolated(callback: Callable[[], Any], timeout_seconds: float, *,
                 raise ResearchCallError("WorkerExited", str(process.exitcode))
             payload = pickle.loads(Path(path).read_bytes())
             if payload[0] == "error":
-                raise ResearchCallError(payload[1], payload[2])
+                raise ResearchCallError(payload[1], payload[2], payload[3])
             return payload[1]
         finally:
             if process.pid is not None:

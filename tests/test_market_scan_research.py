@@ -63,6 +63,16 @@ def configured(monkeypatch):
     monkeypatch.setattr("src.services.market_scan_research.announcement_excerpt",
                         lambda *args: {"body_excerpt_available": False})
     monkeypatch.setattr(ak, "stock_zh_a_disclosure_report_cninfo", announcements)
+    monkeypatch.setattr("src.services.market_scan_research.cninfo_issuers",
+                        lambda offshore: {"00700" if offshore else "603259": "fixture"})
+    def index(code, org_id, now, max_age_days):
+        frame = ak.stock_zh_a_disclosure_report_cninfo(
+            symbol=code[2:] if code.startswith("HK") else code,
+            market="港股" if code.startswith("HK") else "沪深京", keyword="",
+        )
+        return {"rows": [{**row, "orgId": org_id} for row in frame.to_dict("records")],
+                "query": {"symbol": code, "coverage": "latest_page_sample"}}
+    monkeypatch.setattr("src.services.market_scan_research.cninfo_announcement_index", index)
     return ak, service
 
 
@@ -424,11 +434,11 @@ def test_nonempty_but_useless_financial_table_advances_to_fallback(configured, m
     assert any(event.get("fallback_result") == "recovered" for event in result["diagnostics"])
 
 
-def test_hk_announcement_query_is_company_scoped_and_exact_code_checked(configured, monkeypatch):
+def test_hk_announcement_query_is_issuer_scoped_and_exact_code_checked(configured, monkeypatch):
     ak, _ = configured
     def hk(**kwargs):
-        assert kwargs["symbol"] == ""
-        assert kwargs["market"] == "港股" and kwargs["keyword"] == "腾讯控股"
+        assert kwargs["symbol"] == "00700"
+        assert kwargs["market"] == "港股" and kwargs["keyword"] == ""
         frame = announcements()
         frame["代码"] = "00700"
         frame["公告链接"] = "https://www.hkexnews.hk/listedco/fixture.pdf"
@@ -438,3 +448,86 @@ def test_hk_announcement_query_is_company_scoped_and_exact_code_checked(configur
                         lambda self, code, **kwargs: {"growth": {"roe": 18.2}})
     result = ScanResearchCollector(2)({"code": "HK00700", "name": "腾讯控股"})
     assert result["announcements"]["items"][0]["url"].startswith("https://www.hkexnews.hk/")
+
+
+def test_issuer_map_is_cached_in_parent_across_isolated_candidates(configured):
+    collector = ScanResearchCollector(2)
+    collector(CANDIDATE)
+    again = collector(CANDIDATE)
+    assert any(e["provider"] == "cninfo:issuers:szse" and e["result"] == "cache_hit"
+               for e in again["diagnostics"])
+
+
+def test_missing_issuer_never_falls_back_to_an_unscoped_company_search(configured, monkeypatch):
+    monkeypatch.setattr("src.services.market_scan_research.cninfo_issuers", lambda offshore: {})
+    def forbidden(*args):
+        raise AssertionError("An unknown issuer must not query announcements")
+    monkeypatch.setattr("src.services.market_scan_research.cninfo_announcement_index", forbidden)
+    result = ScanResearchCollector(2)(CANDIDATE)
+    assert "announcements:announcement_issuer_not_found" in result["errors"]
+    assert result["announcements"]["status"] == "unavailable"
+
+
+def test_rejected_index_row_keeps_identity_and_original_fields(configured, monkeypatch):
+    monkeypatch.setattr("src.services.market_scan_research.cninfo_announcement_index", lambda *args: {
+        "rows": [{**announcements().to_dict("records")[0], "代码": "603259", "orgId": "wrong"}],
+        "query": {"coverage": "latest_page_sample"},
+    })
+    result = ScanResearchCollector(2)(CANDIDATE)
+    block = result["announcements"]
+    assert block["status"] == "invalid_payload" and not block["items"]
+    assert block["rejected_rows"][0]["reason"] == "identity_mismatch"
+    assert block["rejected_rows"][0]["title"] == "药明康德半年度报告"
+
+
+def test_rejected_pdf_diagnostics_reach_candidate_artifact(configured, monkeypatch):
+    from src.services.research_evidence import AnnouncementEvidenceError
+    evidence = {"document_source": "https://static.cninfo.com.cn/finalpage/fixture.pdf",
+                "document_sha256": "a" * 64, "document_bytes": 123,
+                "extracted_characters": 100, "header_excerpt": "另一家公司的正文"}
+    def rejected(*args):
+        raise AnnouncementEvidenceError("announcement_document_identity_mismatch", evidence)
+    monkeypatch.setattr("src.services.market_scan_research.announcement_excerpt", rejected)
+    result = ScanResearchCollector(2)(CANDIDATE)
+    item = result["announcements"]["items"][0]
+    assert item["body_status"] == "announcement_document_identity_mismatch"
+    assert item["body_diagnostics"] == evidence
+    assert "announcement_body" in result["missing_fields"]
+    assert result["status"] == "partial"
+    assert any(e.get("evidence_diagnostics") == evidence for e in result["diagnostics"])
+
+
+def test_actual_https_index_transport_integrates_with_parent_cache(configured, monkeypatch, tmp_path):
+    from contextlib import nullcontext
+    import json
+    from src.services import research_evidence
+    calls = tmp_path / "http_calls.jsonl"
+    def response(payload):
+        return nullcontext(SimpleNamespace(status_code=200, raise_for_status=lambda: None,
+            iter_content=lambda size: [json.dumps(payload).encode()]))
+    def record(kind, value):
+        with calls.open("a") as handle:
+            handle.write(json.dumps([kind, value]) + "\n")
+    def get(url, **kwargs):
+        record("map", url)
+        return response({"stockList": [{"code": code, "orgId": "fixture"} for code in ("603259", "300473")]})
+    def post(url, **kwargs):
+        record("index", kwargs["data"]["stock"])
+        return response({"totalAnnouncement": 1, "announcements": [{
+            "secCode": kwargs["data"]["stock"].split(",")[0], "orgId": "fixture",
+            "announcementId": "123456", "announcementTitle": "正式公告",
+            "announcementTime": int((datetime.now(timezone.utc) - timedelta(hours=1)).timestamp() * 1000),
+        }]})
+    monkeypatch.setattr("requests.get", get)
+    monkeypatch.setattr("requests.post", post)
+    monkeypatch.setattr("src.services.market_scan_research.cninfo_issuers", research_evidence.cninfo_issuers)
+    monkeypatch.setattr("src.services.market_scan_research.cninfo_announcement_index", research_evidence.cninfo_announcement_index)
+    collector = ScanResearchCollector(2)
+    for code in ("603259", "300473"):
+        result = collector({**CANDIDATE, "code": code})
+        assert result["announcements"]["items"]
+        assert result["announcements"]["query"]["symbol"] == code
+        assert result["announcements"]["content_reviewed"] is False
+    recorded = [json.loads(line) for line in calls.read_text().splitlines()]
+    assert recorded == [["map", "https://www.cninfo.com.cn/new/data/szse_stock.json"],
+                        ["index", "603259,fixture"], ["index", "300473,fixture"]]
