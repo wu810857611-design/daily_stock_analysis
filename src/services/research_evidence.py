@@ -25,7 +25,7 @@ class AnnouncementEvidenceError(ValueError):
         super().__init__(reason)
 
 
-def _cninfo_json(url: str, data: dict | None = None) -> dict:
+def _cninfo_json(url: str, data: dict | None = None, *, expected_type: type = dict) -> Any:
     """Read one official HTTPS response; the caller also enforces a killable deadline."""
     import requests
 
@@ -45,9 +45,37 @@ def _cninfo_json(url: str, data: dict | None = None) -> dict:
         result = json.loads(raw)
     except (ValueError, UnicodeError):
         raise AnnouncementEvidenceError("announcement_index_invalid_json") from None
-    if not isinstance(result, dict):
+    if not isinstance(result, expected_type):
         raise AnnouncementEvidenceError("announcement_index_invalid_payload")
     return result
+
+
+def cninfo_issuer(code: str) -> str:
+    """Resolve one exact A/H issuer without downloading the entire code map."""
+    offshore = code.startswith("HK")
+    identity = code[2:] if offshore else code
+    category = "港股" if offshore else "A股"
+    if not re.fullmatch(r"[0-9]{5}" if offshore else r"[0-9]{6}", identity):
+        raise AnnouncementEvidenceError("announcement_query_identity_invalid")
+    rows = _cninfo_json("https://www.cninfo.com.cn/new/information/topSearch/query",
+                       {"keyWord": identity, "maxNum": "10"}, expected_type=list)
+    if len(rows) > 10 or any(not isinstance(row, dict) for row in rows):
+        raise AnnouncementEvidenceError("announcement_issuer_lookup_invalid_payload")
+    identities = set()
+    for row in rows:
+        # A suggestion match, company name or another security category is
+        # insufficient. HK02331 and A-share 002331 must never be confused.
+        if str(row.get("code") or "") != identity or row.get("category") != category:
+            continue
+        org_id = str(row.get("orgId") or "")
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", org_id):
+            raise AnnouncementEvidenceError("announcement_issuer_lookup_invalid_identity")
+        identities.add(org_id)
+    if len(identities) > 1:
+        raise AnnouncementEvidenceError("announcement_issuer_identity_ambiguous")
+    if not identities:
+        raise AnnouncementEvidenceError("announcement_issuer_lookup_no_exact_match")
+    return next(iter(identities))
 
 
 def cninfo_issuers(offshore: bool) -> dict[str, str]:

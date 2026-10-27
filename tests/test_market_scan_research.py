@@ -63,6 +63,7 @@ def configured(monkeypatch):
     monkeypatch.setattr("src.services.market_scan_research.announcement_excerpt",
                         lambda *args: {"body_excerpt_available": False})
     monkeypatch.setattr(ak, "stock_zh_a_disclosure_report_cninfo", announcements)
+    monkeypatch.setattr("src.services.market_scan_research.cninfo_issuer", lambda code: "fixture")
     monkeypatch.setattr("src.services.market_scan_research.cninfo_issuers",
                         lambda offshore: {"00700" if offshore else "603259": "fixture"})
     def index(code, org_id, now, max_age_days):
@@ -450,15 +451,19 @@ def test_hk_announcement_query_is_issuer_scoped_and_exact_code_checked(configure
     assert result["announcements"]["items"][0]["url"].startswith("https://www.hkexnews.hk/")
 
 
-def test_issuer_map_is_cached_in_parent_across_isolated_candidates(configured):
+def test_exact_issuer_is_cached_in_parent_across_isolated_candidates(configured):
     collector = ScanResearchCollector(2)
     collector(CANDIDATE)
     again = collector(CANDIDATE)
-    assert any(e["provider"] == "cninfo:issuers:szse" and e["result"] == "cache_hit"
+    assert any(e["provider"] == "cninfo:issuer_lookup:603259" and e["result"] == "cache_hit"
                for e in again["diagnostics"])
 
 
 def test_missing_issuer_never_falls_back_to_an_unscoped_company_search(configured, monkeypatch):
+    from src.services.research_evidence import AnnouncementEvidenceError
+    def missing(code):
+        raise AnnouncementEvidenceError("announcement_issuer_lookup_no_exact_match")
+    monkeypatch.setattr("src.services.market_scan_research.cninfo_issuer", missing)
     monkeypatch.setattr("src.services.market_scan_research.cninfo_issuers", lambda offshore: {})
     def forbidden(*args):
         raise AssertionError("An unknown issuer must not query announcements")
@@ -509,9 +514,12 @@ def test_actual_https_index_transport_integrates_with_parent_cache(configured, m
         with calls.open("a") as handle:
             handle.write(json.dumps([kind, value]) + "\n")
     def get(url, **kwargs):
-        record("map", url)
-        return response({"stockList": [{"code": code, "orgId": "fixture"} for code in ("603259", "300473")]})
+        raise AssertionError("Successful exact lookup must not download the bulk map")
     def post(url, **kwargs):
+        if url.endswith("/topSearch/query"):
+            code = kwargs["data"]["keyWord"]
+            record("lookup", code)
+            return response([{"code": code, "orgId": "fixture", "category": "A股"}])
         record("index", kwargs["data"]["stock"])
         return response({"totalAnnouncement": 1, "announcements": [{
             "secCode": kwargs["data"]["stock"].split(",")[0], "orgId": "fixture",
@@ -520,14 +528,36 @@ def test_actual_https_index_transport_integrates_with_parent_cache(configured, m
         }]})
     monkeypatch.setattr("requests.get", get)
     monkeypatch.setattr("requests.post", post)
+    monkeypatch.setattr("src.services.market_scan_research.cninfo_issuer", research_evidence.cninfo_issuer)
     monkeypatch.setattr("src.services.market_scan_research.cninfo_issuers", research_evidence.cninfo_issuers)
     monkeypatch.setattr("src.services.market_scan_research.cninfo_announcement_index", research_evidence.cninfo_announcement_index)
     collector = ScanResearchCollector(2)
-    for code in ("603259", "300473"):
+    for code in ("603259", "603259", "300473"):
         result = collector({**CANDIDATE, "code": code})
         assert result["announcements"]["items"]
         assert result["announcements"]["query"]["symbol"] == code
         assert result["announcements"]["content_reviewed"] is False
     recorded = [json.loads(line) for line in calls.read_text().splitlines()]
-    assert recorded == [["map", "https://www.cninfo.com.cn/new/data/szse_stock.json"],
-                        ["index", "603259,fixture"], ["index", "300473,fixture"]]
+    assert recorded == [["lookup", "603259"], ["index", "603259,fixture"],
+                        ["lookup", "300473"], ["index", "300473,fixture"]]
+
+
+def test_exact_issuer_timeout_uses_original_bounded_map_fallback(configured, monkeypatch):
+    monkeypatch.setattr("src.services.market_scan_research.cninfo_issuer", hanging)
+    result = ScanResearchCollector(2)(CANDIDATE)
+    assert result["announcements"]["items"]
+    assert "announcement_issuer_lookup:TimeoutError" in result["errors"]
+    assert any(e["provider"] == "cninfo:issuers:szse" and e.get("fallback_result") == "recovered"
+               for e in result["diagnostics"])
+    assert not multiprocessing.active_children()
+
+
+def test_conflicting_exact_issuer_is_not_bypassed_by_map_fallback(configured, monkeypatch):
+    from src.services.research_evidence import AnnouncementEvidenceError
+    def ambiguous(code):
+        raise AnnouncementEvidenceError("announcement_issuer_identity_ambiguous")
+    monkeypatch.setattr("src.services.market_scan_research.cninfo_issuer", ambiguous)
+    result = ScanResearchCollector(2)(CANDIDATE)
+    assert not result["announcements"]["items"]
+    assert "announcements:announcement_issuer_identity_ambiguous" in result["errors"]
+    assert not any(e["provider"].startswith("cninfo:issuers:") for e in result["diagnostics"])
