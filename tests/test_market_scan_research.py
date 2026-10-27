@@ -63,7 +63,7 @@ def configured(monkeypatch):
     monkeypatch.setattr("src.services.market_scan_research.announcement_excerpt",
                         lambda *args: {"body_excerpt_available": False})
     monkeypatch.setattr(ak, "stock_zh_a_disclosure_report_cninfo", announcements)
-    monkeypatch.setattr("src.services.market_scan_research.cninfo_a_issuer", lambda code: "fixture")
+    monkeypatch.setattr("src.services.market_scan_research.cninfo_issuer", lambda code: "fixture")
     monkeypatch.setattr("src.services.market_scan_research.cninfo_issuers",
                         lambda offshore: {"00700" if offshore else "603259": "fixture"})
     def index(code, org_id, now, max_age_days):
@@ -463,7 +463,7 @@ def test_missing_issuer_never_falls_back_to_an_unscoped_company_search(configure
     from src.services.research_evidence import AnnouncementEvidenceError
     def missing(code):
         raise AnnouncementEvidenceError("announcement_issuer_lookup_no_exact_match")
-    monkeypatch.setattr("src.services.market_scan_research.cninfo_a_issuer", missing)
+    monkeypatch.setattr("src.services.market_scan_research.cninfo_issuer", missing)
     monkeypatch.setattr("src.services.market_scan_research.cninfo_issuers", lambda offshore: {})
     def forbidden(*args):
         raise AssertionError("An unknown issuer must not query announcements")
@@ -528,7 +528,7 @@ def test_actual_https_index_transport_integrates_with_parent_cache(configured, m
         }]})
     monkeypatch.setattr("requests.get", get)
     monkeypatch.setattr("requests.post", post)
-    monkeypatch.setattr("src.services.market_scan_research.cninfo_a_issuer", research_evidence.cninfo_a_issuer)
+    monkeypatch.setattr("src.services.market_scan_research.cninfo_issuer", research_evidence.cninfo_issuer)
     monkeypatch.setattr("src.services.market_scan_research.cninfo_issuers", research_evidence.cninfo_issuers)
     monkeypatch.setattr("src.services.market_scan_research.cninfo_announcement_index", research_evidence.cninfo_announcement_index)
     collector = ScanResearchCollector(2)
@@ -543,7 +543,7 @@ def test_actual_https_index_transport_integrates_with_parent_cache(configured, m
 
 
 def test_exact_issuer_timeout_uses_original_bounded_map_fallback(configured, monkeypatch):
-    monkeypatch.setattr("src.services.market_scan_research.cninfo_a_issuer", hanging)
+    monkeypatch.setattr("src.services.market_scan_research.cninfo_issuer", hanging)
     result = ScanResearchCollector(2)(CANDIDATE)
     assert result["announcements"]["items"]
     assert "announcement_issuer_lookup:TimeoutError" in result["errors"]
@@ -556,7 +556,7 @@ def test_conflicting_exact_issuer_is_not_bypassed_by_map_fallback(configured, mo
     from src.services.research_evidence import AnnouncementEvidenceError
     def ambiguous(code):
         raise AnnouncementEvidenceError("announcement_issuer_identity_ambiguous")
-    monkeypatch.setattr("src.services.market_scan_research.cninfo_a_issuer", ambiguous)
+    monkeypatch.setattr("src.services.market_scan_research.cninfo_issuer", ambiguous)
     result = ScanResearchCollector(2)(CANDIDATE)
     assert not result["announcements"]["items"]
     assert "announcements:announcement_issuer_identity_ambiguous" in result["errors"]

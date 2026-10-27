@@ -50,19 +50,22 @@ def _cninfo_json(url: str, data: dict | None = None, *, expected_type: type = di
     return result
 
 
-def cninfo_a_issuer(code: str) -> str:
-    """Resolve one exact A-share issuer without downloading the entire code map."""
-    if not re.fullmatch(r"[0-9]{6}", code):
+def cninfo_issuer(code: str) -> str:
+    """Resolve one exact A/H issuer without downloading the entire code map."""
+    offshore = code.startswith("HK")
+    identity = code[2:] if offshore else code
+    category = "港股" if offshore else "A股"
+    if not re.fullmatch(r"[0-9]{5}" if offshore else r"[0-9]{6}", identity):
         raise AnnouncementEvidenceError("announcement_query_identity_invalid")
     rows = _cninfo_json("https://www.cninfo.com.cn/new/information/topSearch/query",
-                       {"keyWord": code, "maxNum": "10"}, expected_type=list)
+                       {"keyWord": identity, "maxNum": "10"}, expected_type=list)
     if len(rows) > 10 or any(not isinstance(row, dict) for row in rows):
         raise AnnouncementEvidenceError("announcement_issuer_lookup_invalid_payload")
     identities = set()
     for row in rows:
         # A suggestion match, company name or another security category is
-        # insufficient. Only the exact code and explicit A-share category pass.
-        if str(row.get("code") or "") != code or row.get("category") != "A股":
+        # insufficient. HK02331 and A-share 002331 must never be confused.
+        if str(row.get("code") or "") != identity or row.get("category") != category:
             continue
         org_id = str(row.get("orgId") or "")
         if not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", org_id):
