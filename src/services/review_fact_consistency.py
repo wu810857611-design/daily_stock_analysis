@@ -131,6 +131,14 @@ def validate_review_facts(review: Mapping[str, Any], candidate: Mapping[str, Any
                     errors.append({"field": field, "error": "invalid_numeric_format",
                                    "claim": match.group(0), **context})
                     continue
+                if (field == "amount" and not match.group(2) and not match.group(3)
+                        and re.search(r"(?:占|佔)(?:当日|當日|总|總)?\s*$",
+                                      text[max(0, match.start() - 16):match.start()])
+                        and re.match(r"[%％]", text[match.end():])):
+                    # "占成交额6.29%" states a share, not a currency amount.
+                    # It is outside the snapshot-amount contract; structured
+                    # echoes and any absolute amount claims still get checked.
+                    continue
                 value = float(literal.replace(",", ""))
                 if field not in expected:
                     errors.append({"field": field, "observed": value,
