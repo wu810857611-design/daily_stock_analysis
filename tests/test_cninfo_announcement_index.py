@@ -4,7 +4,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from src.services.research_evidence import cninfo_a_issuer, cninfo_announcement_index, cninfo_issuers
+from src.services.research_evidence import cninfo_issuer, cninfo_announcement_index, cninfo_issuers
 
 
 class Response:
@@ -108,30 +108,38 @@ def test_index_redirect_is_rejected_without_following(monkeypatch):
         cninfo_announcement_index("HK02331", "issuer", NOW, 3)
 
 
-def test_exact_a_issuer_uses_small_official_query_and_excludes_other_codes_and_categories(monkeypatch):
+@pytest.mark.parametrize("code,identity,category,org_id", [
+    ("300473", "300473", "A股", "9900024764"),
+    ("HK02331", "02331", "港股", "gshk0002331"),
+])
+def test_exact_issuer_uses_small_official_query_and_excludes_other_codes_and_categories(
+    monkeypatch, code, identity, category, org_id,
+):
     calls = []
     def post(url, **kwargs):
         calls.append(url)
         assert url == "https://www.cninfo.com.cn/new/information/topSearch/query"
-        assert kwargs["data"] == {"keyWord": "300473", "maxNum": "10"}
+        assert kwargs["data"] == {"keyWord": identity, "maxNum": "10"}
         assert kwargs["timeout"] == (1.5, 2) and kwargs["allow_redirects"] is False
         return Response([
             {"code": "300474", "category": "A股", "orgId": "wrong-code"},
-            {"code": "300473", "category": "基金", "orgId": "wrong-category"},
-            {"code": "300473", "category": "A股", "orgId": "9900024764"},
+            {"code": identity, "category": "基金", "orgId": "wrong-category"},
+            {"code": "002331", "category": "A股", "orgId": "9900009829"},
+            {"code": "102331", "category": "国债", "orgId": "9900000461"},
+            {"code": identity, "category": category, "orgId": org_id},
         ])
     monkeypatch.setattr("requests.post", post)
-    assert cninfo_a_issuer("300473") == "9900024764"
+    assert cninfo_issuer(code) == org_id
     assert len(calls) == 1
 
 
-@pytest.mark.parametrize("code", ["HK02331", "30047", "300473;other", " 300473"])
+@pytest.mark.parametrize("code", ["HK02331x", "HK2331", "30047", "300473;other", " 300473"])
 def test_invalid_a_issuer_query_never_requests_upstream(monkeypatch, code):
     def forbidden(*args, **kwargs):
         raise AssertionError("Invalid identity must fail before HTTP")
     monkeypatch.setattr("requests.post", forbidden)
     with pytest.raises(ValueError, match="query_identity_invalid"):
-        cninfo_a_issuer(code)
+        cninfo_issuer(code)
 
 
 @pytest.mark.parametrize("rows,reason", [
@@ -147,4 +155,13 @@ def test_invalid_a_issuer_query_never_requests_upstream(monkeypatch, code):
 def test_bad_or_conflicting_a_issuer_payload_fails_closed(monkeypatch, rows, reason):
     monkeypatch.setattr("requests.post", lambda *args, **kwargs: Response(rows))
     with pytest.raises(ValueError, match=reason):
-        cninfo_a_issuer("300473")
+        cninfo_issuer("300473")
+
+
+def test_real_hk_suggestions_cannot_substitute_an_a_share_or_bond(monkeypatch):
+    monkeypatch.setattr("requests.post", lambda *args, **kwargs: Response([
+        {"code": "002331", "category": "A股", "orgId": "9900009829"},
+        {"code": "102331", "category": "国债", "orgId": "9900000461"},
+    ]))
+    with pytest.raises(ValueError, match="lookup_no_exact_match"):
+        cninfo_issuer("HK02331")
