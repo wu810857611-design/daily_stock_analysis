@@ -3,6 +3,11 @@
 from __future__ import annotations
 
 from pathlib import Path
+import subprocess
+import sys
+import tempfile
+import textwrap
+import unittest
 
 from scripts.account_watchlists import PRIMARY_SYMBOLS, priority_analysis_pools
 
@@ -71,3 +76,81 @@ def test_watch_layer_failures_cannot_change_primary_coverage_gate() -> None:
     assert "OPTIONAL_ANALYSIS_DEADLINE" in text
     assert "JOB_BUDGET_STARTED_EPOCH" in text
     assert "OPTIONAL_SAFETY_MARGIN_SECONDS" in text
+
+
+class ReportArchiveTests(unittest.TestCase):
+    """Execute the deployed shell boundary with local commands, never production."""
+
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.reports = self.root / "reports"
+        self.reports.mkdir()
+        self.stock = self.reports / "report_20261028.md"
+        self.stock.write_text("previous CN batch", encoding="utf-8")
+        (self.reports / "market_review_20261028.md").write_text("previous market")
+        self.destination = self.reports / "p2_account_holdings" / "hk"
+
+    def run_command(self, code: str, *, timed: bool = False) -> subprocess.CompletedProcess:
+        text = _workflow_text()
+        start = text.index("          run_with_report_archive() {")
+        end = text.index("          run_analysis_layer() {", start)
+        function = textwrap.dedent(text[start:end])
+        invocation = 'run_with_report_archive "$1" '
+        invocation += 'timeout 0.1s ' if timed else ''
+        invocation += '"$2" -c "$3"'
+        return subprocess.run(
+            ["bash", "-c", "set -euo pipefail\n" + function + invocation,
+             "archive-test", str(self.destination), sys.executable, code],
+            cwd=self.root, capture_output=True, text=True, timeout=10,
+        )
+
+    def test_success_archives_only_this_invocations_report(self) -> None:
+        result = self.run_command(
+            "from pathlib import Path; Path('reports/report_20261028.md').write_text('new HK batch')"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((self.destination / self.stock.name).read_text(), "new HK batch")
+        self.assertFalse((self.destination / "market_review_20261028.md").exists())
+        self.assertEqual(self.stock.read_text(), "new HK batch")
+        self.assertTrue((self.reports / "market_review_20261028.md").exists())
+
+    def test_failed_no_output_cannot_archive_previous_batch(self) -> None:
+        result = self.run_command("raise SystemExit(7)")
+        self.assertEqual(result.returncode, 7)
+        self.assertEqual(list(self.destination.iterdir()), [])
+        self.assertEqual(self.stock.read_text(), "previous CN batch")
+
+    def test_actual_timeout_cannot_archive_previous_batch(self) -> None:
+        result = self.run_command("import time; time.sleep(5)", timed=True)
+        self.assertEqual(result.returncode, 124)
+        self.assertEqual(list(self.destination.iterdir()), [])
+        self.assertEqual(self.stock.read_text(), "previous CN batch")
+
+    def test_success_without_output_is_not_an_existing_report(self) -> None:
+        result = self.run_command("pass")
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(list(self.destination.iterdir()), [])
+
+    def test_partial_output_is_preserved_without_hiding_failure(self) -> None:
+        result = self.run_command(
+            "from pathlib import Path; Path('reports/report_20261028.md').write_text('partial HK'); "
+            "raise SystemExit(3)"
+        )
+        self.assertEqual(result.returncode, 3)
+        self.assertEqual((self.destination / self.stock.name).read_text(), "partial HK")
+        self.assertFalse((self.destination / "market_review_20261028.md").exists())
+
+    def test_new_output_with_identical_bytes_still_belongs_to_this_call(self) -> None:
+        result = self.run_command(
+            "from pathlib import Path; Path('reports/report_20261028.md').write_text('previous CN batch')"
+        )
+        self.assertEqual(result.returncode, 0)
+        self.assertTrue((self.destination / self.stock.name).exists())
+
+    def test_all_close_report_invocations_use_archive_boundary(self) -> None:
+        text = _workflow_text()
+        self.assertEqual(text.count('run_with_report_archive "reports/${priority,,}/$market"'), 2)
+        self.assertIn("run_with_report_archive reports/market", text)
+        self.assertNotIn('cp reports/*.md "reports/${priority,,}/$market/"', text)
