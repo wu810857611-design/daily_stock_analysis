@@ -15,6 +15,9 @@
   截断历史或日期不明时拒绝进入生产；显式`trade_date`只能核对原始run归属日，不能
   覆盖时间窗。外部收盘也保留19:27收盘扫描兜底，重复入口不会重复产生扫描或记账。
   验收须核对原始创建时间、实际提交、归属日、PRIMARY覆盖及产物，不能只看绿色状态。
+  分层目录只归档该批命令新生成的报告。旁路分析超时或未生成报告时，其目录不会
+  借用上一批报告；本批部分输出也只代表部分完成。根目录保留最近一次实际输出，
+  不能凭目录存在或根目录文件判定某层、某市场的分析已完成。
   调度语义参见 [GitHub schedule 官方说明](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#schedule)。
 - `01-intraday-session.yml`：外部 cron-job.org 仍是主要精准触发源，在交易日
   北京时间 09:20 以 `workflow_dispatch` 触发 `session=morning`，12:50 触发

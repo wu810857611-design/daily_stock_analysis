@@ -818,6 +818,38 @@ jobs:
           # 旁路观察层共享一个有限时间预算。预算耗尽时跳过低优先级层，不影响
           # 已完成的 PRIMARY 分析、覆盖率和数据库。
           OPTIONAL_ANALYSIS_DEADLINE=0
+          run_with_report_archive() {
+            local destination="$1"
+            shift
+            local report_backup
+            local report
+            local command_status=0
+            mkdir -p reports "$destination" || return 1
+            report_backup="$(mktemp -d)" || return 1
+            # main.py 的根目录报告名跨批次复用。调用前暂存已有报告，
+            # 只归档本次命令实际生成的文件；失败/超时不得冒用上一批报告。
+            for report in reports/*.md; do
+              [ -f "$report" ] || continue
+              mv -- "$report" "$report_backup/" || return 1
+            done
+            "$@" || command_status=$?
+            for report in reports/*.md; do
+              [ -f "$report" ] || continue
+              cp -- "$report" "$destination/" || return 1
+            done
+            # 根目录仍保留最近一次实际输出，旧批次副本已在各自目录中。
+            for report in "$report_backup"/*.md; do
+              [ -f "$report" ] || continue
+              if [ ! -e "reports/${report##*/}" ]; then
+                mv -- "$report" reports/ || return 1
+              else
+                rm -- "$report" || return 1
+              fi
+            done
+            rmdir -- "$report_backup" || return 1
+            return "$command_status"
+          }
+
           run_analysis_layer() {
             local priority="$1"
             local label="$2"
@@ -851,7 +883,8 @@ jobs:
                 return 1
               fi
               if [ "$required" = "true" ]; then
-                timeout --signal=TERM --kill-after=10s "${close_remaining}s" \
+                run_with_report_archive "reports/${priority,,}/$market" \
+                  timeout --signal=TERM --kill-after=10s "${close_remaining}s" \
                   python main.py --stocks "$batch" --no-market-review --no-notify \
                     --close-analysis-date "$TRADE_DATE" $FORCE_RUN_ARG \
                   || layer_status=1
@@ -864,14 +897,12 @@ jobs:
                 if [ "$remaining" -gt "$close_remaining" ]; then
                   remaining="$close_remaining"
                 fi
-                timeout --signal=TERM --kill-after=10s "${remaining}s" \
+                run_with_report_archive "reports/${priority,,}/$market" \
+                  timeout --signal=TERM --kill-after=10s "${remaining}s" \
                   python main.py --stocks "$batch" --no-market-review --no-notify \
                     --close-analysis-date "$TRADE_DATE" $FORCE_RUN_ARG \
                   || layer_status=1
               fi
-
-              mkdir -p "reports/${priority,,}/$market"
-              cp reports/*.md "reports/${priority,,}/$market/" 2>/dev/null || true
             done
 
             if [ "$layer_status" -ne 0 ]; then
@@ -901,10 +932,9 @@ jobs:
           fi
 
           if [ "$MODE" = "full" ]; then
-            python main.py --market-review --no-notify $FORCE_RUN_ARG \
+            run_with_report_archive reports/market \
+              python main.py --market-review --no-notify $FORCE_RUN_ARG \
               || echo "::warning::大盘复盘失败；不影响已完成的 PRIMARY 分析"
-            mkdir -p reports/market
-            cp reports/*.md reports/market/ 2>/dev/null || true
           fi
 
           # P1-P3 只复用分析数据库和公开 symbol；不进入 PRIMARY A/B 记账。
