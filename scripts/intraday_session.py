@@ -1253,6 +1253,22 @@ class DecisionQuoteFetcher:
         longbridge = self.longbridge_fetcher.fetch(hk_symbols, now=fetched_at)
         for symbol in hk_symbols:
             candidate = longbridge.get(symbol)
+            baseline = results.get(symbol)
+            fallback = None
+            if (
+                baseline is not None
+                and baseline.price is not None
+                and baseline.provider_timestamp
+                and not baseline.is_stale
+            ):
+                # Reuse the Tencent parser's unchanged timestamp/price gates.
+                # A fresh pull of an old Longbridge trade must not hide this
+                # independently timestamped fallback.
+                fallback = replace(
+                    baseline,
+                    provider_snapshot_fresh=False,
+                    source=f"{baseline.source}:fresh_hk_fallback",
+                )
             if candidate is not None and candidate.provider_timestamp:
                 provider_timestamped += 1
             reason = ""
@@ -1268,21 +1284,11 @@ class DecisionQuoteFetcher:
                 reason = "longbridge_provider_snapshot_unverified"
             if reason:
                 degradation_reasons[reason] = degradation_reasons.get(reason, 0) + 1
-                baseline = results.get(symbol)
-                if (
-                    baseline is not None
-                    and baseline.price is not None
-                    and baseline.provider_timestamp
-                    and not baseline.is_stale
-                ):
+                if fallback is not None:
                     # Tencent is allowed to carry the decision only when its
                     # own provider timestamp passes the same hard freshness
                     # gate.  Typical delayed HK quotes remain blocked.
-                    results[symbol] = replace(
-                        baseline,
-                        provider_snapshot_fresh=False,
-                        source=f"{baseline.source}:fresh_hk_fallback",
-                    )
+                    results[symbol] = fallback
                     primary_fallback_covered += 1
                     continue
                 if candidate is not None and candidate.price is not None:
@@ -1310,13 +1316,15 @@ class DecisionQuoteFetcher:
                     )
                 results[symbol] = blocked
                 continue
-            baseline = results.get(symbol)
             if baseline is not None and not candidate.name:
                 candidate = replace(candidate, name=baseline.name)
             results[symbol] = candidate
             upgraded += 1
             if candidate.is_stale:
                 inactive_price_timestamps += 1
+                if fallback is not None:
+                    results[symbol] = fallback
+                    primary_fallback_covered += 1
         self.last_diagnostics = {
             "baseline": "tencent_batch",
             "baseline_diagnostics": baseline_diagnostics,

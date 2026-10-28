@@ -1330,6 +1330,78 @@ class TencentBatchTests(unittest.TestCase):
             {"longbridge_provider_timestamp_missing": 1},
         )
 
+    def _live_snapshot_stale_trade_fetcher(self, *, timestamp, price=4.76):
+        now = datetime(2026, 10, 28, 10, 0, tzinfo=TZ)
+        live_snapshot = RealtimeQuote(
+            symbol="HK02522", name="一脉阳光", price=4.82,
+            provider_timestamp=(now - timedelta(minutes=4)).isoformat(),
+            fetched_at=now.isoformat(), stale_seconds=240,
+            provider_snapshot_fresh=True, is_stale=True, source="longbridge_batch",
+        )
+        # Exercise the production Tencent transport parser and 90s/future gates,
+        # rather than supplying an already blessed fake fallback object.
+        tencent = TencentBatchQuoteFetcher(
+            opener=lambda *_args, **_kwargs: FakeResponse(
+                tencent_record("hk02522", "一脉阳光", price, 4.8, timestamp)
+            ),
+            retry_backoff_seconds=0,
+        )
+        return now, live_snapshot, DecisionQuoteFetcher(
+            tencent_fetcher=tencent,
+            longbridge_fetcher=FakeLongbridgeFetcher([{"HK02522": live_snapshot}]),
+        )
+
+    def test_stale_longbridge_trade_does_not_hide_fresh_tencent_fallback(self):
+        for timestamp, age in [("20261028095955", 5), ("20261028095830", 90)]:
+            with self.subTest(age=age):
+                now, _live, fetcher = self._live_snapshot_stale_trade_fetcher(timestamp=timestamp)
+                result = fetcher.fetch(["HK02522"], now=now)["HK02522"]
+                self.assertEqual(result.price, 4.76)
+                self.assertFalse(result.is_stale)
+                self.assertFalse(result.provider_snapshot_fresh)
+                self.assertEqual(result.source, "tencent_batch:fresh_hk_fallback")
+                self.assertEqual(result.stale_seconds, age)
+                self.assertNotEqual(result.provider_timestamp, result.fetched_at)
+                diag = fetcher.last_diagnostics
+                self.assertEqual(diag["hk_live_snapshot_covered"], 1)
+                self.assertEqual(diag["hk_price_timestamp_stale"], 1)
+                self.assertEqual(diag["hk_fresh_upgraded"], 0)
+                self.assertEqual(diag["hk_primary_fallback_fresh_covered"], 1)
+                self.assertEqual(diag["hk_tradeable_covered"], 1)
+                self.assertFalse(diag["hk_degraded"])
+
+    def test_stale_longbridge_trade_keeps_unsafe_tencent_quotes_blocked(self):
+        for timestamp, price in [
+            ("20261028095829", 4.76),  # 91 seconds old
+            ("20261028100031", 4.76),  # more than existing 30s clock tolerance
+            ("", 4.76),                # no provider timestamp
+            ("20261028095955", 0),     # no usable price
+        ]:
+            with self.subTest(timestamp=timestamp, price=price):
+                now, live, fetcher = self._live_snapshot_stale_trade_fetcher(
+                    timestamp=timestamp, price=price,
+                )
+                result = fetcher.fetch(["HK02522"], now=now)["HK02522"]
+                self.assertEqual(result, live)
+                self.assertTrue(result.is_stale)
+                self.assertEqual(fetcher.last_diagnostics["hk_primary_fallback_fresh_covered"], 0)
+                self.assertEqual(fetcher.last_diagnostics["hk_tradeable_covered"], 0)
+                self.assertFalse(fetcher.last_diagnostics["hk_degraded"])
+
+    def test_cycle_can_observe_safe_fallback_behind_stale_longbridge_trade(self):
+        now, _live, fetcher = self._live_snapshot_stale_trade_fetcher(timestamp="20261028095955")
+        state = {"schema_version": 2, "symbols": {}, "outbox": [], "provider": {}}
+        run_cycle(
+            symbols=["HK02522"], state=state,
+            levels={"HK02522": ReferenceLevels(stop_loss=4.8)},
+            fetcher=fetcher, now=now, notification_sender=lambda **_kwargs: True,
+        )
+        events = [e for e in state["event_ledger"] if e["condition"] == "stop_loss"]
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["price"], 4.76)
+        self.assertEqual(events[0]["payload"]["source"], "tencent_batch:fresh_hk_fallback")
+        self.assertEqual(events[0]["payload"]["data_quality"], "fresh_l1")
+
     def test_market_aware_fetcher_keeps_delayed_primary_hk_quote_blocked(self):
         now = datetime(2026, 8, 11, 14, 45, tzinfo=TZ)
         delayed_hk = RealtimeQuote(
