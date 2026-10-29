@@ -2607,6 +2607,43 @@ def test_reviewer_uses_one_same_channel_fallback_after_primary_retries(
     assert reviewer.diagnostics["batches"][0]["model"] == "openai/test-qwen-fallback"
 
 
+def test_numeric_retry_feedback_keeps_source_conflict_on_watch_and_sibling_independent(monkeypatch, tmp_path):
+    calls = []
+
+    def completion(**kwargs):
+        body = json.loads(kwargs["messages"][1]["content"])
+        calls.append((kwargs["model"], body))
+        result = _review_response(body["candidates"])
+        payload = json.loads(result["choices"][0]["message"]["content"])
+        for review in payload["reviews"]:
+            if kwargs["model"] == "openai/test-qwen" and review["code"] == "600001":
+                review.update(verdict="watch", watch_reason_code="material_fundamental_or_event_risk",
+                              entry_timing_only=False, hard_risk=False,
+                              risks=["公告估值偏高且与快照存在差异，保留观察等待核实。"
+                                     if body.get("retry_feedback") else "昨日公告市盈率100.24倍"])
+        result["choices"][0]["message"]["content"] = json.dumps(payload, ensure_ascii=False)
+        return result
+
+    _install_review_completion(monkeypatch, completion)
+    evidence = {"status": "partial", "announcements": {"items": [{
+        "published_date": "2026-07-27", "excerpt": "公司最新市盈率为100.24，估值偏高。",
+    }]}}
+    result = _service(tmp_path, qwen=build_litellm_reviewer("qwen"),
+                      deepseek=build_litellm_reviewer("deepseek"), research_loader=lambda _c: evidence).run()
+    candidate = next(c for c in result["candidates"] if c["code"] == "600001")
+    assert result["review_complete"] is True
+    assert candidate["qwen_review"]["verdict"] == "watch"
+    assert candidate["qwen_review"]["numeric_consistency"]["status"] == "checked"
+    assert candidate["eligible_for_intraday_review"] is False
+    assert candidate["entry_timing_override_used"] is False
+    assert candidate["research_evidence"]["announcements"] == evidence["announcements"]
+    qwen_calls = [body for model, body in calls if model == "openai/test-qwen"]
+    sibling_calls = [body for model, body in calls if model == "deepseek/test-deepseek"]
+    assert qwen_calls[0]["candidates"] == qwen_calls[1]["candidates"]
+    assert qwen_calls[1]["retry_feedback"]["numeric_errors"]["600001"][0]["expected"] == 20
+    assert all("retry_feedback" not in body for body in sibling_calls)
+
+
 def test_default_a_snapshot_rejects_nonempty_fallback_without_l1_contract(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

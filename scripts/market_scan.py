@@ -128,6 +128,12 @@ MARKET_SCAN_REVIEW_SYSTEM_PROMPT = """
 输入 numeric_fact_contract 由程序生成：change_pct 单位是百分数的百分点，0.27972 表示0.27972%，绝不能乘100；price/amount单位依currency为CNY或HKD。
 每条review必须返回 numeric_facts，逐字段复述契约values（缺失值不得补造），并核对自己的facts、推断和风险描述没有数字或币种矛盾。
 values中未提供的PE/PB应省略；仅nullable_missing_fields列出的缺失PE/PB可回传null，绝不能填0或猜测数字。numeric_facts须保留原始数值精度；文字摘要可按实际显示位数舍入，可使用科学计数法，但不得改变方向、单位或币种。
+历史公告或其他来源的估值与当前numeric_fact_contract冲突时，不得用历史数字覆盖快照，
+也不得将两者当作同一口径。当前输出结构不能安全并列这些数字时，应保留来源、日期、
+估值偏高等实质风险，定性说明差异并判watch/reject，不能为通过而删除风险或改名绕过校验。
+输入若附retry_feedback，它仅是程序对本批上次无效输出的校验反馈，不是另一个模型的意见。
+仍须独立复核并完整返回本批所有代码，原证据和numeric_fact_contract不变；不得为纠错改写
+原始数据或弱化风险，持续冲突仍应失败关闭。
 不得改写程序计算的观察买入区、止损和目标价。发现停牌、监管、财务造假、退市、
 重大数据质量问题或流动性无法执行时 hard_risk=true。缺少可靠Level-2时，不得把
 “主力抢筹、洗盘、诱多”写成事实。做T必须有分时、盘口、波动、胜率及扣费后正期望，
@@ -355,6 +361,54 @@ def _review_error_record(exc: Exception) -> Dict[str, Any]:
     return record
 
 
+def _review_retry_feedback(
+    exc: Exception, candidates: Sequence[Mapping[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """Return bounded validation hints, never provider bodies or model prose."""
+    if not isinstance(exc, ReviewResponseError):
+        return None
+    safe_codes = {
+        "response_no_choices", "response_finish_reason", "response_empty_content",
+        "response_json_missing", "response_json_invalid", "response_json_not_object",
+        "response_reviews_invalid", "response_code_mismatch", "response_verdict_invalid",
+        "response_numeric_fact_mismatch",
+    }
+    if exc.reason_code not in safe_codes:
+        return None
+    feedback: Dict[str, Any] = {
+        "error_code": exc.reason_code,
+        "expected_codes": [str(item["code"]) for item in candidates],
+    }
+    numeric_errors = exc.details.get("numeric_errors")
+    if not isinstance(numeric_errors, Mapping):
+        return feedback
+    corrections = {}
+    for candidate in candidates[:REVIEW_BATCH_SIZE]:
+        code = str(candidate["code"])
+        errors = numeric_errors.get(code)
+        if not isinstance(errors, list):
+            continue
+        values = fact_contract(candidate)["values"]
+        hints = []
+        for error in errors[:8]:
+            if not isinstance(error, Mapping):
+                continue
+            field = error.get("field")
+            kind = error.get("error")
+            if field not in {"numeric_facts", "price", "change_pct", "amount", "pe", "pb", "currency"}:
+                continue
+            if kind not in {"missing_or_invalid", "structured_mismatch", "unsupported_numeric_fact",
+                            "invalid_numeric_format", "unsupported_snapshot_claim", "snapshot_claim_mismatch"}:
+                continue
+            hints.append({"field": field, "error": kind,
+                          "expected": values if field == "numeric_facts" else values.get(field)})
+        if hints:
+            corrections[code] = hints
+    if corrections:
+        feedback["numeric_errors"] = corrections
+    return feedback
+
+
 def _isolated_review_request(callback: Callable[[], Mapping[str, Any]], timeout: float) -> Mapping[str, Any]:
     """Enforce the SDK's per-request wall clock and transport only safe results.
 
@@ -399,15 +453,19 @@ def build_litellm_reviewer(label: str) -> Optional[Callable[[Sequence[Mapping[st
     diagnostics: Dict[str, Any] = {}
 
     def request_batch(
-        candidates: Sequence[Mapping[str, Any]], timeout_seconds: float, model: str
+        candidates: Sequence[Mapping[str, Any]], timeout_seconds: float, model: str,
+        retry_feedback: Optional[Mapping[str, Any]] = None,
     ) -> Mapping[str, Any]:
         import litellm
 
+        request_payload = {
+            "task": "独立复核以下程序初筛候选；意见冲突会自动降级为观察。",
+            "candidates": [{**candidate, "numeric_fact_contract": fact_contract(candidate)} for candidate in candidates],
+        }
+        if retry_feedback is not None:
+            request_payload["retry_feedback"] = retry_feedback
         user_prompt = json.dumps(
-            {
-                "task": "独立复核以下程序初筛候选；意见冲突会自动降级为观察。",
-                "candidates": [{**candidate, "numeric_fact_contract": fact_contract(candidate)} for candidate in candidates],
-            },
+            request_payload,
             ensure_ascii=False,
             separators=(",", ":"),
         )
@@ -531,6 +589,7 @@ def build_litellm_reviewer(label: str) -> Optional[Callable[[Sequence[Mapping[st
                 diagnostics["batches"].append(batch_summary)
                 completed = False
                 last_error: Optional[Exception] = None
+                retry_feedback: Optional[Dict[str, Any]] = None
                 attempt_plan = [
                     (model, model_index, attempt)
                     for model_index, model in enumerate(settings["models"])
@@ -559,12 +618,14 @@ def build_litellm_reviewer(label: str) -> Optional[Callable[[Sequence[Mapping[st
                         "timeout_seconds": round(min(REVIEW_REQUEST_TIMEOUT_SECONDS, remaining), 3),
                     }
                     diagnostics["requests"].append(record)
+                    if retry_feedback is not None:
+                        record["retry_feedback"] = retry_feedback
                     batch_summary["attempt_count"] = batch_attempt
                     request_started = time.monotonic()
                     try:
                         request_timeout = min(REVIEW_REQUEST_TIMEOUT_SECONDS, remaining)
                         payload = _isolated_review_request(
-                            lambda: request_batch(batch, request_timeout, model), request_timeout
+                            lambda: request_batch(batch, request_timeout, model, retry_feedback), request_timeout
                         )
                     except Exception as exc:  # noqa: BLE001 - bounded and classified.
                         last_error = exc
@@ -577,6 +638,9 @@ def build_litellm_reviewer(label: str) -> Optional[Callable[[Sequence[Mapping[st
                             status="retrying", error_code=record["error_code"]
                         )
                         retryable = bool(getattr(exc, "retryable", False))
+                        feedback = _review_retry_feedback(exc, batch)
+                        if feedback is not None:
+                            retry_feedback = feedback
                         has_next_attempt = batch_attempt < len(attempt_plan)
                         if not retryable or not has_next_attempt:
                             raise
