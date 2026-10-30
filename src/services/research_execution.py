@@ -66,6 +66,12 @@ def _execute(callback: Callable[[], Any], path: str, budget: float,
         serialized = pickle.dumps(("error", getattr(exc, "error_class", type(exc).__name__),
                                    str(exc)[:400], diagnostics))
     Path(path).write_bytes(serialized)
+    # The result file is complete and closed. SDK logging executors can keep
+    # Python's thread shutdown waiting after the provider and validation have
+    # finished, turning a completed call into a false TimeoutError. This is a
+    # disposable, read-only worker: exit without waiting for SDK finalizers.
+    # The parent still kills the entire process group and reaps this process.
+    os._exit(0)
 
 
 def run_isolated(callback: Callable[[], Any], timeout_seconds: float, *,
