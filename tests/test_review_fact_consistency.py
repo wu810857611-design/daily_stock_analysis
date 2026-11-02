@@ -58,6 +58,48 @@ def test_percent_is_percentage_points_and_rounding_is_allowed():
 
 @pytest.mark.parametrize('text_field', ['thesis', 'view', 'facts', 'risks', 'inferences', 'invalidators'])
 @pytest.mark.parametrize('claim', [
+    '年化波动率89.07%，ATR占比7.71%，止损距现价约9.4%，在极高波动下极易被扫损',
+    'ATR占比7.7%而止损距现价约9.4%，在如此高波动下止损极易被日内噪音触发',
+])
+def test_stop_distance_percentage_is_not_an_absolute_snapshot_price(text_field, claim):
+    candidate = {'code': '300244', 'price': 20.8}
+    review = {'numeric_facts': numeric_facts(candidate),
+              text_field: claim if text_field in {'thesis', 'view'} else [claim]}
+    assert validate_review_facts(review, candidate, require_echo=True) == []
+
+
+@pytest.mark.parametrize('claim', [
+    '止损价距离当前价 9.4 ％', '止损位距最新价约9.4%', '止损 距离 快照价9.4%',
+])
+def test_explicit_stop_distance_variants_keep_the_percentage_unit(claim):
+    candidate = {'code': '300244', 'price': 20.8}
+    assert validate_review_facts({'numeric_facts': numeric_facts(candidate), 'risks': [claim]},
+                                 candidate, require_echo=True) == []
+
+
+@pytest.mark.parametrize('claim', [
+    '现价约9.4%', '现价9.4元', '止损距现价约9.4', '止损距现价约9.4CNY%',
+    '止损距现价约1,19,4%', '止损距现价约9.4%，当前价9.4元',
+    '止损距现价约9.4%，成交额9.4元', '止损距现价约9.4%，PE9.4倍',
+])
+def test_stop_distance_does_not_exempt_absolute_malformed_or_other_claims(claim):
+    candidate = {'code': '300244', 'price': 20.8, 'amount': 1000000, 'pe': 40}
+    assert validate_review_facts({'numeric_facts': numeric_facts(candidate), 'risks': [claim]},
+                                 candidate, require_echo=True)
+
+
+def test_stop_distance_keeps_structured_price_checks_and_original_risk():
+    candidate = {'code': '300244', 'price': 20.8}
+    risk = '止损距现价约9.4%，在极高波动下极易被扫损'
+    review = {'numeric_facts': {**numeric_facts(candidate), 'price': 9.4}, 'risks': [risk]}
+    assert validate_review_facts(review, candidate, require_echo=True) == [{
+        'field': 'price', 'expected': 20.8, 'observed': 9.4, 'error': 'structured_mismatch',
+    }]
+    assert review['risks'] == [risk]
+
+
+@pytest.mark.parametrize('text_field', ['thesis', 'view', 'facts', 'risks', 'inferences', 'invalidators'])
+@pytest.mark.parametrize('claim', [
     '2026-10-26新闻显示龙虎榜净卖出3.7亿元，占成交额6.29%，大资金流出明显',
     '净卖出占当日成交额 6.29 ％，需关注流动性',
     '净卖出佔總成交额6.29%，成交额58.7763亿元',
