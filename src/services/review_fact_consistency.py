@@ -131,6 +131,14 @@ def validate_review_facts(review: Mapping[str, Any], candidate: Mapping[str, Any
                     errors.append({"field": field, "error": "invalid_numeric_format",
                                    "claim": match.group(0), **context})
                     continue
+                if (field == "price" and not match.group(2)
+                        and re.search(r"止损(?:价|位)?\s*距(?:离)?\s*$",
+                                      text[max(0, match.start() - 20):match.start()])
+                        and re.match(r"[%％]", text[match.end():])):
+                    # "止损距现价9.4%" is a relative distance, not a price.
+                    # Keep the original risk; structured echoes and absolute
+                    # price claims still use their existing checks.
+                    continue
                 if (field == "amount" and not match.group(2) and not match.group(3)
                         and re.search(r"(?:占|佔)(?:当日|當日|总|總)?\s*$",
                                       text[max(0, match.start() - 16):match.start()])
