@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import math
 import re
+from datetime import date
 from typing import Any, Mapping
 
 
@@ -131,6 +132,20 @@ def validate_review_facts(review: Mapping[str, Any], candidate: Mapping[str, Any
                     errors.append({"field": field, "error": "invalid_numeric_format",
                                    "claim": match.group(0), **context})
                     continue
+                if field in {"pe", "pb"}:
+                    research_date = re.match(
+                        r"(\d{4}-\d{2}-\d{2})\s*(?:研究|估值)(?:口径|日期|时点)",
+                        text[match.start(1):match.start(1) + 32],
+                    )
+                    if research_date and literal == research_date.group(1)[:4]:
+                        try:
+                            date.fromisoformat(research_date.group(1))
+                        except ValueError:
+                            pass  # Invalid dates retain the numeric check.
+                        else:
+                            # A marked research date is not a PE/PB multiple;
+                            # keep the original risk and all numeric checks.
+                            continue
                 if (field == "price" and not match.group(2)
                         and re.search(r"止损(?:价|位)?\s*距(?:离)?\s*$",
                                       text[max(0, match.start() - 20):match.start()])

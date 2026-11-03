@@ -61,6 +61,37 @@ def test_real_worker_keeps_relative_stop_risk_without_retry_or_verdict_upgrade(m
     assert not multiprocessing.active_children()
 
 
+@pytest.mark.parametrize("label", ["qwen", "deepseek"])
+def test_real_worker_keeps_valuation_date_risk_without_retry_or_verdict_upgrade(monkeypatch, tmp_path, label):
+    captured = tmp_path / "valuation_date_requests.jsonl"
+    risk = "PE/PB为2026-11-02研究口径，与快照非同一时点"
+
+    def completion(**kwargs):
+        body = json.loads(kwargs["messages"][1]["content"])
+        with captured.open("a") as handle:
+            handle.write(json.dumps(body, ensure_ascii=False) + "\n")
+        reviews = [{"code": item["code"], "verdict": verdict, "hard_risk": hard_risk,
+                    "numeric_facts": item["numeric_fact_contract"]["values"], "risks": [risk]}
+                   for item, verdict, hard_risk in zip(body["candidates"], ["watch", "reject"], [False, True])]
+        return {"choices": [{"finish_reason": "stop", "message": {
+            "content": json.dumps({"reviews": reviews}, ensure_ascii=False)}}]}
+
+    configure(monkeypatch, completion, request_timeout=1.0)
+    monkeypatch.setenv("MARKET_SCAN_QWEN_MODEL", "offline-primary")
+    monkeypatch.setenv("LLM_DASHSCOPE_API_KEY", "never-send-offline-secret")
+    monkeypatch.setenv("LLM_DASHSCOPE_MODELS", "offline-primary,offline-fallback")
+    reviewer = market_scan.build_litellm_reviewer(label)
+    result = reviewer([{"code": "HK00027", "pe": 13.6, "pb": 1.72},
+                       {"code": "HK00669", "pe": 17.2, "pb": 2.22}])
+    assert [(r["verdict"], r["hard_risk"]) for r in result["reviews"]] == [("watch", False), ("reject", True)]
+    assert all(r["risks"] == [risk] for r in result["reviews"])
+    assert len(captured.read_text().splitlines()) == len(reviewer.diagnostics["requests"]) == 1
+    assert reviewer.diagnostics["status"] == "completed"
+    assert reviewer.diagnostics["completed_candidate_count"] == 2
+    assert reviewer.diagnostics["requests"][0]["model_role"] == "primary"
+    assert not multiprocessing.active_children()
+
+
 def test_sdk_ignoring_timeout_is_reaped_then_configured_fallback_completes_all_batches(monkeypatch, tmp_path):
     attempts = tmp_path / "attempts"
     def completion(**kwargs):
