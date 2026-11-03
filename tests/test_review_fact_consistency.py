@@ -100,6 +100,54 @@ def test_stop_distance_keeps_structured_price_checks_and_original_risk():
 
 @pytest.mark.parametrize('text_field', ['thesis', 'view', 'facts', 'risks', 'inferences', 'invalidators'])
 @pytest.mark.parametrize('claim', [
+    'PE/PB为2026-11-02研究口径，与快照非同一时点',
+    'PE为2026-11-02估值时点，与快照非同一时点',
+])
+def test_valuation_research_date_is_not_a_multiple(text_field, claim):
+    candidate = {'code': 'HK00027', 'price': 34.52, 'pe': 13.6, 'pb': 1.72}
+    review = {'numeric_facts': numeric_facts(candidate),
+              text_field: claim if text_field in {'thesis', 'view'} else [claim]}
+    assert validate_review_facts(review, candidate, require_echo=True) == []
+
+
+@pytest.mark.parametrize('claim', [
+    'PB为2026-11-02 研究口径', '市净率为2026-11-02估值日期',
+    '市盈率2024-02-29研究日期',
+])
+def test_explicit_valuation_date_variants_are_calendar_dates(claim):
+    candidate = {'code': 'HK00027', 'pe': 13.6, 'pb': 1.72}
+    assert validate_review_facts({'numeric_facts': numeric_facts(candidate), 'risks': [claim]},
+                                 candidate, require_echo=True) == []
+
+
+@pytest.mark.parametrize('claim', [
+    'PB为2026', 'PB为2026-11-02', 'PB为2026-11-02倍研究口径',
+    'PB为2026-13-02研究口径', 'PB为2026-02-30研究口径', 'PB为2026-11-2研究口径',
+    'PB为2026.0-11-02研究口径', 'PB为2,026-11-02研究口径',
+    'PE/PB为2026-11-02研究口径，PB9.4倍',
+    'PE/PB为2026-11-02研究口径，PE100倍',
+    'PE/PB为2026-11-02研究口径，现价34.52人民币',
+    '2026-11-02的历史PB100倍，与当日研究口径不同',
+])
+def test_valuation_date_does_not_bypass_unmarked_invalid_or_numeric_claims(claim):
+    candidate = {'code': 'HK00027', 'price': 34.52, 'pe': 13.6, 'pb': 1.72}
+    assert validate_review_facts({'numeric_facts': numeric_facts(candidate), 'risks': [claim]},
+                                 candidate, require_echo=True)
+
+
+@pytest.mark.parametrize('field', ['pe', 'pb'])
+def test_valuation_date_keeps_structured_multiple_checks_and_risk(field):
+    candidate = {'code': 'HK00027', 'pe': 13.6, 'pb': 1.72}
+    risk = 'PE/PB为2026-11-02研究口径，与快照非同一时点'
+    review = {'numeric_facts': {**numeric_facts(candidate), field: 2026}, 'risks': [risk]}
+    assert validate_review_facts(review, candidate, require_echo=True) == [{
+        'field': field, 'expected': candidate[field], 'observed': 2026, 'error': 'structured_mismatch',
+    }]
+    assert review['risks'] == [risk]
+
+
+@pytest.mark.parametrize('text_field', ['thesis', 'view', 'facts', 'risks', 'inferences', 'invalidators'])
+@pytest.mark.parametrize('claim', [
     '2026-10-26新闻显示龙虎榜净卖出3.7亿元，占成交额6.29%，大资金流出明显',
     '净卖出占当日成交额 6.29 ％，需关注流动性',
     '净卖出佔總成交额6.29%，成交额58.7763亿元',
