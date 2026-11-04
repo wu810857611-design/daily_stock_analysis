@@ -10,7 +10,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
-from src.services.research_execution import ResearchCallError, run_isolated
+from src.services.research_execution import ResearchCallError, record_isolated_phase, run_isolated
 
 
 def hang():
@@ -56,6 +56,7 @@ def test_requests_connect_and_read_deadlines_are_local_to_worker():
 @pytest.mark.parametrize("fails", [False, True])
 def test_completed_callback_does_not_wait_for_sdk_logging_executor(tmp_path, fails):
     completed = tmp_path / "completed"
+    execution = {}
 
     def callback():
         executor = ThreadPoolExecutor(max_workers=1)
@@ -69,15 +70,19 @@ def test_completed_callback_does_not_wait_for_sdk_logging_executor(tmp_path, fai
     started = time.monotonic()
     if fails:
         with pytest.raises(ResearchCallError, match="ZeroDivisionError"):
-            run_isolated(callback, 2)
+            run_isolated(callback, 2, execution_diagnostics=execution)
     else:
-        assert run_isolated(callback, 2) == {"evidence": "x" * 1024 * 1024}
+        assert run_isolated(callback, 2, execution_diagnostics=execution) == {"evidence": "x" * 1024 * 1024}
     assert completed.read_text() == "provider callback finished"
     assert time.monotonic() - started < 1.5
     assert not multiprocessing.active_children()
+    assert execution["last_phase"] == "exit_requested" and execution["worker_exitcode"] == 0
+    assert "result_closed" in [event["phase"] for event in execution["phases"]]
+    assert not execution["deadline_exceeded"] and execution["result_file_bytes"] > 0
 
 
 def test_background_executor_does_not_make_unfinished_callback_usable(tmp_path):
+    execution = {}
     def callback():
         executor = ThreadPoolExecutor(max_workers=1)
         executor.submit(threading.Event().wait)
@@ -86,8 +91,44 @@ def test_background_executor_does_not_make_unfinished_callback_usable(tmp_path):
         return "must never become a completed result"
 
     with pytest.raises(ResearchCallError, match="TimeoutError"):
-        run_isolated(callback, 0.25)
+        run_isolated(callback, 0.25, execution_diagnostics=execution)
     assert (tmp_path / "started").exists()
+    assert not multiprocessing.active_children()
+    assert execution["last_phase"] == "callback_started" and execution["deadline_exceeded"]
+    assert execution["result_file_bytes"] == 0
+
+
+def test_progress_is_bounded_and_rejects_non_allowlisted_phase_text():
+    execution = {}
+
+    def callback():
+        for _ in range(100):
+            record_isolated_phase("sdk_ready")
+        record_isolated_phase("never-log-this-secret")
+        return "unchanged"
+
+    assert run_isolated(callback, 2, execution_diagnostics=execution) == "unchanged"
+    assert len(execution["phases"]) == 64
+    assert "never-log-this-secret" not in str(execution)
+
+
+def test_progress_write_failure_does_not_change_provider_result(monkeypatch):
+    def denied(*_args, **_kwargs):
+        raise PermissionError("diagnostic unavailable")
+
+    monkeypatch.setattr(Path, "write_text", denied)
+    execution = {}
+    assert run_isolated(lambda: "unchanged", 2, execution_diagnostics=execution) == "unchanged"
+    assert execution["last_phase"] == "unavailable" and execution["worker_exitcode"] == 0
+
+
+def test_closed_result_at_deadline_is_not_accepted_as_completed(monkeypatch):
+    monkeypatch.setattr(os, "_exit", lambda _code: threading.Event().wait())
+    execution = {}
+    with pytest.raises(ResearchCallError, match="TimeoutError"):
+        run_isolated(lambda: "closed file is insufficient", 0.3, execution_diagnostics=execution)
+    assert execution["last_phase"] == "exit_requested"
+    assert execution["result_file_bytes"] > 0 and execution["deadline_exceeded"]
     assert not multiprocessing.active_children()
 
 

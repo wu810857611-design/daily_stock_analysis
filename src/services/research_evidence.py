@@ -215,6 +215,45 @@ def announcement_document_url(url: str, code: str, published_date: str) -> str:
     return f"https://static.cninfo.com.cn/finalpage/{document_date.isoformat()}/{announcement_id}.PDF"
 
 
+def _adobe_gb1_without_unicode(page: Any) -> bool:
+    """Recognize a declared standard CID collection, never infer from garbled text."""
+    def resolve(value: Any) -> Any:
+        return value.get_object() if hasattr(value, "get_object") else value
+
+    resources = resolve(page.get("/Resources", {})) if isinstance(page, dict) else {}
+    for reference in resolve(resources.get("/Font", {})).values():
+        font = resolve(reference)
+        if (font.get("/Subtype") != "/Type0" or font.get("/Encoding") != "/Identity-H"
+                or font.get("/ToUnicode") is not None):
+            continue
+        for reference in font.get("/DescendantFonts", []):
+            collection = resolve(resolve(reference).get("/CIDSystemInfo", {}))
+            if collection.get("/Registry") == "Adobe" and collection.get("/Ordering") == "GB1":
+                return True
+    return False
+
+
+def _adobe_gb1_excerpt(data: bytes) -> str:
+    """Decode the standard font map within the same page, text and worker bounds."""
+    from pdfminer.converter import TextConverter
+    from pdfminer.layout import LAParams
+    from pdfminer.pdfinterp import PDFPageInterpreter, PDFResourceManager
+    from pdfminer.pdfpage import PDFPage
+
+    class PageText(io.StringIO):
+        def write(self, value: str) -> int:
+            return super().write(value[:max(0, 10000 - self.tell())])
+
+    manager = PDFResourceManager(caching=False)
+    parts = []
+    for page in PDFPage.get_pages(io.BytesIO(data), maxpages=3, caching=False, check_extractable=True):
+        output = PageText()
+        with TextConverter(manager, output, laparams=LAParams()) as converter:
+            PDFPageInterpreter(manager, converter).process_page(page)
+        parts.append(output.getvalue())
+    return "\n".join(parts)
+
+
 def announcement_excerpt(url: str, code: str, name: str) -> dict:
     """Read a bounded excerpt only from a validated official PDF URL.
 
@@ -241,11 +280,17 @@ def announcement_excerpt(url: str, code: str, name: str) -> dict:
         if not data.startswith(b"%PDF"):
             raise AnnouncementEvidenceError("announcement_not_pdf")
     reader = PdfReader(io.BytesIO(data))
-    text = "\n".join((page.extract_text() or "")[:10000] for page in islice(reader.pages, 3))
+    pages = list(islice(reader.pages, 3))
+    if any(_adobe_gb1_without_unicode(page) for page in pages):
+        text = _adobe_gb1_excerpt(bytes(data))
+        text_extractor = "pdfminer.six_adobe_gb1"
+    else:
+        text = "\n".join((page.extract_text() or "")[:10000] for page in pages)
+        text_extractor = "pypdf"
     compact = "".join(text.split())
     evidence = {"document_source": url, "document_sha256": hashlib.sha256(data).hexdigest(),
                 "document_bytes": len(data), "extracted_characters": len(compact),
-                "header_excerpt": text[:1600]}
+                "header_excerpt": text[:1600], "text_extractor": text_extractor}
     identity = code[2:] if code.startswith("HK") else code
     identity_present = bool(re.search(
         rf"(?<![A-Za-z0-9]){re.escape(identity)}(?![A-Za-z0-9])", compact
@@ -276,4 +321,5 @@ def announcement_excerpt(url: str, code: str, name: str) -> dict:
         raise AnnouncementEvidenceError("announcement_document_identity_mismatch", evidence)
     return {"excerpt": text[:2000], "document_source": url,
             "extraction": "official_pdf_first_three_pages", "document_bytes": len(data),
+            "text_extractor": text_extractor, "document_sha256": evidence["document_sha256"],
             "content_reviewed": False, "body_excerpt_available": True}

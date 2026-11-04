@@ -102,7 +102,7 @@ def _parse_enabled_markets(value: str) -> tuple[str, ...]:
 
 
 from src.services.review_fact_consistency import fact_contract, validate_review_facts
-from src.services.research_execution import ResearchCallError, run_isolated
+from src.services.research_execution import ResearchCallError, record_isolated_phase, run_isolated
 
 
 MARKET_SCAN_REVIEW_SYSTEM_PROMPT = """
@@ -409,7 +409,8 @@ def _review_retry_feedback(
     return feedback
 
 
-def _isolated_review_request(callback: Callable[[], Mapping[str, Any]], timeout: float) -> Mapping[str, Any]:
+def _isolated_review_request(callback: Callable[[], Mapping[str, Any]], timeout: float, *,
+                             execution_diagnostics: Optional[Dict[str, Any]] = None) -> Mapping[str, Any]:
     """Enforce the SDK's per-request wall clock and transport only safe results.
 
     A socket/read timeout alone can be bypassed by a hanging SDK or a response
@@ -420,10 +421,12 @@ def _isolated_review_request(callback: Callable[[], Mapping[str, Any]], timeout:
         try:
             return True, callback()
         except Exception as exc:
+            record_isolated_phase("review_failed")
             return False, _review_error_record(exc)
 
     try:
-        ok, value = run_isolated(execute, timeout, network_timeout_seconds=timeout)
+        ok, value = run_isolated(execute, timeout, network_timeout_seconds=timeout,
+                                 execution_diagnostics=execution_diagnostics)
     except ResearchCallError as exc:
         timed_out = exc.error_class == "TimeoutError"
         raise ReviewProviderError(
@@ -456,7 +459,9 @@ def build_litellm_reviewer(label: str) -> Optional[Callable[[Sequence[Mapping[st
         candidates: Sequence[Mapping[str, Any]], timeout_seconds: float, model: str,
         retry_feedback: Optional[Mapping[str, Any]] = None,
     ) -> Mapping[str, Any]:
+        record_isolated_phase("sdk_import_started")
         import litellm
+        record_isolated_phase("sdk_ready")
 
         request_payload = {
             "task": "独立复核以下程序初筛候选；意见冲突会自动降级为观察。",
@@ -499,9 +504,13 @@ def build_litellm_reviewer(label: str) -> Optional[Callable[[Sequence[Mapping[st
         if settings["extra_headers"]:
             kwargs["extra_headers"] = settings["extra_headers"]
         try:
+            record_isolated_phase("sdk_call_started")
             response = litellm.completion(**kwargs)
         except Exception as exc:  # noqa: BLE001 - classified without raw provider body.
+            record_isolated_phase("sdk_call_failed")
             raise _provider_review_error(exc) from exc
+        record_isolated_phase("sdk_call_returned")
+        record_isolated_phase("response_validation_started")
         choices = getattr(response, "choices", None)
         if choices is None and isinstance(response, Mapping):
             choices = response.get("choices")
@@ -556,6 +565,7 @@ def build_litellm_reviewer(label: str) -> Optional[Callable[[Sequence[Mapping[st
         }
         if inconsistencies:
             raise ReviewResponseError("response_numeric_fact_mismatch", numeric_errors=inconsistencies)
+        record_isolated_phase("response_validation_completed")
         return payload
 
     def review(candidates: Sequence[Mapping[str, Any]]) -> Mapping[str, Any]:
@@ -615,6 +625,7 @@ def build_litellm_reviewer(label: str) -> Optional[Callable[[Sequence[Mapping[st
                         "model_role": "primary" if model_index == 0 else "fallback",
                         "candidate_count": len(batch),
                         "status": "running",
+                        "started_at": datetime.now(SHANGHAI_TZ).isoformat(timespec="milliseconds"),
                         "timeout_seconds": round(min(REVIEW_REQUEST_TIMEOUT_SECONDS, remaining), 3),
                     }
                     diagnostics["requests"].append(record)
@@ -625,7 +636,8 @@ def build_litellm_reviewer(label: str) -> Optional[Callable[[Sequence[Mapping[st
                     try:
                         request_timeout = min(REVIEW_REQUEST_TIMEOUT_SECONDS, remaining)
                         payload = _isolated_review_request(
-                            lambda: request_batch(batch, request_timeout, model, retry_feedback), request_timeout
+                            lambda: request_batch(batch, request_timeout, model, retry_feedback), request_timeout,
+                            execution_diagnostics=record.setdefault("execution", {}),
                         )
                     except Exception as exc:  # noqa: BLE001 - bounded and classified.
                         last_error = exc
