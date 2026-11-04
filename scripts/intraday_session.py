@@ -119,7 +119,7 @@ MAX_EXTRA_CANDIDATE_SYMBOLS = 12
 CONDITIONAL_CONSENSUS_MODE = "conditional_one_pass_one_noncritical_watch"
 TENCENT_BATCH_ENDPOINT = "https://qt.gtimg.cn/q="
 TENCENT_BATCH_FALLBACK_ENDPOINT = "https://web.sqt.gtimg.cn/q="
-_TENCENT_RECORD = re.compile(r'v_([A-Za-z0-9]+)="([^"]*)"')
+_TENCENT_RECORD = re.compile(r'v_((?:r_)?[A-Za-z0-9]+)="([^"]*)"')
 _SEVERITY_RANK = {"info": 0, "warning": 1, "high": 2, "critical": 3}
 _OPEN_PHASES = {"intraday", "closing_auction"}
 _SYSTEM_PUSH_CONDITIONS = {
@@ -448,7 +448,7 @@ def _a_share_exchange(code: str) -> str:
 def to_tencent_symbol(symbol: str) -> str:
     canonical = canonical_symbol(symbol)
     if canonical.startswith("HK") and canonical[2:].isdigit():
-        return f"hk{canonical[2:].zfill(5)}"
+        return f"r_hk{canonical[2:].zfill(5)}"
     if canonical.isdigit() and len(canonical) == 6:
         return f"{_a_share_exchange(canonical)}{canonical}"
     raise SessionError(f"腾讯批量行情不支持股票代码: {symbol}")
@@ -456,6 +456,8 @@ def to_tencent_symbol(symbol: str) -> str:
 
 def from_tencent_symbol(provider_symbol: str) -> Optional[str]:
     token = (provider_symbol or "").strip().lower()
+    if token.startswith("r_hk"):
+        token = token[2:]
     if token.startswith("hk") and token[2:].isdigit():
         return f"HK{token[2:].zfill(5)}"
     if token[:2] in {"sh", "sz", "bj"} and token[2:].isdigit():
@@ -482,6 +484,7 @@ def parse_tencent_batch(
     fetched_at: datetime,
     freshness_seconds: float = DEFAULT_FRESHNESS_SECONDS,
     source: str = "tencent_batch",
+    validation_rejections: Optional[Dict[str, str]] = None,
 ) -> Dict[str, RealtimeQuote]:
     """Parse one Tencent multi-symbol response into basic, freshness-checked quotes."""
 
@@ -492,6 +495,15 @@ def parse_tencent_batch(
         if symbol is None or symbol not in requested:
             continue
         fields = raw_fields.split("~")
+        if provider_symbol.lower().startswith("r_hk"):
+            reason = ("invalid_payload" if len(fields) < 76 else
+                      "provider_code_mismatch" if fields[2] != symbol[2:] else
+                      "missing_currency" if not fields[75] else
+                      "unsupported_currency" if fields[75] != "HKD" else "")
+            if reason:
+                if validation_rejections is not None:
+                    validation_rejections[symbol] = reason
+                continue
         price = _positive_float(fields[3] if len(fields) > 3 else None)
         previous_close = _positive_float(fields[4] if len(fields) > 4 else None)
         volume = _nonnegative_float(fields[6] if len(fields) > 6 else None)
@@ -607,12 +619,14 @@ class TencentBatchQuoteFetcher:
                         if route_index == 0
                         else "tencent_batch_fallback"
                     )
+                    validation_rejections: Dict[str, str] = {}
                     parsed = parse_tencent_batch(
                         payload,
                         unresolved,
                         fetched_at=fetched_at,
                         freshness_seconds=self.freshness_seconds,
                         source=source,
+                        validation_rejections=validation_rejections,
                     )
                 except Exception as exc:
                     diagnostic = {
@@ -623,6 +637,7 @@ class TencentBatchQuoteFetcher:
                     route_stats.append(
                         {
                             "route": route_name,
+                            "requested_keys": query.split(","),
                             "requested": route_requested,
                             "price_returned": 0,
                             "provider_timestamped": 0,
@@ -650,7 +665,7 @@ class TencentBatchQuoteFetcher:
                         continue
                     timestamp = _parse_iso(quote.provider_timestamp)
                     age = (fetched_at.astimezone(SHANGHAI_TZ) - timestamp).total_seconds() if timestamp is not None else None
-                    reason = (
+                    reason = validation_rejections.get(symbol) or (
                         "missing_price" if quote.price is None else
                         "missing_provider_timestamp" if timestamp is None else
                         "future_provider_timestamp" if age < -30 else
@@ -664,6 +679,7 @@ class TencentBatchQuoteFetcher:
                 route_stats.append(
                     {
                         "route": route_name,
+                        "requested_keys": query.split(","),
                         "requested": route_requested,
                         "price_returned": sum(
                             1

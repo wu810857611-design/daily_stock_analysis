@@ -163,6 +163,12 @@ if [[ ! -f "${packaged_akshare_calendar}" ]]; then
   packaged_akshare_calendar="${packaged_root}/akshare/file_fold/calendar.json"
 fi
 if [[ ! -f "${packaged_akshare_calendar}" ]]; then
+  packaged_akshare_calendar="${packaged_root}/_internal/akshare/data/calendar.json"
+fi
+if [[ ! -f "${packaged_akshare_calendar}" ]]; then
+  packaged_akshare_calendar="${packaged_root}/akshare/data/calendar.json"
+fi
+if [[ ! -f "${packaged_akshare_calendar}" ]]; then
   echo "ERROR: packaged AkShare calendar data not found under ${packaged_root}."
   exit 1
 fi

@@ -13,7 +13,7 @@ from zoneinfo import ZoneInfo
 SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
 PRIMARY_ENDPOINT = "https://qt.gtimg.cn/q="
 ALTERNATE_ENDPOINT = "https://web.sqt.gtimg.cn/q="
-_RECORD = re.compile(r'v_([A-Za-z0-9]+)="([^"]*)"')
+_RECORD = re.compile(r'v_((?:r_)?[A-Za-z0-9]+)="([^"]*)"')
 
 
 def _number(value: Any) -> Optional[float]:
@@ -27,12 +27,14 @@ def _number(value: Any) -> Optional[float]:
 def _symbol_to_provider(symbol: str) -> str:
     token = str(symbol or "").strip().upper()
     if token.startswith("HK") and token[2:].isdigit():
-        return f"hk{token[2:].zfill(5)}"
+        return f"r_hk{token[2:].zfill(5)}"
     raise ValueError(f"unsupported Tencent HK symbol: {symbol}")
 
 
 def _symbol_from_provider(symbol: str) -> str:
     token = str(symbol or "").strip().lower()
+    if token.startswith("r_hk"):
+        token = token[2:]
     if token.startswith("hk") and token[2:].isdigit():
         return f"HK{token[2:].zfill(5)}"
     return ""
@@ -64,10 +66,14 @@ def _parse_payload(
         if not symbol or symbol not in expected:
             continue
         fields = raw_fields.split("~")
+        if provider_symbol.lower().startswith("r_hk") and (
+            len(fields) < 76 or fields[2] != symbol[2:] or fields[75] != "HKD"
+        ):
+            continue
         price = _number(fields[3] if len(fields) > 3 else None)
         change_pct = _number(fields[32] if len(fields) > 32 else None)
         volume = _number(fields[6] if len(fields) > 6 else None)
-        # Tencent field 37 is turnover in ten-thousand currency units.
+        # HK field 37 is turnover in HKD, unlike the A-share ten-thousand unit.
         turnover = _number(fields[37] if len(fields) > 37 else None)
         timestamp = _provider_time(fields[30] if len(fields) > 30 else None)
         if timestamp is None or price is None or price <= 0:
@@ -83,7 +89,7 @@ def _parse_payload(
             "price": price,
             "change_pct": change_pct,
             "volume": volume,
-            "amount": turnover * 10_000.0,
+            "amount": turnover,
             "provider_timestamp": timestamp.isoformat(timespec="seconds"),
             "is_connect": True,
         }
@@ -147,13 +153,15 @@ def load_fresh_hk_membership_snapshot(
             except Exception as exc:  # noqa: BLE001 - bounded provider fallback.
                 provider_errors.append(f"{route}:{type(exc).__name__}:{exc}")
                 route_stats.append(
-                    {"route": route, "requested": len(unresolved), "fresh": 0, "failed": True}
+                    {"route": route, "requested_keys": query.split(","),
+                     "requested": len(unresolved), "fresh": 0, "failed": True}
                 )
                 continue
             records.update(parsed)
             route_stats.append(
                 {
                     "route": route,
+                    "requested_keys": query.split(","),
                     "requested": len(unresolved),
                     "fresh": len(parsed),
                     "failed": False,
