@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+- [修复] 官方公告对未压缩且非分块、声明Content-Length超2MiB的响应提前拒绝，避免无效下载先耗尽预算；保留实际流式大小校验，并在原诊断中记录有界HTTP/JSON/PDF阶段及状态码。
 - [修复] 腾讯港股两条既有路由及名册快照请求真实时间戳的r_hk键并校验代码/币种，纠正港股成交额误乘A股万元因子；保留90秒、未来时间和全部交易门禁。
 - [修复] Windows/macOS打包日历检查兼容AkShare将calendar.json从file_fold迁至data的资源路径，继续要求日历文件真实存在。
 

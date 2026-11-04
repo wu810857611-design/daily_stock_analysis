@@ -1398,18 +1398,21 @@ def test_rejected_announcement_diagnostics_stay_in_artifact_not_model_inputs(tmp
                     "items": [{"title": "已通过校验的正式公告索引", "body_excerpt_available": False,
                                "body_status": "announcement_document_identity_mismatch",
                                "body_diagnostics": {"header_excerpt": marker}}]},
-                "diagnostics": [{"evidence_diagnostics": {"header_excerpt": marker}}],
+                "diagnostics": [{"evidence_diagnostics": {"header_excerpt": marker},
+                                 "execution": {"phases": [{"phase": "official_pdf_text_started", "elapsed_seconds": 0.1}]}}],
                 "errors": ["announcement_body:announcement_document_identity_mismatch"]}
     result = _service(tmp_path, qwen=qwen, deepseek=deepseek, research_loader=research_loader).run()
     for reviewer in (qwen, deepseek):
         assert reviewer.calls
         assert marker not in json.dumps(reviewer.calls, ensure_ascii=False)
+        assert "official_pdf_text_started" not in json.dumps(reviewer.calls, ensure_ascii=False)
         assert all(candidate["facts"]["official_announcements"]["items"][0]["body_status"]
                    == "announcement_document_identity_mismatch" for candidate in reviewer.calls[0])
     for candidate in result["candidates"]:
         retained = candidate["research_evidence"]["announcements"]
         assert retained["rejected_rows"][0]["title"] == marker
         assert retained["items"][0]["body_diagnostics"]["header_excerpt"] == marker
+        assert candidate["research_evidence"]["diagnostics"][0]["execution"]["phases"][0]["phase"] == "official_pdf_text_started"
 
 
 def test_null_research_wrapper_is_not_counted_as_available(tmp_path: Path) -> None:

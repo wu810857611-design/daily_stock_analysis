@@ -39,12 +39,20 @@ _HTTP_PHASES = {
     )
     for state in ("started", "complete", "failed")
 }
+_OFFICIAL_PHASES = {
+    "official_request_started", "official_headers_received",
+    "official_body_read_started", "official_body_read_completed",
+    "official_declared_size_rejected", "official_streamed_size_rejected",
+    "official_json_decode_started", "official_json_decode_completed",
+    "official_pdf_parse_started", "official_pdf_parse_completed",
+    "official_pdf_text_started", "official_pdf_text_completed",
+} | {f"official_http_status_{status}" for status in range(100, 600)}
 
 
 def record_isolated_phase(phase: str) -> None:
     """Persist only fixed phase names and timings; never HTTP info, bodies or keys."""
     progress = _PROGRESS.get()
-    if progress is None or not isinstance(phase, str) or phase not in _CALL_PHASES | _HTTP_PHASES:
+    if progress is None or not isinstance(phase, str) or phase not in _CALL_PHASES | _HTTP_PHASES | _OFFICIAL_PHASES:
         return
     events = progress["events"]
     events.append({"phase": phase, "elapsed_seconds": round(time.monotonic() - progress["started"], 6)})
