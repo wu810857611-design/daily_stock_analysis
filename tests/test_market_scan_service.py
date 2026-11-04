@@ -700,7 +700,7 @@ def _tencent_quote_line(
     *,
     timestamp: str,
     price: str = "100.00",
-    amount_ten_thousand: str = "3000.00",
+    amount_hkd: str = "30000000.00",
 ) -> str:
     fields = [""] * 38
     fields[1] = "腾讯控股"
@@ -709,7 +709,7 @@ def _tencent_quote_line(
     fields[6] = "1000000"
     fields[30] = timestamp
     fields[32] = "1.01"
-    fields[37] = amount_ten_thousand
+    fields[37] = amount_hkd
     return f'v_{symbol}="{"~".join(fields)}";'
 
 
@@ -796,6 +796,7 @@ def test_tencent_hk_membership_fallback_uses_alternate_route() -> None:
     ]
     assert payload["route_stats"][-1] == {
         "route": "alternate",
+        "requested_keys": ["r_hk00700"],
         "requested": 1,
         "fresh": 1,
         "failed": False,

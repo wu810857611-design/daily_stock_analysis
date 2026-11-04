@@ -61,15 +61,16 @@ TZ = ZoneInfo("Asia/Shanghai")
 
 
 def tencent_record(provider_symbol, name, price, previous_close, timestamp):
-    fields = [""] * 50
+    fields = [""] * 78
     fields[0] = "51"
     fields[1] = name
-    fields[2] = provider_symbol[2:]
+    fields[2] = provider_symbol.removeprefix("r_")[2:]
     fields[3] = str(price)
     fields[4] = str(previous_close)
     fields[30] = timestamp
     fields[31] = str(price - previous_close)
     fields[32] = str((price - previous_close) / previous_close * 100)
+    fields[75] = "HKD" if provider_symbol.removeprefix("r_").startswith("hk") else ""
     return f'v_{provider_symbol}="{"~".join(fields)}";'
 
 
@@ -1342,7 +1343,7 @@ class TencentBatchTests(unittest.TestCase):
         # rather than supplying an already blessed fake fallback object.
         tencent = TencentBatchQuoteFetcher(
             opener=lambda *_args, **_kwargs: FakeResponse(
-                tencent_record("hk02522", "一脉阳光", price, 4.8, timestamp)
+                tencent_record("r_hk02522", "一脉阳光", price, 4.8, timestamp)
             ),
             retry_backoff_seconds=0,
         )
@@ -1444,7 +1445,7 @@ class TencentBatchTests(unittest.TestCase):
         result = fetcher.fetch(["300408", "HK00981"], now=now)
 
         self.assertEqual(len(calls), 1)
-        self.assertIn("sz300408,hk00981", calls[0][0])
+        self.assertIn("sz300408,r_hk00981", calls[0][0])
         self.assertEqual(result["300408"].price, 40)
         self.assertEqual(result["HK00981"].price, 51)
         self.assertFalse(result["300408"].is_stale)

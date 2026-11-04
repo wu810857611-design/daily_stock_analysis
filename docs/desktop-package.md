@@ -1,6 +1,9 @@
 # 桌面端打包说明 (Electron + React UI)
 
 本项目可打包为桌面应用，使用 Electron 作为桌面壳，`apps/dsa-web` 的 React UI 作为界面。
+Windows/macOS冻结后均要求AkShare日历文件真实存在；检查兼容旧版
+`akshare/file_fold/calendar.json`与新版`akshare/data/calendar.json`，包括PyInstaller的
+`_internal`布局。资源路径迁移不改变交易日历内容或交易日判断；缺文件仍使构建失败。
 
 ## 架构说明
 

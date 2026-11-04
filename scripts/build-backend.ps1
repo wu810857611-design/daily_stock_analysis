@@ -182,6 +182,12 @@ if (-not (Test-Path $packagedAkshareCalendar)) {
   $packagedAkshareCalendar = Join-Path 'dist\backend\stock_analysis' 'akshare\file_fold\calendar.json'
 }
 if (-not (Test-Path $packagedAkshareCalendar)) {
+  $packagedAkshareCalendar = Join-Path 'dist\backend\stock_analysis' '_internal\akshare\data\calendar.json'
+}
+if (-not (Test-Path $packagedAkshareCalendar)) {
+  $packagedAkshareCalendar = Join-Path 'dist\backend\stock_analysis' 'akshare\data\calendar.json'
+}
+if (-not (Test-Path $packagedAkshareCalendar)) {
   throw 'Packaged AkShare calendar data not found under dist\backend\stock_analysis.'
 }
 

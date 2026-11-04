@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+- [修复] 腾讯港股两条既有路由及名册快照请求真实时间戳的r_hk键并校验代码/币种，纠正港股成交额误乘A股万元因子；保留90秒、未来时间和全部交易门禁。
+- [修复] Windows/macOS打包日历检查兼容AkShare将calendar.json从file_fold迁至data的资源路径，继续要求日历文件真实存在。
+
 - [修复] 官方公告PDF明确声明Adobe GB1/Identity-H且缺失ToUnicode时使用标准CID映射解码，保留原前三页、文本、身份、来源与预算门禁，并记录提取器及文件摘要。
 - [改进] 扫描双模型请求增加有界且不含正文/密钥的工作进程与同步HTTPX阶段诊断，保留原超时、主备次数、校验及进程组回收规则；阶段记录不直接归因上游。
 
