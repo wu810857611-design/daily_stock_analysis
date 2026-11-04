@@ -59,7 +59,12 @@ class ResearchBudget:
                      "result": "started", "error_class": ""}
             print(json.dumps({"event": "research_provider", **event}), flush=True)
             try:
-                result = run_isolated(callback, budget)
+                # Keep official download/parse phases even when the worker is
+                # killed; they stay in artifact diagnostics, outside model evidence.
+                if self.stage == "announcements":
+                    result = run_isolated(callback, budget, execution_diagnostics=event.setdefault("execution", {}))
+                else:
+                    result = run_isolated(callback, budget)
                 if getattr(result, "success", True) is False:
                     detail = str(getattr(result, "error_message", "") or "")
                     if any(term in detail.lower() for term in ("429", "rate limit", "限流", "503", "502")):

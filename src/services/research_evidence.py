@@ -15,6 +15,43 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 
+from src.services.research_execution import record_isolated_phase
+
+
+_OFFICIAL_MAX_BYTES = 2 * 1024 * 1024
+
+
+def _official_body(response: Any, kind: str) -> bytearray:
+    """Keep the original decoded-body cap; reject known oversized identity bodies early."""
+    record_isolated_phase("official_headers_received")
+    status = response.status_code
+    if isinstance(status, int) and not isinstance(status, bool) and 100 <= status <= 599:
+        record_isolated_phase(f"official_http_status_{status}")
+    response.raise_for_status()
+    if status != 200:
+        raise AnnouncementEvidenceError(
+            "announcement_index_redirect_or_non_json" if kind == "index"
+            else "announcement_redirect_or_non_document")
+    headers = getattr(response, "headers", {})
+    length = str(headers.get("Content-Length", "")).strip()
+    # Content-Length describes the encoded representation and is ignored with
+    # Transfer-Encoding. Do not apply a decoded-file limit to either case.
+    if (not headers.get("Transfer-Encoding")
+            and str(headers.get("Content-Encoding", "")).strip().lower() in {"", "identity"}
+            and re.fullmatch(r"[0-9]{1,20}", length)
+            and int(length) > _OFFICIAL_MAX_BYTES):
+        record_isolated_phase("official_declared_size_rejected")
+        raise AnnouncementEvidenceError(f"announcement_{kind}_too_large")
+    record_isolated_phase("official_body_read_started")
+    raw = bytearray()
+    for chunk in response.iter_content(32768):
+        raw.extend(chunk)
+        if len(raw) > _OFFICIAL_MAX_BYTES:
+            record_isolated_phase("official_streamed_size_rejected")
+            raise AnnouncementEvidenceError(f"announcement_{kind}_too_large")
+    record_isolated_phase("official_body_read_completed")
+    return raw
+
 
 class AnnouncementEvidenceError(ValueError):
     """Stable, public guard reason retained across the isolated worker."""
@@ -31,22 +68,18 @@ def _cninfo_json(url: str, data: dict | None = None, *, expected_type: type = di
 
     method = requests.get if data is None else requests.post
     kwargs = {} if data is None else {"data": data}
+    record_isolated_phase("official_request_started")
     with method(url, headers={"Referer": "https://www.cninfo.com.cn/"},
                 stream=True, timeout=(1.5, 2), allow_redirects=False, **kwargs) as response:
-        response.raise_for_status()
-        if response.status_code != 200:
-            raise AnnouncementEvidenceError("announcement_index_redirect_or_non_json")
-        raw = bytearray()
-        for chunk in response.iter_content(32768):
-            raw.extend(chunk)
-            if len(raw) > 2 * 1024 * 1024:
-                raise AnnouncementEvidenceError("announcement_index_too_large")
+        raw = _official_body(response, "index")
+    record_isolated_phase("official_json_decode_started")
     try:
         result = json.loads(raw)
     except (ValueError, UnicodeError):
         raise AnnouncementEvidenceError("announcement_index_invalid_json") from None
     if not isinstance(result, expected_type):
         raise AnnouncementEvidenceError("announcement_index_invalid_payload")
+    record_isolated_phase("official_json_decode_completed")
     return result
 
 
@@ -268,25 +301,23 @@ def announcement_excerpt(url: str, code: str, name: str) -> dict:
         "static.cninfo.com.cn", "www.cninfo.com.cn", "www.hkexnews.hk"
     } or parsed.username or parsed.password or parsed.port not in (None, 443):
         raise AnnouncementEvidenceError("untrusted_announcement_document")
+    record_isolated_phase("official_request_started")
     with requests.get(url, stream=True, timeout=(1.5, 2), allow_redirects=False) as response:
-        response.raise_for_status()
-        if response.status_code != 200:
-            raise AnnouncementEvidenceError("announcement_redirect_or_non_document")
-        data = bytearray()
-        for chunk in response.iter_content(32768):
-            data.extend(chunk)
-            if len(data) > 2 * 1024 * 1024:
-                raise AnnouncementEvidenceError("announcement_document_too_large")
+        data = _official_body(response, "document")
         if not data.startswith(b"%PDF"):
             raise AnnouncementEvidenceError("announcement_not_pdf")
+    record_isolated_phase("official_pdf_parse_started")
     reader = PdfReader(io.BytesIO(data))
     pages = list(islice(reader.pages, 3))
+    record_isolated_phase("official_pdf_parse_completed")
+    record_isolated_phase("official_pdf_text_started")
     if any(_adobe_gb1_without_unicode(page) for page in pages):
         text = _adobe_gb1_excerpt(bytes(data))
         text_extractor = "pdfminer.six_adobe_gb1"
     else:
         text = "\n".join((page.extract_text() or "")[:10000] for page in pages)
         text_extractor = "pypdf"
+    record_isolated_phase("official_pdf_text_completed")
     compact = "".join(text.split())
     evidence = {"document_source": url, "document_sha256": hashlib.sha256(data).hexdigest(),
                 "document_bytes": len(data), "extracted_characters": len(compact),
