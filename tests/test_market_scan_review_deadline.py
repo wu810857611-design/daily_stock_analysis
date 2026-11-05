@@ -32,9 +32,12 @@ def response(kwargs):
 
 
 @pytest.mark.parametrize("label", ["qwen", "deepseek"])
-def test_real_worker_keeps_relative_stop_risk_without_retry_or_verdict_upgrade(monkeypatch, tmp_path, label):
+@pytest.mark.parametrize("risk,price,stop", [
+    ("ATR占比7.7%而止损距现价约9.4%，在如此高波动下止损极易被日内噪音触发", 20.8, None),
+    ("年化波动率76.36%、ATR占比8.4%，止损7.1471距现价约15%，单笔潜在亏损过大", 8.42, 7.1471),
+])
+def test_real_worker_keeps_relative_stop_risk_without_retry_or_verdict_upgrade(monkeypatch, tmp_path, label, risk, price, stop):
     captured = tmp_path / "stop_distance_requests.jsonl"
-    risk = "ATR占比7.7%而止损距现价约9.4%，在如此高波动下止损极易被日内噪音触发"
 
     def completion(**kwargs):
         body = json.loads(kwargs["messages"][1]["content"])
@@ -51,7 +54,8 @@ def test_real_worker_keeps_relative_stop_risk_without_retry_or_verdict_upgrade(m
     monkeypatch.setenv("LLM_DASHSCOPE_API_KEY", "never-send-offline-secret")
     monkeypatch.setenv("LLM_DASHSCOPE_MODELS", "offline-primary,offline-fallback")
     reviewer = market_scan.build_litellm_reviewer(label)
-    result = reviewer([{"code": "300244", "price": 20.8}, {"code": "600002", "price": 20.8}])
+    result = reviewer([{"code": code, "price": price, "plan": {"stop_loss": stop}}
+                       for code in ["002354", "600002"]])
     assert [(r["verdict"], r["hard_risk"]) for r in result["reviews"]] == [("watch", False), ("reject", True)]
     assert all(r["risks"] == [risk] for r in result["reviews"])
     assert len(captured.read_text().splitlines()) == len(reviewer.diagnostics["requests"]) == 1

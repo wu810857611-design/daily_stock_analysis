@@ -100,6 +100,57 @@ def test_stop_distance_keeps_structured_price_checks_and_original_risk():
 
 @pytest.mark.parametrize('text_field', ['thesis', 'view', 'facts', 'risks', 'inferences', 'invalidators'])
 @pytest.mark.parametrize('claim', [
+    '年化波动率76.36%、ATR占比8.4%，止损7.1471距现价约15%，单笔潜在亏损过大',
+    '止损价为7.1471元距离当前价15％，保持观察',
+    '止损位 7.1471e0 CNY 距最新价约15%，不追高',
+])
+def test_explicit_plan_stop_keeps_relative_distance_and_original_text(text_field, claim):
+    candidate = {'code': '002354', 'price': 8.42, 'plan': {'stop_loss': 7.1471}}
+    review = {'numeric_facts': numeric_facts(candidate),
+              text_field: claim if text_field in {'thesis', 'view'} else [claim]}
+    original = json.dumps(review, ensure_ascii=False, sort_keys=True)
+    assert validate_review_facts(review, candidate, require_echo=True) == []
+    assert json.dumps(review, ensure_ascii=False, sort_keys=True) == original
+
+
+@pytest.mark.parametrize('claim', [
+    '止损7.1471距现价约15元', '止损7.1471距现价约15',
+    '止损7.1471距现价约15CNY%', '止损7.1471距现价约1,5%',
+    '止损7.1471港元距现价约15%', '止损7.9距现价约15%',
+    '止损7,14.71距现价约15%', '止损1e999距现价约15%',
+    '止损7.1471距现价约15%，当前价15元',
+    '止损7.1471距现价约15%，成交额15元',
+    '止损7.1471距现价约15%，PE15倍',
+])
+def test_explicit_stop_distance_does_not_exempt_conflicts_or_invalid_units(claim):
+    candidate = {'code': '002354', 'price': 8.42, 'amount': 1000000, 'pe': 40,
+                 'plan': {'stop_loss': 7.1471}}
+    assert validate_review_facts({'numeric_facts': numeric_facts(candidate), 'risks': [claim]},
+                                 candidate, require_echo=True)
+
+
+@pytest.mark.parametrize('plan', [None, {}, {'stop_loss': None}, {'stop_loss': True},
+                                  {'stop_loss': float('nan')}, {'stop_loss': -7.1471}])
+def test_explicit_stop_requires_a_trusted_plan_anchor(plan):
+    candidate = {'code': '002354', 'price': 8.42, 'plan': plan}
+    assert validate_review_facts({'numeric_facts': numeric_facts(candidate),
+                                 'risks': ['止损7.1471距现价约15%']}, candidate, require_echo=True)
+
+
+def test_explicit_stop_distance_keeps_structured_echo_and_hk_currency_checks():
+    candidate = {'code': 'HK00254', 'price': 8.42, 'plan': {'stop_loss': 7.1471}}
+    risk = '止损7.1471港元距现价约15%，保持观察'
+    review = {'numeric_facts': numeric_facts(candidate), 'risks': [risk]}
+    assert validate_review_facts(review, candidate, require_echo=True) == []
+    review['numeric_facts']['price'] = 15
+    assert validate_review_facts(review, candidate, require_echo=True) == [{
+        'field': 'price', 'expected': 8.42, 'observed': 15, 'error': 'structured_mismatch',
+    }]
+    assert review['risks'] == [risk]
+
+
+@pytest.mark.parametrize('text_field', ['thesis', 'view', 'facts', 'risks', 'inferences', 'invalidators'])
+@pytest.mark.parametrize('claim', [
     'PE/PB为2026-11-02研究口径，与快照非同一时点',
     'PE为2026-11-02估值时点，与快照非同一时点',
 ])
@@ -368,3 +419,20 @@ def test_injected_review_with_contradictory_vote_cannot_enter_conditional_consen
     assert result['review_complete'] is True  # Calls completed; fact integrity failed.
     assert not any(item.get('eligible_for_intraday_review') for item in result['candidates'])
     assert all(item['qwen_review']['numeric_consistency']['status'] == 'inconsistent' for item in result['candidates'])
+
+
+def test_service_keeps_explicit_stop_distance_risk_without_upgrade(tmp_path):
+    def review(candidates):
+        return {'reviews': [{'code': item['code'], 'verdict': 'watch', 'confidence': .9,
+                             'hard_risk': True, 'numeric_facts': numeric_facts(item),
+                             'risks': [f"止损{item['plan']['stop_loss']}距现价约15%，保持观察"]}
+                            for item in candidates]}
+    result = _service(tmp_path, qwen=review, deepseek=review).run()
+    assert result['review_complete'] is True and result['candidates']
+    assert not any(item.get('eligible_for_intraday_review') for item in result['candidates'])
+    for item in result['candidates']:
+        for label in ['qwen', 'deepseek']:
+            checked = item[f'{label}_review']
+            assert checked['numeric_consistency']['status'] == 'checked'
+            assert checked['verdict'] == 'watch' and checked['hard_risk'] is True
+            assert checked['risks'] == [f"止损{item['plan']['stop_loss']}距现价约15%，保持观察"]

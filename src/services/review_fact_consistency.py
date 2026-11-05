@@ -69,6 +69,29 @@ _CLAIMS = {
 }
 
 
+def _stop_distance_context(prefix: str, candidate: Mapping[str, Any], currency: str) -> bool:
+    """Recognize a distance label, checking any explicit stop against the plan."""
+    context = re.search(
+        rf"止损(?:价|位)?\s*(?:(?:约|为|：|:|=)?\s*(?P<stop>{_NUMBER})\s*"
+        r"(?P<currency>港元|港币|人民币|元|HKD|CNY)?\s*)?距(?:离)?\s*$",
+        prefix, flags=re.IGNORECASE,
+    )
+    if not context:
+        return False
+    literal = context.group("stop")
+    if literal is None:
+        return True
+    plan = candidate.get("plan")
+    stop = plan.get("stop_loss") if isinstance(plan, Mapping) else None
+    if (not _VALID_NUMBER.fullmatch(literal)
+            or not isinstance(stop, (int, float)) or isinstance(stop, bool)
+            or not math.isfinite(stop) or stop <= 0
+            or not _matches("price", stop, float(literal.replace(",", "")))):
+        return False
+    unit = context.group("currency")
+    return not unit or ("HKD" if unit.lower() in {"港元", "港币", "hkd"} else "CNY") == currency
+
+
 def _prose_matches(field: str, expected: float, observed: float, literal: str,
                    multiplier: float = 1) -> bool:
     """Compare a labelled claim at its printed precision, after unit conversion.
@@ -147,9 +170,9 @@ def validate_review_facts(review: Mapping[str, Any], candidate: Mapping[str, Any
                             # keep the original risk and all numeric checks.
                             continue
                 if (field == "price" and not match.group(2)
-                        and re.search(r"止损(?:价|位)?\s*距(?:离)?\s*$",
-                                      text[max(0, match.start() - 20):match.start()])
-                        and re.match(r"[%％]", text[match.end():])):
+                        and re.match(r"[%％]", text[match.end():])
+                        and _stop_distance_context(text[max(0, match.start() - 96):match.start()],
+                                                   candidate, expected.get("currency", ""))):
                     # "止损距现价9.4%" is a relative distance, not a price.
                     # Keep the original risk; structured echoes and absolute
                     # price claims still use their existing checks.
