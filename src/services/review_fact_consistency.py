@@ -155,6 +155,16 @@ def validate_review_facts(review: Mapping[str, Any], candidate: Mapping[str, Any
                     errors.append({"field": field, "error": "invalid_numeric_format",
                                    "claim": match.group(0), **context})
                     continue
+                if (field == "change_pct"
+                        and match.group("label") in {"日涨幅", "日跌幅", "日涨跌幅", "日涨跌"}
+                        and re.search(
+                            r"连续\s*(?:[2-9]|[1-9]\d|[二三四五六七八九两]|"
+                            r"[一二三四五六七八九]?十[一二三四五六七八九]?)\s*(?:个\s*交易)?\s*$",
+                            text[max(0, match.start() - 32):match.start()])):
+                    # An explicit multi-day window is not today's return.
+                    # Keep the original risk; echoes and same-sentence daily
+                    # claims still undergo their independent numeric checks.
+                    continue
                 if field in {"pe", "pb"}:
                     research_date = re.match(
                         r"(\d{4}-\d{2}-\d{2})\s*(?:研究|估值)(?:口径|日期|时点)",
