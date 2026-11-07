@@ -151,6 +151,46 @@ def test_explicit_stop_distance_keeps_structured_echo_and_hk_currency_checks():
 
 @pytest.mark.parametrize('text_field', ['thesis', 'view', 'facts', 'risks', 'inferences', 'invalidators'])
 @pytest.mark.parametrize('claim', [
+    '连续四日涨幅37.79%后换手率高达16.46%，投机情绪过热',
+    '连续4个交易日涨跌幅37.79%，仍应观察',
+    '连续两日跌幅12.5%，保留回撤风险',
+])
+def test_explicit_multiday_window_is_not_a_snapshot_daily_return(text_field, claim):
+    candidate = {'code': '603598', 'change_pct': 1.25}
+    review = {'numeric_facts': numeric_facts(candidate),
+              text_field: claim if text_field in {'thesis', 'view'} else [claim]}
+    original = json.dumps(review, ensure_ascii=False, sort_keys=True)
+    assert validate_review_facts(review, candidate, require_echo=True) == []
+    assert json.dumps(review, ensure_ascii=False, sort_keys=True) == original
+
+
+@pytest.mark.parametrize('claim', [
+    '11月4日涨幅37.79%', '连续一日涨幅37.79%', '连续1日涨幅37.79%',
+    '连续01日涨幅37.79%', '连续四日每日涨幅37.79%',
+    '连续四日涨幅37.79%，当日涨幅37.79%',
+    '连续四日涨幅37.79%，日涨跌幅37.79%',
+    '连续四日涨幅37.79%，当前价37.79元',
+    '连续四日涨幅37.79%，PE305.57倍',
+    '连续四日涨幅3,7.79%',
+])
+def test_multiday_window_does_not_exempt_dates_daily_or_other_numeric_conflicts(claim):
+    candidate = {'code': '603598', 'change_pct': 1.25, 'price': 47.66, 'pe': 309.38}
+    assert validate_review_facts({'numeric_facts': numeric_facts(candidate), 'risks': [claim]},
+                                 candidate, require_echo=True)
+
+
+def test_multiday_risk_keeps_structured_daily_return_validation():
+    candidate = {'code': '603598', 'change_pct': 1.25}
+    risk = '连续四日涨幅37.79%，投机情绪过热'
+    review = {'numeric_facts': {**numeric_facts(candidate), 'change_pct': 37.79}, 'risks': [risk]}
+    assert validate_review_facts(review, candidate, require_echo=True) == [{
+        'field': 'change_pct', 'expected': 1.25, 'observed': 37.79, 'error': 'structured_mismatch',
+    }]
+    assert review['risks'] == [risk]
+
+
+@pytest.mark.parametrize('text_field', ['thesis', 'view', 'facts', 'risks', 'inferences', 'invalidators'])
+@pytest.mark.parametrize('claim', [
     'PE/PB为2026-11-02研究口径，与快照非同一时点',
     'PE为2026-11-02估值时点，与快照非同一时点',
 ])
@@ -436,3 +476,20 @@ def test_service_keeps_explicit_stop_distance_risk_without_upgrade(tmp_path):
             assert checked['numeric_consistency']['status'] == 'checked'
             assert checked['verdict'] == 'watch' and checked['hard_risk'] is True
             assert checked['risks'] == [f"止损{item['plan']['stop_loss']}距现价约15%，保持观察"]
+
+
+def test_service_keeps_multiday_risk_without_upgrading_consensus(tmp_path):
+    risk = '连续四日涨幅37.79%，投机情绪过热'
+    def review(candidates):
+        return {'reviews': [{'code': item['code'], 'verdict': 'watch', 'hard_risk': True,
+                             'numeric_facts': numeric_facts(item), 'risks': [risk]}
+                            for item in candidates]}
+    result = _service(tmp_path, qwen=review, deepseek=review).run()
+    assert result['review_complete'] and result['candidates']
+    assert not any(item['eligible_for_intraday_review'] for item in result['candidates'])
+    for item in result['candidates']:
+        for label in ['qwen', 'deepseek']:
+            checked = item[f'{label}_review']
+            assert checked['numeric_consistency']['status'] == 'checked'
+            assert checked['verdict'] == 'watch' and checked['hard_risk']
+            assert checked['risks'] == [risk]

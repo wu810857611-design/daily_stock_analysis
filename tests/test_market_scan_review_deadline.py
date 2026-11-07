@@ -66,6 +66,33 @@ def test_real_worker_keeps_relative_stop_risk_without_retry_or_verdict_upgrade(m
 
 
 @pytest.mark.parametrize("label", ["qwen", "deepseek"])
+def test_real_worker_keeps_multiday_risk_without_retry_or_upgrade(monkeypatch, tmp_path, label):
+    captured = tmp_path / "multiday_requests.jsonl"
+    risk = "连续四日涨幅37.79%后换手率高达16.46%，投机情绪过热"
+    def completion(**kwargs):
+        batch = json.loads(kwargs["messages"][1]["content"])["candidates"]
+        with captured.open("a") as handle:
+            handle.write(json.dumps(batch) + "\n")
+        reviews = [{"code": item["code"], "verdict": verdict, "hard_risk": hard_risk,
+                    "numeric_facts": item["numeric_fact_contract"]["values"], "risks": [risk]}
+                   for item, verdict, hard_risk in zip(batch, ["watch", "reject"], [False, True])]
+        return {"choices": [{"finish_reason": "stop", "message": {
+            "content": json.dumps({"reviews": reviews}, ensure_ascii=False)}}]}
+    configure(monkeypatch, completion, request_timeout=1.0)
+    monkeypatch.setenv("MARKET_SCAN_QWEN_MODEL", "offline-primary")
+    monkeypatch.setenv("LLM_DASHSCOPE_API_KEY", "never-send-offline-secret")
+    monkeypatch.setenv("LLM_DASHSCOPE_MODELS", "offline-primary,offline-fallback")
+    reviewer = market_scan.build_litellm_reviewer(label)
+    result = reviewer([{"code": code, "change_pct": 1.25} for code in ["603598", "600002"]])
+    assert [(r["verdict"], r["hard_risk"]) for r in result["reviews"]] == [("watch", False), ("reject", True)]
+    assert all(r["risks"] == [risk] for r in result["reviews"])
+    assert len(captured.read_text().splitlines()) == len(reviewer.diagnostics["requests"]) == 1
+    assert reviewer.diagnostics["status"] == "completed"
+    assert reviewer.diagnostics["completed_candidate_count"] == 2
+    assert not multiprocessing.active_children()
+
+
+@pytest.mark.parametrize("label", ["qwen", "deepseek"])
 def test_real_worker_keeps_valuation_date_risk_without_retry_or_verdict_upgrade(monkeypatch, tmp_path, label):
     captured = tmp_path / "valuation_date_requests.jsonl"
     risk = "PE/PB为2026-11-02研究口径，与快照非同一时点"
