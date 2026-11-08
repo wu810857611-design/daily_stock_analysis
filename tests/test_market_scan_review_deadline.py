@@ -66,6 +66,33 @@ def test_real_worker_keeps_relative_stop_risk_without_retry_or_verdict_upgrade(m
 
 
 @pytest.mark.parametrize("label", ["qwen", "deepseek"])
+def test_real_worker_keeps_multiday_risk_without_retry_or_upgrade(monkeypatch, tmp_path, label):
+    captured = tmp_path / "multiday_requests.jsonl"
+    risk = "连续四日涨幅37.79%后换手率高达16.46%，投机情绪过热"
+    def completion(**kwargs):
+        batch = json.loads(kwargs["messages"][1]["content"])["candidates"]
+        with captured.open("a") as handle:
+            handle.write(json.dumps(batch) + "\n")
+        reviews = [{"code": item["code"], "verdict": verdict, "hard_risk": hard_risk,
+                    "numeric_facts": item["numeric_fact_contract"]["values"], "risks": [risk]}
+                   for item, verdict, hard_risk in zip(batch, ["watch", "reject"], [False, True])]
+        return {"choices": [{"finish_reason": "stop", "message": {
+            "content": json.dumps({"reviews": reviews}, ensure_ascii=False)}}]}
+    configure(monkeypatch, completion, request_timeout=1.0)
+    monkeypatch.setenv("MARKET_SCAN_QWEN_MODEL", "offline-primary")
+    monkeypatch.setenv("LLM_DASHSCOPE_API_KEY", "never-send-offline-secret")
+    monkeypatch.setenv("LLM_DASHSCOPE_MODELS", "offline-primary,offline-fallback")
+    reviewer = market_scan.build_litellm_reviewer(label)
+    result = reviewer([{"code": code, "change_pct": 1.25} for code in ["603598", "600002"]])
+    assert [(r["verdict"], r["hard_risk"]) for r in result["reviews"]] == [("watch", False), ("reject", True)]
+    assert all(r["risks"] == [risk] for r in result["reviews"])
+    assert len(captured.read_text().splitlines()) == len(reviewer.diagnostics["requests"]) == 1
+    assert reviewer.diagnostics["status"] == "completed"
+    assert reviewer.diagnostics["completed_candidate_count"] == 2
+    assert not multiprocessing.active_children()
+
+
+@pytest.mark.parametrize("label", ["qwen", "deepseek"])
 def test_real_worker_keeps_valuation_date_risk_without_retry_or_verdict_upgrade(monkeypatch, tmp_path, label):
     captured = tmp_path / "valuation_date_requests.jsonl"
     risk = "PE/PB为2026-11-02研究口径，与快照非同一时点"
@@ -179,7 +206,9 @@ def test_real_worker_preserves_numeric_rejection_and_retries_without_relaxing_va
                          "numeric_facts": item["numeric_fact_contract"]["values"],
                          "facts": ["日涨0.28%" if recovers and count > 1 else "日涨27.97%"]}],
         })}}]}
-    configure(monkeypatch, completion)
+    # This checks numeric rejection/recovery, not a 250 ms scheduling deadline.
+    # Keep the real worker while giving validation and result transport time.
+    configure(monkeypatch, completion, request_timeout=1.0)
     reviewer = market_scan.build_litellm_reviewer("deepseek")
     candidate = {"code": "HK01548", "price": 43.02, "change_pct": 0.27972, "amount": 1649000000}
     if recovers:
@@ -189,7 +218,9 @@ def test_real_worker_preserves_numeric_rejection_and_retries_without_relaxing_va
         with pytest.raises(ValueError, match="response_numeric_fact_mismatch"):
             reviewer([candidate])
         assert reviewer.diagnostics["completed_candidate_count"] == 0
-    error = reviewer.diagnostics["requests"][0]["numeric_errors"]["HK01548"][0]
+    first = reviewer.diagnostics["requests"][0]
+    assert first["error_code"] == "response_numeric_fact_mismatch", first
+    error = first["numeric_errors"]["HK01548"][0]
     assert error["field"] == "change_pct" and error["expected"] == 0.27972
     assert error["text_field"] == "facts" and error["claim_context"] == "日涨27.97%"
     assert all(request["retry_feedback"]["numeric_errors"]["HK01548"][0]["expected"] == 0.27972
