@@ -206,7 +206,9 @@ def test_real_worker_preserves_numeric_rejection_and_retries_without_relaxing_va
                          "numeric_facts": item["numeric_fact_contract"]["values"],
                          "facts": ["日涨0.28%" if recovers and count > 1 else "日涨27.97%"]}],
         })}}]}
-    configure(monkeypatch, completion)
+    # This checks numeric rejection/recovery, not a 250 ms scheduling deadline.
+    # Keep the real worker while giving validation and result transport time.
+    configure(monkeypatch, completion, request_timeout=1.0)
     reviewer = market_scan.build_litellm_reviewer("deepseek")
     candidate = {"code": "HK01548", "price": 43.02, "change_pct": 0.27972, "amount": 1649000000}
     if recovers:
@@ -216,7 +218,9 @@ def test_real_worker_preserves_numeric_rejection_and_retries_without_relaxing_va
         with pytest.raises(ValueError, match="response_numeric_fact_mismatch"):
             reviewer([candidate])
         assert reviewer.diagnostics["completed_candidate_count"] == 0
-    error = reviewer.diagnostics["requests"][0]["numeric_errors"]["HK01548"][0]
+    first = reviewer.diagnostics["requests"][0]
+    assert first["error_code"] == "response_numeric_fact_mismatch", first
+    error = first["numeric_errors"]["HK01548"][0]
     assert error["field"] == "change_pct" and error["expected"] == 0.27972
     assert error["text_field"] == "facts" and error["claim_context"] == "日涨27.97%"
     assert all(request["retry_feedback"]["numeric_errors"]["HK01548"][0]["expected"] == 0.27972
