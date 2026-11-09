@@ -248,7 +248,7 @@ def announcement_document_url(url: str, code: str, published_date: str) -> str:
     return f"https://static.cninfo.com.cn/finalpage/{document_date.isoformat()}/{announcement_id}.PDF"
 
 
-def _adobe_gb1_without_unicode(page: Any) -> bool:
+def _adobe_cid_without_unicode(page: Any) -> str | None:
     """Recognize a declared standard CID collection, never infer from garbled text."""
     def resolve(value: Any) -> Any:
         return value.get_object() if hasattr(value, "get_object") else value
@@ -261,12 +261,13 @@ def _adobe_gb1_without_unicode(page: Any) -> bool:
             continue
         for reference in font.get("/DescendantFonts", []):
             collection = resolve(resolve(reference).get("/CIDSystemInfo", {}))
-            if collection.get("/Registry") == "Adobe" and collection.get("/Ordering") == "GB1":
-                return True
-    return False
+            ordering = collection.get("/Ordering")
+            if collection.get("/Registry") == "Adobe" and ordering in ("GB1", "CNS1"):
+                return ordering
+    return None
 
 
-def _adobe_gb1_excerpt(data: bytes) -> str:
+def _adobe_cid_excerpt(data: bytes) -> str:
     """Decode the standard font map within the same page, text and worker bounds."""
     from pdfminer.converter import TextConverter
     from pdfminer.layout import LAParams
@@ -311,9 +312,11 @@ def announcement_excerpt(url: str, code: str, name: str) -> dict:
     pages = list(islice(reader.pages, 3))
     record_isolated_phase("official_pdf_parse_completed")
     record_isolated_phase("official_pdf_text_started")
-    if any(_adobe_gb1_without_unicode(page) for page in pages):
-        text = _adobe_gb1_excerpt(bytes(data))
-        text_extractor = "pdfminer.six_adobe_gb1"
+    collection = next((declared for page in pages
+                       if (declared := _adobe_cid_without_unicode(page))), None)
+    if collection:
+        text = _adobe_cid_excerpt(bytes(data))
+        text_extractor = f"pdfminer.six_adobe_{collection.lower()}"
     else:
         text = "\n".join((page.extract_text() or "")[:10000] for page in pages)
         text_extractor = "pypdf"
