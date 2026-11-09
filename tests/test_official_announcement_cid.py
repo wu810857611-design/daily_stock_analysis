@@ -1,4 +1,4 @@
-"""Real PDF decoding, with the same missing Adobe GB1 map as official HK forms."""
+"""Real PDF decoding for official HK forms without ToUnicode maps."""
 import io
 
 import pytest
@@ -33,10 +33,14 @@ def cid_pdf(*, codes=(17, 19, 17, 19, 17), pages=1, identity_page=0, prefix=0, o
     ref = writer._add_object(font)
     # Adobe GB1 CIDs: 安踏體育用品有限公司。 No font/issuer guesses in production.
     body = [957, 3575, 8564, 4322, 4264, 3030, 4277, 3915, 1796, 3507, 98] * 10
+    label = [1826, 1658, 1405, 8002, 287]  # GB1: 股份代號：
+    if ordering == 'CNS1':
+        label = [1648, 901, 766, 3822, 106]  # CNS1: 股份代號：
+        body = [661, 2615, 4309, 1041, 1648, 901, 990, 2082, 686, 801, 102] * 10
     for index in range(pages):
         glyphs = [957] * prefix
         if index == identity_page:
-            glyphs += [1826, 1658, 1405, 8002, 287, *codes]  # 股份代號：02020
+            glyphs += [*label, *codes]
         glyphs += body
         encoded = b''.join(cid.to_bytes(2, 'big') for cid in glyphs).hex().encode()
         stream = DecodedStreamObject()
@@ -63,6 +67,22 @@ def test_real_adobe_gb1_pdf_decodes_before_unchanged_identity_check(monkeypatch)
     assert result['text_extractor'] == 'pdfminer.six_adobe_gb1'
     assert result['content_reviewed'] is False
     assert result['extraction'] == 'official_pdf_first_three_pages'
+
+
+def test_real_adobe_cns1_pdf_preserves_identity_and_diagnostics(monkeypatch):
+    from src.services.research_execution import ResearchCallError, run_isolated
+
+    serve(monkeypatch, cid_pdf(ordering='CNS1', codes=(13667, 13673, 13672, 13672)))
+    url = 'https://static.cninfo.com.cn/a.pdf'
+    result = run_isolated(lambda: announcement_excerpt(url, 'HK03988', ''), 2)
+    assert '股份代號：3988' in result['excerpt']
+    assert '中國銀行股份有限公司' in result['excerpt']
+    assert result['text_extractor'] == 'pdfminer.six_adobe_cns1'
+    assert result['content_reviewed'] is False
+    for code in ('HK03989', '003988'):
+        with pytest.raises(ResearchCallError, match='identity_mismatch') as caught:
+            run_isolated(lambda: announcement_excerpt(url, code, ''), 2)
+        assert caught.value.evidence_diagnostics['text_extractor'] == 'pdfminer.six_adobe_cns1'
 
 
 @pytest.mark.parametrize('code', ['HK02021', '002020', 'HK09988'])

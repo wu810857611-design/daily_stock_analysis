@@ -151,7 +151,7 @@ def _execute(callback: Callable[[], Any], path: str, budget: float,
                 if isinstance(public.get(key), int) and not isinstance(public[key], bool):
                     diagnostics[key] = public[key]
             if isinstance(public.get("text_extractor"), str) and public["text_extractor"] in {
-                "pypdf", "pdfminer.six_adobe_gb1"
+                "pypdf", "pdfminer.six_adobe_gb1", "pdfminer.six_adobe_cns1"
             }:
                 diagnostics["text_extractor"] = public["text_extractor"]
         serialized = pickle.dumps(("error", getattr(exc, "error_class", type(exc).__name__),
