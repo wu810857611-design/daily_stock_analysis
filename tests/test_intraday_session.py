@@ -1354,7 +1354,9 @@ class TencentBatchTests(unittest.TestCase):
 
     def test_stale_longbridge_trade_does_not_hide_fresh_tencent_fallback(self):
         for timestamp, age in [("20261028095955", 5), ("20261028095830", 90)]:
-            with self.subTest(age=age):
+            with self.subTest(age=age), patch.object(
+                intraday_session_module, "time", SimpleNamespace(monotonic=lambda: 0.0)
+            ):
                 now, _live, fetcher = self._live_snapshot_stale_trade_fetcher(timestamp=timestamp)
                 result = fetcher.fetch(["HK02522"], now=now)["HK02522"]
                 self.assertEqual(result.price, 4.76)
@@ -1370,6 +1372,39 @@ class TencentBatchTests(unittest.TestCase):
                 self.assertEqual(diag["hk_primary_fallback_fresh_covered"], 1)
                 self.assertEqual(diag["hk_tradeable_covered"], 1)
                 self.assertFalse(diag["hk_degraded"])
+
+    def test_hk_takeover_checks_trade_age_after_both_provider_requests(self):
+        now = datetime(2026, 11, 10, 10, 0, tzinfo=TZ)
+        symbol = "HK02522"
+        for longbridge_age, tencent_age, takeover in [(89, 5, True), (240, 89, False), (240, 88, True)]:
+            with self.subTest(longbridge_age=longbridge_age, tencent_age=tencent_age):
+                elapsed = [0.0]
+
+                def longbridge_quotes(symbols, fetched_at):
+                    elapsed[0] = 2.0
+                    return parse_longbridge_batch([{
+                        "symbol": "2522.HK", "last_done": 4.82,
+                        "timestamp": fetched_at - timedelta(seconds=longbridge_age),
+                    }], symbols, fetched_at=fetched_at, realtime_entitled=True)
+
+                timestamp = (now - timedelta(seconds=tencent_age)).strftime("%Y%m%d%H%M%S")
+                tencent = TencentBatchQuoteFetcher(
+                    opener=lambda *_args, **_kwargs: FakeResponse(
+                        tencent_record("r_hk02522", "一脉阳光", 4.76, 4.8, timestamp)
+                    ), retry_backoff_seconds=0,
+                )
+                fetcher = DecisionQuoteFetcher(
+                    tencent_fetcher=tencent,
+                    longbridge_fetcher=FakeLongbridgeFetcher([longbridge_quotes]),
+                )
+                with patch.object(intraday_session_module, "time", SimpleNamespace(monotonic=lambda: elapsed[0])):
+                    result = fetcher.fetch([symbol], now=now)[symbol]
+                self.assertEqual(result.is_stale, not takeover)
+                self.assertEqual(result.source, "tencent_batch:fresh_hk_fallback" if takeover else "longbridge_batch")
+                diagnostics = fetcher.last_diagnostics
+                self.assertEqual(diagnostics["hk_live_snapshot_covered"], 1)
+                self.assertEqual(diagnostics["hk_fresh_upgraded"], 0)
+                self.assertEqual(diagnostics["hk_primary_fallback_fresh_covered"], int(takeover))
 
     def test_stale_longbridge_trade_keeps_unsafe_tencent_quotes_blocked(self):
         for timestamp, price in [

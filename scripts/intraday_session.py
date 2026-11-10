@@ -1239,6 +1239,7 @@ class DecisionQuoteFetcher:
         tencent_fetcher: Optional[TencentBatchQuoteFetcher] = None,
         longbridge_fetcher: Optional[LongbridgeBatchQuoteFetcher] = None,
     ):
+        self.freshness_seconds = freshness_seconds
         self.tencent_fetcher = tencent_fetcher or TencentBatchQuoteFetcher(
             freshness_seconds=freshness_seconds
         )
@@ -1251,9 +1252,20 @@ class DecisionQuoteFetcher:
         )
         self.last_diagnostics: Dict[str, Any] = {}
 
+    def _expire_trade(self, quote: Optional[RealtimeQuote], selected_at: datetime) -> Optional[RealtimeQuote]:
+        if quote is None or quote.is_stale:
+            return quote
+        timestamp = _parse_iso(quote.provider_timestamp)
+        if timestamp is not None:
+            age = (selected_at - timestamp).total_seconds()
+            if age > self.freshness_seconds:
+                return replace(quote, is_stale=True, stale_seconds=age)
+        return quote
+
     def fetch(
         self, symbols: Sequence[str], *, now: Optional[datetime] = None
     ) -> Dict[str, RealtimeQuote]:
+        started = time.monotonic()
         fetched_at = now or datetime.now(SHANGHAI_TZ)
         canonical = list(dict.fromkeys(canonical_symbol(symbol) for symbol in symbols))
         results = self.tencent_fetcher.fetch(canonical, now=fetched_at)
@@ -1267,9 +1279,11 @@ class DecisionQuoteFetcher:
         primary_fallback_covered = 0
         degradation_reasons: Dict[str, int] = {}
         longbridge = self.longbridge_fetcher.fetch(hk_symbols, now=fetched_at)
+        # Account for time spent pulling both sources before choosing a price.
+        selected_at = fetched_at.astimezone(SHANGHAI_TZ) + timedelta(seconds=time.monotonic() - started)
         for symbol in hk_symbols:
-            candidate = longbridge.get(symbol)
-            baseline = results.get(symbol)
+            candidate = self._expire_trade(longbridge.get(symbol), selected_at)
+            baseline = self._expire_trade(results.get(symbol), selected_at)
             fallback = None
             if (
                 baseline is not None
