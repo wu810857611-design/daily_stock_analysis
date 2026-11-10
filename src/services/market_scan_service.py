@@ -39,6 +39,7 @@ from src.services.position_sizing_policy import (
     classify_opportunity,
     opportunity_policy,
 )
+from src.services.market_scan_research import has_announcement_excerpt, meaningful
 
 
 SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
@@ -1188,11 +1189,16 @@ def _build_v4_evidence_contract(
     fundamentals_status = str(fundamentals.get("status") or "unavailable").lower()
     if fundamentals_status not in {"available", "partial"}:
         fundamentals_status = "unavailable"
-    announcements_status = str(
+    news_status = str(
         announcements_and_news.get("status") or "unavailable"
     ).lower()
-    if announcements_status not in {"available", "partial"}:
-        announcements_status = "unavailable"
+    if news_status not in {"available", "partial"}:
+        news_status = "unavailable"
+    official_announcements = research.get("announcements") or {}
+    verified_excerpt = isinstance(official_announcements, Mapping) and any(
+        has_announcement_excerpt(item) for item in (official_announcements.get("items") or [])
+    )
+    announcements_status = "partial" if verified_excerpt and news_status == "unavailable" else news_status
     availability = {
         "basic_quote": "available" if quote_available else "partial",
         "ohlcv": "available" if ohlcv_available else "partial",
@@ -1221,9 +1227,9 @@ def _build_v4_evidence_contract(
         )
         + (
             0.10
-            if announcements_status == "available"
+            if news_status == "available"
             else 0.05
-            if announcements_status == "partial"
+            if news_status == "partial"
             else 0.0
         )
     )
@@ -1265,7 +1271,7 @@ def _build_v4_evidence_contract(
         # A provider-indexed official document is distinct from news, and the
         # index does not prove the document contents were reviewed. Keep the
         # existing quality weights and decision gates unchanged.
-        "official_announcements": _json_safe(research.get("announcements") or {}),
+        "official_announcements": _json_safe(official_announcements),
     }
     above_ma20 = bool(
         _finite_float(candidate.get("price"))
@@ -2321,7 +2327,6 @@ class MarketScanService:
                         }
                 research_evidence["attempted"] = True
                 research_attempted_count += 1
-                from src.services.market_scan_research import meaningful
                 def research_block(key: str, payload_key: str) -> Any:
                     block = research_evidence.get(key)
                     return block.get(payload_key) if isinstance(block, Mapping) else None
@@ -2352,8 +2357,7 @@ class MarketScanService:
                     research_field_counts[field] += int(_finite_float(financial_report.get(field)) is not None)
                 research_field_counts["dated_financial_report"] += int(bool(financial_report.get("report_date")))
                 research_field_counts["announcement_body_excerpt"] += int(any(
-                    isinstance(item, Mapping) and item.get("body_excerpt_available") is True
-                    for item in (blocks["announcements"] or [])
+                    has_announcement_excerpt(item) for item in (blocks["announcements"] or [])
                 ))
                 errors = research_evidence.get("errors")
                 if isinstance(errors, list) and errors:

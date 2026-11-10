@@ -35,6 +35,17 @@ def meaningful(value: Any) -> bool:
     return value is not None and value != "" and not isinstance(value, bool)
 
 
+def has_announcement_excerpt(item: Any) -> bool:
+    if not isinstance(item, Mapping) or item.get("body_excerpt_available") is not True:
+        return False
+    excerpt = item.get("excerpt")
+    return isinstance(excerpt, str) and bool(excerpt.strip())
+
+
+def _finite_number(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+
 class ResearchBudget:
     def __init__(self, seconds: float, symbol: str, stage: str, events: list[dict],
                  retry_max: int = 2, request_timeout: float = 4.0) -> None:
@@ -149,8 +160,7 @@ class ScanResearchCollector:
         # never a substitute for a fresh entry quote. No full-market re-fetch.
         valuation = {key: candidate.get(source) for key, source in
                      (("pe_ratio", "pe"), ("pb_ratio", "pb"), ("total_mv", "total_mv"))}
-        valuation = {key: value for key, value in valuation.items()
-                     if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)}
+        valuation = {key: value for key, value in valuation.items() if _finite_number(value)}
         fundamental = {"valuation": {"status": "partial" if valuation else "unavailable", "data": valuation,
                                      "source": candidate.get("_research_snapshot_source", ""),
                                      "fetched_at": candidate.get("_research_snapshot_fetched_at", "")}}
@@ -306,7 +316,7 @@ class ScanResearchCollector:
                     if getattr(exc, "evidence_diagnostics", None):
                         item["body_diagnostics"] = exc.evidence_diagnostics
                     errors.append(f"announcement_body:{item['body_status']}")
-            announcements["body_excerpt_count"] = sum(bool(item.get("body_excerpt_available")) for item in announcements["items"])
+            announcements["body_excerpt_count"] = sum(has_announcement_excerpt(item) for item in announcements["items"])
             if not items:
                 self._cache.pop(announcement_key, None)
             if invalid_rows and not items:
@@ -317,8 +327,10 @@ class ScanResearchCollector:
 
         news = {"status": "unavailable", "evidence_type": "news_search_not_verified_exchange_announcements",
                 "items": []}
+        has_company_news = False
         budget = stage("news")
         try:
+            from src.search_service import SearchService
             from src.services.alphasift_service import _get_dsa_search_service
             service = _get_dsa_search_service()
             if not service.is_available:
@@ -330,12 +342,15 @@ class ScanResearchCollector:
                 code, str(candidate.get("name") or code), max_results=3,
                 request_runner=lambda callback, provider: search_budget.call(callback, provider),
             )
+            admitted = response.results[:3] if response.success else []
             items = [{"title": item.title, "snippet": item.snippet[:500], "url": item.url,
                       "source": item.source, "published_date": item.published_date}
-                     for item in response.results[:3]]
+                     for item in admitted]
+            has_company_news = any(item.relevance_category == SearchService._DIRECT_NEWS_CATEGORY
+                                   for item in admitted)
             news.update(status="partial" if response.success and items else
                         "no_results" if response.success else "provider_error",
-                        provider=response.provider, items=items if response.success else [])
+                        provider=response.provider, items=items)
             if not response.success:
                 errors.append("news:provider_error")
         except Exception as exc:
@@ -363,6 +378,7 @@ class ScanResearchCollector:
                 admitted = [item for item in response.results if item.relevance_category == filters._DIRECT_NEWS_CATEGORY
                             and item.published_date <= now.date().isoformat()][:3]
                 if admitted:
+                    has_company_news = True
                     news.update(status="partial", provider="Eastmoney", items=[{
                         "title": item.title, "snippet": item.snippet[:500], "url": item.url,
                         "source": item.source, "published_date": item.published_date,
@@ -374,17 +390,24 @@ class ScanResearchCollector:
 
         report = fundamental["earnings"]["data"].get("financial_report") or {}
         missing = [f"valuation.{field}" for field in ("pe_ratio", "pb_ratio") if field not in valuation]
-        missing += [f"financial_report.{field}" for field in ("report_date", "revenue", "net_profit_parent", "operating_cash_flow", "roe")
-                if report.get(field) is None]
+        try:
+            report_date = datetime.fromisoformat(str(report.get("report_date") or "")).date()
+        except ValueError:
+            report_date = None
+        if report_date is None or report_date > now.date():
+            missing.append("financial_report.report_date")
+        missing += [f"financial_report.{field}" for field in ("revenue", "net_profit_parent", "operating_cash_flow", "roe")
+                    if not _finite_number(report.get(field))]
         missing += [f"growth.{field}" for field in ("revenue_yoy", "net_profit_yoy")
-                    if fundamental["growth"]["data"].get(field) is None]
-        if not news["items"]:
+                    if not _finite_number(fundamental["growth"]["data"].get(field))]
+        if not has_company_news:
             missing.append("news")
-        if not any(item.get("body_excerpt_available") for item in announcements["items"]):
+        if not announcements.get("body_excerpt_count"):
             missing.append("announcement_body")
 
         has_data = meaningful(fundamentals.get("data")) or bool(news["items"] or announcements["items"])
-        return {"attempted": True, "status": "partial" if has_data else "unavailable",
+        status = "complete" if not missing else "partial" if has_data else "unavailable"
+        return {"attempted": True, "status": status,
                 "fetched_at": datetime.now(timezone.utc).isoformat(), "fundamentals": fundamentals,
                 "announcements_and_news": news, "announcements": announcements,
                 "diagnostics": events, "errors": errors,

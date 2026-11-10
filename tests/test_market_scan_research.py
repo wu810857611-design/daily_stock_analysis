@@ -299,6 +299,88 @@ def test_official_body_excerpt_does_not_claim_full_review(configured, monkeypatc
     assert "announcement_body" not in result["missing_fields"]
 
 
+@pytest.mark.parametrize("news_category,missing", [
+    ("direct_company_news", None),
+    (None, "news"),
+    ("sector_related_news", "news"),
+    ("direct_company_news", "financial_report.roe"),
+    ("direct_company_news", "announcement_body"),
+])
+def test_scan_research_cns1_excerpt_reaches_reviewers_with_truthful_coverage(
+    configured, monkeypatch, tmp_path, news_category, missing,
+):
+    from data_provider.yfinance_fundamental_adapter import YfinanceFundamentalAdapter
+    from src.config import get_config
+    from src.services.market_scan_service import MARKET_HK
+    from src.services.research_evidence import announcement_excerpt
+    from tests.test_market_scan_service import ReviewRecorder, _history, _hk_snapshot, _service
+    from tests.test_official_announcement_cid import cid_pdf, serve
+
+    _, service = configured
+    config = get_config()
+    config.fundamental_stage_timeout_seconds = 3.0
+    config.fundamental_fetch_timeout_seconds = 1.0
+    monkeypatch.setattr("src.config.get_config", lambda: config)
+    monkeypatch.setattr("src.services.market_scan_research.announcement_excerpt", announcement_excerpt)
+    report = {"report_date": "2026-06-30", "revenue": 100.0, "net_profit_parent": 15.0,
+              "operating_cash_flow": 17.0, "roe": 12.0}
+    if missing == "financial_report.roe":
+        report["roe"] = float("nan")
+    monkeypatch.setattr(YfinanceFundamentalAdapter, "get_fundamental_bundle", lambda *_args, **_kwargs: {
+        "growth": {"revenue_yoy": 10.0, "net_profit_yoy": 5.0}, "earnings": {"financial_report": report},
+    })
+    digit = 13673 if missing == "announcement_body" else 13672
+    serve(monkeypatch, cid_pdf(ordering="CNS1", codes=(13667, 13673, 13672, digit)))
+
+    def index(code, org_id, now, _max_age):
+        date = now.date().isoformat()
+        link = (f"https://www.cninfo.com.cn/new/disclosure/detail?stockCode=03988"
+                f"&announcementId=1225663847&orgId={org_id}&announcementTime={date}")
+        return {"rows": [{"代码": "03988", "orgId": org_id, "公告时间": now.isoformat(),
+                          "公告标题": "股东会回执", "公告链接": link}],
+                "query": {"symbol": code, "coverage": "latest_page_sample"}}
+
+    monkeypatch.setattr("src.services.market_scan_research.cninfo_announcement_index", index)
+    news = [SearchResult("中国银行新闻", "公司经营动态", "https://example.com/news", "fixture",
+                         published_date="2026-11-09", relevance_category=news_category)] if news_category else []
+    monkeypatch.setattr(service, "search_stock_news", lambda *_args, **_kwargs: SearchResponse(
+        "中国银行", news, "Fixture", success=bool(news),
+    ))
+    snapshot = _hk_snapshot(include_non_connect=False)
+    snapshot["records"] = [{**snapshot["records"][0], "代码": "03988", "名称": "中国银行",
+                            "市盈率-动态": 6.0, "市净率": 0.6}]
+    history, history_source = _history("HK03988", 90)
+    history["high"] = history["close"] * 1.02
+    history["low"] = history["close"] * 0.98
+    qwen, deepseek = ReviewRecorder("watch"), ReviewRecorder("watch")
+    result = _service(tmp_path, qwen=qwen, deepseek=deepseek, hk_loader=lambda: snapshot,
+                      history_loader=lambda *_args: (history, history_source),
+                      config_overrides={"enabled_markets": (MARKET_HK,), "final_top_n": 1},
+                      research_loader=ScanResearchCollector(6)).run()
+
+    candidate, = result["candidates"]
+    research = candidate["research_evidence"]
+    body_available = missing != "announcement_body"
+    assert research["status"] == ("complete" if missing is None else "partial")
+    assert research["missing_fields"] == ([missing] if missing else [])
+    assert research["announcements"]["body_excerpt_count"] == int(body_available)
+    assert result["diagnostics"]["buy_funnel"]["research_complete_count"] == int(missing is None)
+    for reviewer in (qwen, deepseek):
+        payload, = reviewer.calls[0]
+        official = payload["facts"]["official_announcements"]
+        assert official["content_reviewed"] is False
+        item, = official["items"]
+        assert "body_diagnostics" not in item
+        if body_available:
+            assert "股份代號：3988" in item["excerpt"]
+            assert payload["data_availability"]["announcements"] == "partial"
+        else:
+            assert item["body_status"] == "announcement_document_identity_mismatch"
+            assert "excerpt" not in item
+    if not news:
+        assert candidate["data_quality"] == 0.85
+
+
 def test_terminal_document_uses_remaining_stage_without_reserving_unused_fallback(configured, monkeypatch):
     ak, _ = configured
     from src.config import get_config
