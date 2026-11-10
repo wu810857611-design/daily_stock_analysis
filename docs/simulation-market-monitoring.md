@@ -186,8 +186,10 @@ Linux 子进程中执行；请求设置 connect/read 超时，SDK总耗时由父
 和查询时间窗均通过的条目才能进入证据。公告索引始终标注 `content_reviewed=false`，
 不能表示已审阅原文，更不能以普通新闻替代正式公告。SearXNG 实例发现和逐实例请求
 分别受同一新闻阶段预算约束；首实例挂起后仍可切换，实例池缓存保留实际刷新时间及
-失败退避，实例轮换在父进程保留。新闻保留现有日期/关联性过滤，
-成功但零条有效结果记 `no_results`，与 `provider_error`、`NotConfigured`、超时分开。
+失败退避，实例轮换在父进程保留。搜索未取得直接个股新闻时，A 股用代码、港股用去掉
+上市标记的公司名通过东方财富补取，同样经过日期和关联性过滤。备用结果无直接匹配时，
+保留原有行业背景和失败诊断。成功但零条有效结果记 `no_results`，与 `provider_error`、
+`NotConfigured`、超时分开。
 
 漏斗新增研究 `attempted/complete/partial/unavailable` 及基本面、新闻、公告索引
 有效覆盖。旧 `research_available_count` 为兼容保留，明确只指“至少有一块非空证据”，
