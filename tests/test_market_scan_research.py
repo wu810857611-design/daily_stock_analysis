@@ -301,6 +301,9 @@ def test_official_body_excerpt_does_not_claim_full_review(configured, monkeypatc
 
 @pytest.mark.parametrize("news_category,missing", [
     ("direct_company_news", None),
+    ("eastmoney_after_failure", None),
+    ("eastmoney_after_sector_news", None),
+    ("eastmoney_without_direct_news", "news"),
     (None, "news"),
     ("sector_related_news", "news"),
     ("direct_company_news", "financial_report.roe"),
@@ -316,7 +319,7 @@ def test_scan_research_cns1_excerpt_reaches_reviewers_with_truthful_coverage(
     from tests.test_market_scan_service import ReviewRecorder, _history, _hk_snapshot, _service
     from tests.test_official_announcement_cid import cid_pdf, serve
 
-    _, service = configured
+    ak, service = configured
     config = get_config()
     config.fundamental_stage_timeout_seconds = 3.0
     config.fundamental_fetch_timeout_seconds = 1.0
@@ -341,13 +344,39 @@ def test_scan_research_cns1_excerpt_reaches_reviewers_with_truthful_coverage(
                 "query": {"symbol": code, "coverage": "latest_page_sample"}}
 
     monkeypatch.setattr("src.services.market_scan_research.cninfo_announcement_index", index)
-    news = [SearchResult("中国银行新闻", "公司经营动态", "https://example.com/news", "fixture",
-                         published_date="2026-11-09", relevance_category=news_category)] if news_category else []
+    news_from_fallback = bool(news_category and news_category.startswith("eastmoney_"))
+    primary_category = {
+        "eastmoney_after_failure": None,
+        "eastmoney_after_sector_news": "sector_related_news",
+        "eastmoney_without_direct_news": "sector_related_news",
+    }.get(news_category, news_category)
+    news = [SearchResult("原搜索结果", "公司经营动态", "https://example.com/news", "fixture",
+                         published_date="2026-11-09", relevance_category=primary_category)] if primary_category else []
     monkeypatch.setattr(service, "search_stock_news", lambda *_args, **_kwargs: SearchResponse(
         "中国银行", news, "Fixture", success=bool(news),
     ))
+    if news_from_fallback:
+        today = datetime.now().date()
+        valid_url = "https://finance.eastmoney.com/a/direct.html"
+
+        def eastmoney_news(symbol):
+            assert symbol == "中国银行"
+            rows = [
+                ("另一家银行发布业绩", today, "https://finance.eastmoney.com/a/other.html"),
+                ("中国银行发布旧业绩", today - timedelta(days=8), "https://finance.eastmoney.com/a/old.html"),
+                ("中国银行未来财报", today + timedelta(days=2), "https://finance.eastmoney.com/a/future.html"),
+            ]
+            if missing != "news":
+                rows.append(("中国银行(03988.HK)发布三季报", today, valid_url))
+            return pd.DataFrame([
+                {"新闻标题": title, "发布时间": stamp.isoformat(), "新闻链接": url, "文章来源": "测试媒体"}
+                for title, stamp, url in rows
+            ])
+
+        monkeypatch.setattr(ak, "stock_news_em", eastmoney_news)
     snapshot = _hk_snapshot(include_non_connect=False)
-    snapshot["records"] = [{**snapshot["records"][0], "代码": "03988", "名称": "中国银行",
+    snapshot["records"] = [{**snapshot["records"][0], "代码": "03988",
+                            "名称": "中国银行-W" if news_from_fallback else "中国银行",
                             "市盈率-动态": 6.0, "市净率": 0.6}]
     history, history_source = _history("HK03988", 90)
     history["high"] = history["close"] * 1.02
@@ -365,6 +394,18 @@ def test_scan_research_cns1_excerpt_reaches_reviewers_with_truthful_coverage(
     assert research["missing_fields"] == ([missing] if missing else [])
     assert research["announcements"]["body_excerpt_count"] == int(body_available)
     assert result["diagnostics"]["buy_funnel"]["research_complete_count"] == int(missing is None)
+    if news_from_fallback:
+        news_evidence = research["announcements_and_news"]
+        if missing == "news":
+            assert news_evidence["fallback_status"] == "no_results"
+            assert news_evidence["provider"] == "Fixture"
+        else:
+            assert news_evidence["provider"] == "Eastmoney"
+            assert [item["url"] for item in news_evidence["items"]] == [valid_url]
+            if not news:
+                assert "news:provider_error" in research["errors"]
+    elif primary_category == "direct_company_news":
+        assert "fallback_status" not in research["announcements_and_news"]
     for reviewer in (qwen, deepseek):
         payload, = reviewer.calls[0]
         official = payload["facts"]["official_announcements"]
@@ -377,7 +418,7 @@ def test_scan_research_cns1_excerpt_reaches_reviewers_with_truthful_coverage(
         else:
             assert item["body_status"] == "announcement_document_identity_mismatch"
             assert "excerpt" not in item
-    if not news:
+    if not news and not news_from_fallback:
         assert candidate["data_quality"] == 0.85
 
 

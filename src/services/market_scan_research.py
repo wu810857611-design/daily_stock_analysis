@@ -356,11 +356,20 @@ class ScanResearchCollector:
         except Exception as exc:
             errors.append(f"news:{getattr(exc, 'error_class', type(exc).__name__)}")
 
-        if not news["items"] and not code.startswith("HK"):
+        if not has_company_news:
             try:
                 import akshare as ak
                 from src.search_service import SearchResponse, SearchResult, SearchService
-                frame = cached_call(budget, lambda: ak.stock_news_em(symbol=code), f"eastmoney:news:{code}")
+                stock_name = str(candidate.get("name") or "")
+                keyword = code
+                if code.startswith("HK"):
+                    # Search by issuer without listing decorations such as -W.
+                    names = SearchService._company_identity_terms(stock_name)
+                    keyword = names[-1] if names else code[2:]
+                frame = cached_call(
+                    budget, lambda: ak.stock_news_em(symbol=keyword), f"eastmoney:news:{code}",
+                    reserve_for_fallback=False,
+                )
                 response = SearchResponse(code, [SearchResult(
                     title=str(row.get("新闻标题") or ""), snippet=str(row.get("新闻内容") or ""),
                     url=str(row.get("新闻链接") or ""), source=str(row.get("文章来源") or "Eastmoney"),
@@ -370,7 +379,7 @@ class ScanResearchCollector:
                 response = filters._filter_news_response(response, search_days=config.news_max_age_days,
                                                           max_results=10, log_scope=f"{code}:fallback")
                 response = filters._rank_news_response(response, stock_code=code,
-                          stock_name=str(candidate.get("name") or code), prefer_chinese=True,
+                          stock_name=stock_name or code, prefer_chinese=True,
                           max_results=10, log_scope=f"{code}:fallback")
                 response = filters._filter_ranked_news_for_context(response, log_scope=f"{code}:fallback")
                 # Company-specific evidence only; sector matches are not
