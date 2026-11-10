@@ -10,16 +10,19 @@ import pytest
 
 from scripts import market_scan
 from tests.test_market_scan_review_deadline import configure, response
+from tests.test_market_scan_service import ReviewRecorder, _review_response, _service
 
 
 @pytest.fixture
 def loopback_server():
     servers = []
 
-    def start(mode):
+    def start(mode, *, on_request=None):
         class Handler(BaseHTTPRequestHandler):
             def do_POST(self):
                 body = self.rfile.read(int(self.headers['Content-Length']))
+                if on_request is not None:
+                    on_request()
                 if mode == 'headers_pending':
                     time.sleep(3)
                 try:
@@ -98,4 +101,71 @@ def test_real_transport_phases_distinguish_pending_http_and_post_http_sdk(monkey
     assert 'never-log-this' not in json.dumps(reviewer.diagnostics)
     assert 'never-send-offline-secret' not in json.dumps(reviewer.diagnostics)
     assert httpx.Client.send is original_send
+    assert not multiprocessing.active_children()
+
+
+def test_header_timeout_does_not_serialize_the_other_reviewer(monkeypatch, tmp_path, loopback_server):
+    qwen_sent = threading.Event()
+    deepseek_arrival = []
+    qwen_arrival = []
+
+    def qwen_received():
+        qwen_arrival.append(time.monotonic())
+        qwen_sent.set()
+
+    def deepseek_received():
+        assert qwen_sent.wait(1)
+        deepseek_arrival.append(time.monotonic())
+
+    qwen_url = loopback_server('headers_pending', on_request=qwen_received)
+    deepseek_url = loopback_server('ok', on_request=deepseek_received)
+
+    def completion(**kwargs):
+        url = qwen_url if kwargs['model'].startswith('openai/') else deepseek_url
+        candidates = json.loads(kwargs['messages'][1]['content'])['candidates']
+        with httpx.Client(trust_env=False, timeout=kwargs['timeout']) as client:
+            return client.post(url, json=_review_response(candidates)).json()
+
+    configure(monkeypatch, completion, request_timeout=0.8)
+    monkeypatch.setenv('MARKET_SCAN_QWEN_MODEL', 'offline-primary')
+    monkeypatch.setenv('LLM_DASHSCOPE_API_KEY', 'never-send-offline-secret')
+    monkeypatch.setenv('LLM_DASHSCOPE_MODELS', 'offline-primary,offline-fallback')
+    qwen = market_scan.build_litellm_reviewer('qwen')
+    deepseek = market_scan.build_litellm_reviewer('deepseek')
+    result = _service(tmp_path, qwen=qwen, deepseek=deepseek).run()
+
+    assert qwen_arrival[0] <= deepseek_arrival[0] < qwen_arrival[1]
+    assert [r['model_role'] for r in qwen.diagnostics['requests']] == ['primary', 'primary', 'fallback']
+    assert all(r['error_code'] == 'provider_timeout' for r in qwen.diagnostics['requests'])
+    assert qwen.diagnostics['requests'][0]['execution']['last_phase'] == 'http11.receive_response_headers.started'
+    assert deepseek.diagnostics['completed_candidate_count'] == len(result['candidates']) > 0
+    assert result['review_errors'] == {'qwen': 'qwen_review_failed:provider_timeout'}
+    assert result['safe_to_push'] is False
+    assert not any(c['eligible_for_intraday_review'] for c in result['candidates'])
+    assert not multiprocessing.active_children()
+
+
+def test_review_stage_deadline_caps_the_worker_and_prevents_another_attempt(monkeypatch, tmp_path, loopback_server):
+    url = loopback_server('headers_pending')
+
+    def completion(**kwargs):
+        with httpx.Client(trust_env=False, timeout=kwargs['timeout']) as client:
+            return client.post(url, json=response(kwargs)).json()
+
+    configure(monkeypatch, completion, request_timeout=3.0)
+    deepseek = market_scan.build_litellm_reviewer('deepseek')
+    result = _service(tmp_path, qwen=ReviewRecorder(), deepseek=deepseek,
+                      config_overrides={'reviewer_stage_timeout_seconds': 0.8}).run()
+
+    # The child can still be completing bounded process-group cleanup when the
+    # scan hits its deadline. It must not keep the original three-second budget.
+    cleanup_deadline = time.monotonic() + 0.75
+    while deepseek.diagnostics.get('status') == 'running' and time.monotonic() < cleanup_deadline:
+        time.sleep(0.01)
+    assert deepseek.diagnostics['status'] == 'failed'
+    assert deepseek.diagnostics['request_count'] == 1
+    request = deepseek.diagnostics['requests'][0]
+    assert 0 < request['timeout_seconds'] <= 0.8
+    assert request['error_code'] == 'provider_timeout'
+    assert result['safe_to_push'] is False
     assert not multiprocessing.active_children()

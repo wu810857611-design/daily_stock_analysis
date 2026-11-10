@@ -1398,8 +1398,9 @@ class MarketScanService:
             float(self._total_deadline or now), now + float(budget_seconds)
         )
 
-    def _remaining_call_budget(self, requested: float) -> Tuple[float, str]:
-        now = self.monotonic()
+    def _remaining_call_budget(self, requested: float, *, now: Optional[float] = None) -> Tuple[float, str]:
+        if now is None:
+            now = self.monotonic()
         total_remaining = float(self._total_deadline or now) - now
         stage_remaining = float(self._stage_deadline or now) - now
         budget = min(float(requested), total_remaining, stage_remaining)
@@ -1469,20 +1470,39 @@ class MarketScanService:
         provider: str,
         attempt: int = 1,
     ) -> Any:
-        budget, limiting_scope = self._remaining_call_budget(timeout_seconds)
+        collect = self._start_timed_call(
+            lambda _deadline: callback(), timeout_seconds=timeout_seconds,
+            item_or_symbol=item_or_symbol, provider=provider, attempt=attempt,
+        )
+        return collect()
+
+    def _start_timed_call(
+        self,
+        callback: Callable[[float], Any],
+        *,
+        timeout_seconds: float,
+        item_or_symbol: str,
+        provider: str,
+        attempt: int = 1,
+    ) -> Callable[[], Any]:
+        """Start a bounded call and return its result collector for the scan thread."""
         started_monotonic = self.monotonic()
+        budget, limiting_scope = self._remaining_call_budget(timeout_seconds, now=started_monotonic)
+        deadline = started_monotonic + budget
+        stage_name = self._stage_name
         started_at = _iso_datetime(self.clock())
-        outcome: queue.Queue[Tuple[str, Any]] = queue.Queue(maxsize=1)
+        outcome: queue.Queue[Tuple[str, Any, float]] = queue.Queue(maxsize=1)
 
         def invoke() -> None:
             try:
-                outcome.put(("ok", callback()))
+                kind, value = "ok", callback(deadline)
             except BaseException as exc:  # noqa: BLE001 - transported to caller.
-                outcome.put(("error", exc))
+                kind, value = "error", exc
+            outcome.put((kind, value, self.monotonic()))
 
         event = {
             "event": "market_scan_stage",
-            "stage_name": self._stage_name,
+            "stage_name": stage_name,
             "item_or_symbol": item_or_symbol,
             "provider": provider,
             "started_at": started_at,
@@ -1497,47 +1517,51 @@ class MarketScanService:
         print(json.dumps(event, ensure_ascii=False, sort_keys=True), flush=True)
         thread = threading.Thread(
             target=invoke,
-            name=f"market-scan-{self._stage_name}-{provider}"[:80],
+            name=f"market-scan-{stage_name}-{provider}"[:80],
             daemon=True,
         )
         thread.start()
-        thread.join(max(0.001, budget))
-        elapsed = self.monotonic() - started_monotonic
-        if thread.is_alive():
+
+        def collect() -> Any:
+            thread.join(max(0.0, deadline - self.monotonic()))
+            try:
+                kind, value, finished = outcome.get_nowait()
+            except queue.Empty:
+                kind, value, finished = "timeout", None, self.monotonic()
+            elapsed = finished - started_monotonic
+            # The other reviewer may finish before we collect its result.
+            # Judge timeliness by its own completion time.
+            if kind == "timeout" or finished >= deadline:
+                event.update(elapsed=round(elapsed, 3), result="timeout",
+                             error_class="MarketScanDeadlineExceeded")
+                self._last_stage_event = dict(event)
+                failure = f"market_scan_{limiting_scope}_timeout:{stage_name}"
+                if limiting_scope == "total":
+                    self._runtime_failures.append(failure)
+                self._write_runtime_state(status="timeout", error=failure)
+                print(json.dumps(event, ensure_ascii=False, sort_keys=True), flush=True)
+                raise MarketScanDeadlineExceeded(
+                    stage_name=stage_name,
+                    item_or_symbol=item_or_symbol,
+                    provider=provider,
+                    timeout_budget=budget,
+                    scope=limiting_scope,
+                )
             event.update(
                 {
                     "elapsed": round(elapsed, 3),
-                    "result": "timeout",
-                    "error_class": "MarketScanDeadlineExceeded",
+                    "result": "success" if kind == "ok" else "error",
+                    "error_class": "" if kind == "ok" else type(value).__name__,
                 }
             )
             self._last_stage_event = dict(event)
-            failure = f"market_scan_{limiting_scope}_timeout:{self._stage_name}"
-            if limiting_scope == "total":
-                self._runtime_failures.append(failure)
-            self._write_runtime_state(status="timeout", error=failure)
+            self._write_runtime_state(status="running")
             print(json.dumps(event, ensure_ascii=False, sort_keys=True), flush=True)
-            raise MarketScanDeadlineExceeded(
-                stage_name=self._stage_name,
-                item_or_symbol=item_or_symbol,
-                provider=provider,
-                timeout_budget=budget,
-                scope=limiting_scope,
-            )
-        kind, value = outcome.get_nowait()
-        event.update(
-            {
-                "elapsed": round(elapsed, 3),
-                "result": "success" if kind == "ok" else "error",
-                "error_class": "" if kind == "ok" else type(value).__name__,
-            }
-        )
-        self._last_stage_event = dict(event)
-        self._write_runtime_state(status="running")
-        print(json.dumps(event, ensure_ascii=False, sort_keys=True), flush=True)
-        if kind == "error":
-            raise value
-        return value
+            if kind == "error":
+                raise value
+            return value
+
+        return collect
 
     def _wait_before_snapshot_retry(self, attempt: int) -> None:
         """Apply bounded exponential backoff between provider attempts."""
@@ -2384,18 +2408,20 @@ class MarketScanService:
             }
             review_payload.append(payload)
         self._begin_stage("dual_model_review", self.config.reviewer_stage_timeout_seconds)
-        qwen_reviews, qwen_error = self._call_reviewer(
+        collect_qwen = self._start_reviewer(
             "qwen",
             self.qwen_reviewer,
             review_payload,
             ranked,
         )
-        deepseek_reviews, deepseek_error = self._call_reviewer(
+        collect_deepseek = self._start_reviewer(
             "deepseek",
             self.deepseek_reviewer,
             review_payload,
             ranked,
         )
+        qwen_reviews, qwen_error = collect_qwen()
+        deepseek_reviews, deepseek_error = collect_deepseek()
         review_complete = not qwen_error and not deepseek_error
 
         candidates: List[Dict[str, Any]] = []
@@ -2923,28 +2949,53 @@ class MarketScanService:
         )
         return {field: copy.deepcopy(candidate.get(field)) for field in fields}
 
-    def _call_reviewer(
+    def _start_reviewer(
         self,
         label: str,
         reviewer: Optional[Reviewer],
         payload: Sequence[Mapping[str, Any]],
         candidates: Sequence[Mapping[str, Any]],
-    ) -> Tuple[Dict[str, Dict[str, Any]], str]:
+    ) -> Callable[[], Tuple[Dict[str, Dict[str, Any]], str]]:
         if not payload:
-            return {}, ""
+            return lambda: ({}, "")
         if reviewer is None:
-            return {}, f"{label}_reviewer_not_configured"
+            return lambda: ({}, f"{label}_reviewer_not_configured")
+        def invoke(deadline: float) -> Any:
+            inputs = copy.deepcopy(list(payload))
+            if getattr(reviewer, "accepts_timeout_seconds", False) is True:
+                return reviewer(inputs, timeout_seconds=max(0.0, deadline - self.monotonic()))
+            return reviewer(inputs)
+
+        try:
+            collect = self._start_timed_call(
+                invoke,
+                timeout_seconds=self.config.reviewer_timeout_seconds,
+                item_or_symbol=f"{len(payload)}_candidates",
+                provider=f"{label}_reviewer",
+            )
+        except MarketScanDeadlineExceeded as exc:
+            if exc.scope == "total":
+                raise
+
+            def collect(error: MarketScanDeadlineExceeded = exc) -> Any:
+                raise error
+
+        return lambda: self._collect_reviewer(label, reviewer, payload, candidates, collect)
+
+    @staticmethod
+    def _collect_reviewer(
+        label: str,
+        reviewer: Reviewer,
+        payload: Sequence[Mapping[str, Any]],
+        candidates: Sequence[Mapping[str, Any]],
+        collect: Callable[[], Any],
+    ) -> Tuple[Dict[str, Dict[str, Any]], str]:
         market_by_code = {
             str(candidate["code"]): str(candidate["market"])
             for candidate in candidates
         }
         try:
-            raw = self._timed_call(
-                lambda: reviewer(copy.deepcopy(list(payload))),
-                timeout_seconds=self.config.reviewer_timeout_seconds,
-                item_or_symbol=f"{len(payload)}_candidates",
-                provider=f"{label}_reviewer",
-            )
+            raw = collect()
             reviews = _normalise_review_payload(raw, candidates, market_by_code)
         except Exception as exc:  # noqa: BLE001 - model failure becomes a safe watch result.
             if isinstance(exc, MarketScanDeadlineExceeded) and exc.scope == "total":
