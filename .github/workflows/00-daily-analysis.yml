@@ -878,11 +878,11 @@ jobs:
               echo "📌 $priority $label / $market_label: $batch"
 
               close_remaining=$((CLOSE_CUTOFF_EPOCH - $(date +%s)))
-              if [ "$close_remaining" -le 0 ]; then
-                echo "❌ 收盘分析已超过开盘前截止时间"
-                return 1
-              fi
               if [ "$required" = "true" ]; then
+                if [ "$close_remaining" -le 0 ]; then
+                  echo "❌ 收盘分析已超过开盘前截止时间"
+                  return 1
+                fi
                 run_with_report_archive "reports/${priority,,}/$market" \
                   timeout --signal=TERM --kill-after=10s "${close_remaining}s" \
                   python main.py --stocks "$batch" --no-market-review --no-notify \
@@ -890,16 +890,17 @@ jobs:
                   || layer_status=1
               else
                 remaining=$((OPTIONAL_ANALYSIS_DEADLINE - $(date +%s)))
+                if [ "$remaining" -gt "$close_remaining" ]; then
+                  remaining="$close_remaining"
+                fi
                 if [ "$remaining" -le 0 ]; then
                   echo "::warning::$priority $label 因旁路分析时间预算耗尽而跳过；PRIMARY 不受影响"
                   return 0
                 fi
-                if [ "$remaining" -gt "$close_remaining" ]; then
-                  remaining="$close_remaining"
-                fi
+                echo "⏳ $priority $market_label 旁路分析本批最多 ${remaining} 秒"
                 run_with_report_archive "reports/${priority,,}/$market" \
                   timeout --signal=TERM --kill-after=10s "${remaining}s" \
-                  python main.py --stocks "$batch" --no-market-review --no-notify \
+                  env BACKTEST_ENABLED=false python main.py --stocks "$batch" --no-market-review --no-notify \
                     --close-analysis-date "$TRADE_DATE" $FORCE_RUN_ARG \
                   || layer_status=1
               fi
@@ -938,9 +939,8 @@ jobs:
           fi
 
           # P1-P3 只复用分析数据库和公开 symbol；不进入 PRIMARY A/B 记账。
-          # 总预算24分钟，低优先级失败或超时只降级，不污染 PRIMARY coverage。
-          # 除24分钟旁路上限外，再按整个job的timeout预留至少8分钟用于
-          # PRIMARY数据库/旧历史打包与上传，避免可选分析拖垮已完成的P0。
+          # 全库回测已由 P0 执行，旁路时间优先用于个股分析。共享上限30分钟，
+          # 仍按整个 job 的 timeout 预留至少8分钟用于数据库/旧历史打包与上传。
           OPTIONAL_SAFETY_MARGIN_SECONDS=$((8 * 60))
           if ! [[ "$ANALYSIS_TIMEOUT_MINUTES" =~ ^[0-9]+$ ]]; then
             ANALYSIS_TIMEOUT_MINUTES=90
@@ -950,7 +950,7 @@ jobs:
             + ANALYSIS_TIMEOUT_MINUTES * 60
             - OPTIONAL_SAFETY_MARGIN_SECONDS
           ))
-          OPTIONAL_ANALYSIS_DEADLINE=$(( $(date +%s) + 24 * 60 ))
+          OPTIONAL_ANALYSIS_DEADLINE=$(( $(date +%s) + 30 * 60 ))
           if [ "$OPTIONAL_ANALYSIS_DEADLINE" -gt "$JOB_PERSIST_DEADLINE" ]; then
             OPTIONAL_ANALYSIS_DEADLINE="$JOB_PERSIST_DEADLINE"
           fi

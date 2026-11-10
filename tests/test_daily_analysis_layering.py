@@ -154,3 +154,63 @@ class ReportArchiveTests(unittest.TestCase):
         self.assertEqual(text.count('run_with_report_archive "reports/${priority,,}/$market"'), 2)
         self.assertIn("run_with_report_archive reports/market", text)
         self.assertNotIn('cp reports/*.md "reports/${priority,,}/$market/"', text)
+
+    def run_layer(self, required: bool, *, close_seconds: int, job_seconds: int):
+        text = _workflow_text()
+        functions = text[text.index("          run_with_report_archive() {"):
+                         text.index("          # P0 必须先完整分析")]
+        budget = text[text.index("          OPTIONAL_SAFETY_MARGIN_SECONDS="):
+                      text.index('          run_analysis_layer "P1_FAMILY"')]
+        bin_dir = self.root / "bin"
+        bin_dir.mkdir(exist_ok=True)
+        python = bin_dir / "python"
+        python.write_text(
+            '#!/usr/bin/env bash\nprintf "analysis %s %s %s\\n" "$BACKTEST_ENABLED" "$TEST_TIMEOUT" "$3"\n',
+            encoding="utf-8",
+        )
+        python.chmod(0o755)
+        setup = """
+            set -euo pipefail
+            export PATH="$PWD/bin:$PATH" BACKTEST_ENABLED=true
+            python3() { local entry="$1"; shift; "$TEST_PYTHON" "$TEST_REPO/$entry" "$@"; }
+            date() { echo 100000; }
+            timeout() { export TEST_TIMEOUT="$3"; shift 3; "$@"; }
+            TEST_PYTHON="$1"
+            TEST_REPO="$2"
+            CLOSE_CUTOFF_EPOCH=$((100000 + $3))
+            ANALYSIS_TIMEOUT_MINUTES=90
+            JOB_BUDGET_STARTED_EPOCH=$((100000 - 90 * 60 + $4))
+            TRADE_DATE=2026-11-10
+            FORCE_RUN_ARG=
+        """
+        command = 'run_analysis_layer "$5" "观察层" "HK09988" "$6"\n'
+        return subprocess.run(
+            ["bash", "-c", textwrap.dedent(setup) + textwrap.dedent(functions)
+             + textwrap.dedent(budget) + command, "layer-test",
+             sys.executable, str(ROOT), str(close_seconds), str(job_seconds),
+             "P0_PRIMARY" if required else "P2_ACCOUNT_HOLDINGS", str(required).lower()],
+            cwd=self.root, capture_output=True, text=True, timeout=10,
+        )
+
+    def test_only_primary_batch_runs_auto_backtest(self) -> None:
+        primary = self.run_layer(True, close_seconds=3600, job_seconds=5400)
+        optional = self.run_layer(False, close_seconds=3600, job_seconds=5400)
+        self.assertEqual(primary.returncode, 0, primary.stderr)
+        self.assertEqual(optional.returncode, 0, optional.stderr)
+        self.assertIn("analysis true 3600s HK09988", primary.stdout)
+        self.assertIn("analysis false 1800s HK09988", optional.stdout)
+
+    def test_optional_limits_reserve_persistence_and_respect_close_cutoff(self) -> None:
+        for close_seconds, job_seconds, expected in [(3600, 600, 120), (50, 5400, 50)]:
+            with self.subTest(close_seconds=close_seconds, job_seconds=job_seconds):
+                run = self.run_layer(False, close_seconds=close_seconds, job_seconds=job_seconds)
+                self.assertEqual(run.returncode, 0, run.stderr)
+                self.assertIn(f"analysis false {expected}s HK09988", run.stdout)
+
+    def test_expired_optional_cutoff_does_not_fail_completed_primary(self) -> None:
+        primary = self.run_layer(True, close_seconds=0, job_seconds=5400)
+        optional = self.run_layer(False, close_seconds=0, job_seconds=5400)
+        self.assertEqual(primary.returncode, 1)
+        self.assertEqual(optional.returncode, 0, optional.stderr)
+        self.assertIn("PRIMARY 不受影响", optional.stdout)
+        self.assertNotIn("analysis false", optional.stdout)
