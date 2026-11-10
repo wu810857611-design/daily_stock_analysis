@@ -18,6 +18,8 @@
   分层目录只归档该批命令新生成的报告。旁路分析超时或未生成报告时，其目录不会
   借用上一批报告；本批部分输出也只代表部分完成。根目录保留最近一次实际输出，
   不能凭目录存在或根目录文件判定某层、某市场的分析已完成。
+  全库自动回测由 PRIMARY 批次执行。P1–P3 共享最多 30 分钟用于个股分析，
+  同时受开盘前截止时间与 job 预留至少 8 分钟打包上传的约束。
   调度语义参见 [GitHub schedule 官方说明](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#schedule)。
 - `01-intraday-session.yml`：外部 cron-job.org 仍是主要精准触发源，在交易日
   北京时间 09:20 以 `workflow_dispatch` 触发 `session=morning`，12:50 触发
