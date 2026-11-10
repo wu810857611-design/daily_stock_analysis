@@ -568,9 +568,12 @@ def build_litellm_reviewer(label: str) -> Optional[Callable[[Sequence[Mapping[st
         record_isolated_phase("response_validation_completed")
         return payload
 
-    def review(candidates: Sequence[Mapping[str, Any]]) -> Mapping[str, Any]:
+    def review(candidates: Sequence[Mapping[str, Any]], *, timeout_seconds: Optional[float] = None) -> Mapping[str, Any]:
         started = time.monotonic()
-        deadline = started + REVIEW_TOTAL_TIMEOUT_SECONDS
+        budget = REVIEW_TOTAL_TIMEOUT_SECONDS
+        if timeout_seconds is not None:
+            budget = min(budget, timeout_seconds)
+        deadline = started + budget
         diagnostics.clear()
         diagnostics.update({
             "model": settings["model"],
@@ -715,6 +718,7 @@ def build_litellm_reviewer(label: str) -> Optional[Callable[[Sequence[Mapping[st
             diagnostics["elapsed_seconds"] = round(time.monotonic() - started, 3)
 
     review.diagnostics = diagnostics
+    review.accepts_timeout_seconds = True
 
     return review
 
