@@ -3036,3 +3036,119 @@ def test_generic_a_snapshot_uses_larger_but_bounded_provider_budget(
     assert payload["capability_contract"]["usable_for_l1"] is True
     assert any("snapshot_contract_failed" in item for item in payload["provider_errors"])
     assert budgets[-1][1] < 150.0
+
+
+def test_partial_connect_fallback_degrades_and_keeps_a_share_actionable(tmp_path):
+    _service(tmp_path, qwen=None, deepseek=None).run_l1()
+    available, missing = _hk_snapshot(include_non_connect=False)["records"]
+    broken = lambda: (_ for _ in ()).throw(TimeoutError("connect endpoint unavailable"))
+    service = _service(
+        tmp_path, qwen=ReviewRecorder(), deepseek=ReviewRecorder(), hk_loader=broken,
+        hk_all_loader=lambda: {"is_full_hk_universe": True, "records": [available]},
+        config_overrides={"min_net_rr": 0.1},
+    )
+    result = service.run()
+
+    assert result["operational_status"] == "degraded"
+    assert result["market_operational_status"] == {MARKET_A: "healthy", MARKET_HK: "degraded"}
+    assert "hk_connect_snapshot_incomplete" in result["operational_failures"]
+    coverage = result["diagnostics"]["hk_snapshot_coverage"]
+    assert coverage["covered_count"] == 1
+    assert coverage["expected_count"] == 2
+    assert coverage["missing_codes"] == ["HK" + missing["代码"]]
+    assert result["diagnostics"]["buy_funnel"]["actionable_by_market"][MARKET_A] > 0
+    hk, = (candidate for candidate in result["candidates"] if candidate["market"] == MARKET_HK)
+    assert hk["action"] == "watch"
+    assert "覆盖=1/2" in render_market_scan_markdown(result)
+
+    # A later fallback to the saved partial snapshot must keep the coverage gap.
+    cached = _service(tmp_path, qwen=ReviewRecorder(), deepseek=ReviewRecorder(), hk_loader=broken).run()
+    assert cached["diagnostics"]["hk_snapshot_coverage"]["missing_codes"] == ["HK00981"]
+    assert cached["market_operational_status"][MARKET_HK] == "degraded"
+
+
+@pytest.mark.parametrize(
+    "day_offset,amount,expected_status,outcome",
+    [(0, 650_000_000, "healthy", "recovered"),
+     (-1, 650_000_000, "degraded", "no_unique_same_day_bar"),
+     (1, 650_000_000, "degraded", "no_unique_same_day_bar"),
+     (0, float("inf"), "degraded", "invalid_close_fields")],
+)
+def test_hk_close_backfill_requires_dated_usable_bar(tmp_path, day_offset, amount, expected_status, outcome):
+    _service(tmp_path, qwen=None, deepseek=None).run_l1()
+    available = _hk_snapshot(include_non_connect=False)["records"][0]
+    close_time = NOW.replace(hour=19)
+
+    def daily(code, trade_date):
+        assert code == "HK00981"
+        assert trade_date == close_time.date()
+        return pd.DataFrame([{
+            "日期": trade_date + timedelta(days=day_offset), "收盘": 100,
+            "涨跌幅": 3, "成交量": 900_000, "成交额": amount,
+        }])
+
+    service = _service(
+        tmp_path, qwen=ReviewRecorder(), deepseek=ReviewRecorder(),
+        hk_loader=lambda: (_ for _ in ()).throw(TimeoutError("connect endpoint unavailable")),
+        hk_all_loader=lambda: {"is_full_hk_universe": True, "records": [available]},
+        clock=lambda: close_time,
+    )
+    service.hk_close_daily_loader = daily
+    result = service.run()
+    coverage = result["diagnostics"]["hk_snapshot_coverage"]
+    recovery = result["diagnostics"]["hk_close_daily_recovery"]
+    assert result["operational_status"] == expected_status
+    assert recovery["initial_covered_count"] == 1
+    assert recovery["attempts"] == {"HK00981": outcome}
+    assert coverage["covered_count"] == (2 if outcome == "recovered" else 1)
+    cached = json.loads(service.config.hk_cache_path.read_text(encoding="utf-8"))
+    assert [item["code"] for item in cached["records"]] == ["HK00700"]
+    assert result["as_of"][MARKET_HK] == ""
+
+
+def test_hk_daily_provider_is_close_only_and_requests_unadjusted_session(tmp_path, monkeypatch):
+    import akshare as ak
+
+    def fake_hist(**kwargs):
+        assert kwargs == {
+            "symbol": "00981", "period": "daily", "start_date": "20260728",
+            "end_date": "20260728", "adjust": "",
+        }
+        return pd.DataFrame([{
+            "日期": NOW.date(), "收盘": 100, "涨跌幅": 3,
+            "成交量": 900_000, "成交额": 650_000_000,
+        }])
+
+    monkeypatch.setattr(ak, "stock_hk_hist", fake_hist)
+    _service(tmp_path, qwen=None, deepseek=None).run_l1()
+    available = _hk_snapshot(include_non_connect=False)["records"][0]
+    service = _service(
+        tmp_path, qwen=ReviewRecorder(), deepseek=ReviewRecorder(),
+        hk_loader=lambda: (_ for _ in ()).throw(TimeoutError("connect endpoint unavailable")),
+        hk_all_loader=lambda: {"is_full_hk_universe": True, "records": [available]},
+    )
+    service.hk_close_daily_loader = market_scan_service_module.default_hk_close_daily_loader
+    assert service.run_l1().diagnostics["hk_close_daily_recovery"] == {}
+    service.clock = lambda: NOW.replace(hour=19)
+    assert service.run_l1().diagnostics["hk_close_daily_recovery"]["attempts"] == {"HK00981": "recovered"}
+
+
+def test_hk_daily_recovery_respects_budget_and_reaps_hung_request(tmp_path, monkeypatch):
+    import multiprocessing
+
+    monkeypatch.setattr(market_scan_service_module, "HK_CLOSE_DAILY_BUDGET_SECONDS", 0.15)
+    _service(tmp_path, qwen=None, deepseek=None).run_l1()
+    available = _hk_snapshot(include_non_connect=False)["records"][0]
+    service = _service(
+        tmp_path, qwen=ReviewRecorder(), deepseek=ReviewRecorder(),
+        hk_loader=lambda: (_ for _ in ()).throw(TimeoutError("connect endpoint unavailable")),
+        hk_all_loader=lambda: {"is_full_hk_universe": True, "records": [available]},
+        clock=lambda: NOW.replace(hour=19),
+    )
+    service.hk_close_daily_loader = lambda *_: time.sleep(4)
+    started = time.monotonic()
+    result = service.run_l1()
+    assert time.monotonic() - started < 2.0
+    assert result.diagnostics["hk_close_daily_recovery"]["attempts"] == {"HK00981": "TimeoutError"}
+    assert result.diagnostics["hk_snapshot_coverage"]["missing_codes"] == ["HK00981"]
+    assert not multiprocessing.active_children()
