@@ -609,14 +609,20 @@ def test_rejected_index_row_keeps_identity_and_original_fields(configured, monke
 
 
 def test_rejected_pdf_diagnostics_reach_candidate_artifact(configured, monkeypatch):
+    from src.config import get_config
     from src.services.research_evidence import AnnouncementEvidenceError
+
+    config = get_config()
+    config.fundamental_stage_timeout_seconds = 3.0
+    config.fundamental_fetch_timeout_seconds = 1.0
+    monkeypatch.setattr("src.config.get_config", lambda: config)
     evidence = {"document_source": "https://static.cninfo.com.cn/finalpage/fixture.pdf",
                 "document_sha256": "a" * 64, "document_bytes": 123,
                 "extracted_characters": 100, "header_excerpt": "另一家公司的正文"}
     def rejected(*args):
         raise AnnouncementEvidenceError("announcement_document_identity_mismatch", evidence)
     monkeypatch.setattr("src.services.market_scan_research.announcement_excerpt", rejected)
-    result = ScanResearchCollector(2)(CANDIDATE)
+    result = ScanResearchCollector(5)(CANDIDATE)
     item = result["announcements"]["items"][0]
     assert item["body_status"] == "announcement_document_identity_mismatch"
     assert item["body_diagnostics"] == evidence
