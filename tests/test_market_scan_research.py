@@ -684,3 +684,37 @@ def test_conflicting_exact_issuer_is_not_bypassed_by_map_fallback(configured, mo
     assert not result["announcements"]["items"]
     assert "announcements:announcement_issuer_identity_ambiguous" in result["errors"]
     assert not any(e["provider"].startswith("cninfo:issuers:") for e in result["diagnostics"])
+
+
+@pytest.mark.parametrize("code,name,title,snippet,direct", [
+    ("002376", "新北洋", "计算机设备概念盘中走强，板块三季度利润端业绩持续兑现",
+     "相关成分股中，维宏股份（300508）上涨13.78%，新北洋（002376）上涨9.96%", False),
+    ("003006", "百亚股份", "强势股追踪 主力资金连续5日净流入124股",
+     "主力资金净流入个股排名 证券代码 证券简称 003006 百亚股份 39 36.28", False),
+    ("003006", "百亚股份", "强势股追踪 主力资金连续5日净流入128股",
+     "主力资金净流入个股排名 证券代码 证券简称 003006 百亚股份 40 37.98", False),
+    ("003006", "百亚股份", "美容护理行业今日跌1.02%，主力资金净流入6924.78万元",
+     "美容护理行业资金流向排名 003006 百亚股份 0.26 10.08 9861.10", False),
+    ("003006", "百亚股份", "美容护理行业盘中走强，多家公司发布公告",
+     "百亚股份（003006）上涨0.26%，其他公司宣布回购股份", False),
+    ("003006", "百亚股份", "美容护理行业盘中走强，多家公司发布公告",
+     "百亚股份（003006）宣布回购股份，其他公司上涨0.26%", True),
+    ("HK00939", "建设银行", "建设银行将召开临时股东会",
+     "建设银行公告称，公司将召开临时股东会", True),
+    ("HK01810", "小米集团-W", "小米集团-W(01810.HK)回购股份",
+     "小米集团-W公告显示，公司已回购165.5万股", True),
+])
+def test_market_scan_roundup_mentions_do_not_fill_direct_news(
+    configured, monkeypatch, code, name, title, snippet, direct,
+):
+    ak, service = configured
+    service._providers = [Provider("Failed", news_error)]
+    monkeypatch.setattr(ak, "stock_news_em", lambda **kwargs: pd.DataFrame([{
+        "新闻标题": title, "新闻内容": snippet, "新闻链接": "https://finance.eastmoney.com/a/test.html",
+        "文章来源": "测试媒体", "发布时间": datetime.now().isoformat(),
+    }]))
+    result = ScanResearchCollector(2)({"code": code, "name": name})
+    news = result["announcements_and_news"]
+    assert news["fallback_status"] == ("partial" if direct else "no_results")
+    assert ("news" not in result["missing_fields"]) is direct
+    assert bool(news["items"]) is direct

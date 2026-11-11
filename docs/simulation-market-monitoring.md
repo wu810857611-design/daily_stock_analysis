@@ -193,6 +193,9 @@ Linux 子进程中执行；请求设置 connect/read 超时，SDK总耗时由父
 保留原有行业背景和失败诊断。成功但零条有效结果记 `no_results`，与 `provider_error`、
 `NotConfigured`、超时分开。
 
+板块行情和资金榜单仅列出证券代码、简称或交易指标时，归入行业背景。汇总报道
+明确写出目标发行人回购、召开股东会等事项时，仍可计入直接个股新闻。
+
 漏斗新增研究 `attempted/complete/partial/unavailable` 及基本面、新闻、公告索引
 有效覆盖。旧 `research_available_count` 为兼容保留，明确只指“至少有一块非空证据”，
 完整取数要求 PE/PB、有效且非未来的财报日期、收入、归母净利、经营现金流、ROE、
