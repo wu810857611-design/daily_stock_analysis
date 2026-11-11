@@ -2174,6 +2174,15 @@ class SearchService:
         "行业", "板块", "产业链", "龙头", "概念股", "赛道", "sector", "industry",
         "peers", "competitors", "supply chain", "market share",
     )
+    _MARKET_ROUNDUP_TITLE_RE = re.compile(
+        r"强势股追踪|主力资金.{0,18}(?:净流入|净流出).{0,5}\d+\s*只?股"
+        r"|(?:行业|板块|概念|指数).{0,12}(?:盘中|走强|走弱|集体|[涨跌]\s*\d|资金流向|排名|榜单)"
+        r"|(?:个股|资金).{0,10}(?:排名|榜单)"
+    )
+    _ISSUER_EVENT_AFTER_NAME = (
+        r"(?:公告(?:称|显示)|披露|宣布|发布(?:公告|财报|业绩|年报|季报)|"
+        r"回购|增持|减持|召开|举行|签署|获批|中标|收购|被罚|被处罚|分红)"
+    )
     _MACRO_NEWS_TERMS = (
         "大盘", "市场", "指数", "宏观", "央行", "利率", "通胀", "a股", "港股",
         "美股", "纳指", "标普", "market", "index", "fed", "inflation",
@@ -2998,6 +3007,28 @@ class SearchService:
         )
 
     @classmethod
+    def _is_market_roundup_mention(
+        cls, title: str, snippet: str, stock_code: str, stock_name: str,
+    ) -> bool:
+        """A sector or leaderboard mention needs a predicate about this issuer."""
+        if not cls._MARKET_ROUNDUP_TITLE_RE.search(title):
+            return False
+        codes = cls._stock_code_identity_terms(stock_code)
+        subjects = [re.escape(term) + r"(?![镇村县])"
+                    for term in cls._company_identity_terms(stock_name) if cls._contains_chinese_text(term)]
+        subjects.extend(r"(?<![A-Za-z0-9])" + re.escape(term) + r"(?![A-Za-z0-9])" for term in codes)
+        if not subjects:
+            return True
+        event = re.compile(
+            r"(?:" + "|".join(subjects) + r")\s*"
+            r"(?:[（(]\s*[\w.]+\s*[）)])?\s*[:：]?\s*"
+            r"(?:(?:近日|今日|昨日|已|拟|将)\s*)*"
+            + cls._ISSUER_EVENT_AFTER_NAME,
+            re.IGNORECASE,
+        )
+        return not (event.search(title) or event.search(snippet))
+
+    @classmethod
     def _score_news_relevance(
         cls,
         item: SearchResult,
@@ -3148,7 +3179,11 @@ class SearchService:
         has_sector_signal = cls._contains_any_news_term(full_text, cls._SECTOR_NEWS_TERMS)
         has_macro_signal = cls._contains_any_news_term(full_text, cls._MACRO_NEWS_TERMS)
 
-        if direct_signal >= 38:
+        if direct_signal >= 38 and cls._is_market_roundup_mention(title, snippet, stock_code, stock_name):
+            category = cls._SECTOR_NEWS_CATEGORY
+            reasons.insert(0, "板块行情或榜单仅提及标的，无对应公司事件")
+            reasons = reasons[:5]
+        elif direct_signal >= 38:
             category = cls._DIRECT_NEWS_CATEGORY
         elif has_macro_signal and not direct_signal:
             category = cls._MACRO_NEWS_CATEGORY

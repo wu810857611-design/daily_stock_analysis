@@ -367,8 +367,12 @@ def test_history_stage_deadline_ends_batch_and_marks_scan_failed(tmp_path: Path)
 
 
 def test_total_budget_exits_before_external_runner_timeout(tmp_path: Path) -> None:
+    from threading import Event
+
+    release_history = Event()
+
     def hanging_history(code: str, days: int) -> Any:
-        time.sleep(0.3)
+        release_history.wait(timeout=5.0)
         return _history(code, days)
 
     service = _service(
@@ -378,15 +382,18 @@ def test_total_budget_exits_before_external_runner_timeout(tmp_path: Path) -> No
         history_loader=hanging_history,
         config_overrides={
             "enabled_markets": (MARKET_A,),
-            "history_symbol_timeout_seconds": 1.0,
-            "total_timeout_seconds": 0.1,
+            "history_symbol_timeout_seconds": 4.0,
+            "total_timeout_seconds": 1.0,
         },
     )
     started = time.monotonic()
-    with pytest.raises(MarketScanDeadlineExceeded) as exc_info:
-        service.run()
+    try:
+        with pytest.raises(MarketScanDeadlineExceeded) as exc_info:
+            service.run()
+    finally:
+        release_history.set()
     assert exc_info.value.scope == "total"
-    assert time.monotonic() - started < 0.5
+    assert time.monotonic() - started < 3.0
     runtime = json.loads((tmp_path / "runtime.json").read_text(encoding="utf-8"))
     assert runtime["status"] == "timeout"
     assert runtime["last_stage_event"]["item_or_symbol"].endswith("600001")
