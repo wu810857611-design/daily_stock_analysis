@@ -26,7 +26,7 @@ import tempfile
 import threading
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import date, datetime, time as wall_time, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 from zoneinfo import ZoneInfo
@@ -40,9 +40,14 @@ from src.services.position_sizing_policy import (
     opportunity_policy,
 )
 from src.services.market_scan_research import has_announcement_excerpt, meaningful
+from src.services.research_execution import ResearchCallError, run_isolated
 
 
 SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
+HK_CLOSE_DAILY_SOURCE = "akshare.stock_hk_hist"
+HK_CLOSE_DAILY_BUDGET_SECONDS = 30.0
+HK_CLOSE_DAILY_MAX_REQUESTS = 20
+HK_CLOSE_DAILY_REQUEST_SECONDS = 4.0
 SCHEMA_VERSION = 1
 MARKET_A = "A"
 MARKET_HK = "HK_CONNECT"
@@ -563,6 +568,24 @@ def _normalise_snapshot(frame: pd.DataFrame, *, market: str, now: datetime) -> p
     normalised = normalised[normalised["code"].astype(bool)]
     normalised = normalised.drop_duplicates(subset=["code"], keep="first")
     return normalised.reset_index(drop=True)
+
+
+def _hk_snapshot_coverage(frame: pd.DataFrame, membership_codes: set[str]) -> Dict[str, Any]:
+    present = set(frame["code"]) & membership_codes
+    usable = set()
+    if not frame.empty:
+        numeric = frame[["price", "change_pct", "volume", "amount"]]
+        valid = numeric.notna().all(axis=1) & np.isfinite(numeric).all(axis=1)
+        valid &= numeric[["price", "volume", "amount"]].ge(0).all(axis=1)
+        usable = set(frame.loc[valid, "code"]) & membership_codes
+    return {
+        "expected_count": len(membership_codes),
+        "received_count": len(present),
+        "covered_count": len(usable),
+        "missing_codes": sorted(membership_codes - usable),
+        "absent_codes": sorted(membership_codes - present),
+        "invalid_codes": sorted(present - usable),
+    }
 
 
 def _filter_and_rank_l1(
@@ -1361,6 +1384,7 @@ class MarketScanService:
         research_evidence_loader: Optional[ResearchEvidenceLoader] = None,
         hk_all_snapshot_loader: Optional[SnapshotLoader] = None,
         hk_membership_snapshot_loader: Optional[MembershipSnapshotLoader] = None,
+        hk_close_daily_loader: Optional[Callable[[str, date], pd.DataFrame]] = None,
         config: Optional[MarketScanConfig] = None,
         clock: Clock = _now_shanghai,
         sleeper: Sleeper = time.sleep,
@@ -1370,6 +1394,7 @@ class MarketScanService:
         self.hk_connect_snapshot_loader = hk_connect_snapshot_loader
         self.hk_all_snapshot_loader = hk_all_snapshot_loader
         self.hk_membership_snapshot_loader = hk_membership_snapshot_loader
+        self.hk_close_daily_loader = hk_close_daily_loader
         self.history_loader = history_loader
         self.qwen_reviewer = qwen_reviewer
         self.deepseek_reviewer = deepseek_reviewer
@@ -1606,10 +1631,41 @@ class MarketScanService:
                 limit=self.config.top_a_history,
             )
 
+        hk_coverage: Dict[str, Any] = {}
+        hk_daily_recovery: Dict[str, Any] = {}
         if hk_enabled:
             hk_frame, hk_metadata, hk_safe_halt, hk_warning = (
                 self._load_hk_connect_snapshot(now)
             )
+            membership_codes = set(hk_metadata.get("membership_codes") or [])
+            if membership_codes:
+                hk_frame = hk_frame[hk_frame["code"].isin(membership_codes)].copy()
+                hk_coverage = _hk_snapshot_coverage(hk_frame, membership_codes)
+                missing = hk_coverage["missing_codes"]
+                if (
+                    missing and self.hk_close_daily_loader is not None
+                    and now.astimezone(SHANGHAI_TZ).time() >= wall_time(16, 10)
+                ):
+                    recovered, hk_daily_recovery = self._recover_hk_close_daily(
+                        missing, hk_frame, now
+                    )
+                    hk_daily_recovery["initial_covered_count"] = hk_coverage["covered_count"]
+                    if not recovered.empty:
+                        if hk_frame.empty:
+                            hk_frame = recovered
+                            hk_metadata.update(
+                                source=HK_CLOSE_DAILY_SOURCE,
+                                fetched_at=_iso_datetime(self.clock()),
+                            )
+                        else:
+                            hk_frame = pd.concat(
+                                [hk_frame[~hk_frame["code"].isin(recovered["code"])], recovered],
+                                ignore_index=True,
+                            )
+                        hk_coverage = _hk_snapshot_coverage(hk_frame, membership_codes)
+                hk_frame = hk_frame[~hk_frame["code"].isin(hk_coverage["missing_codes"])]
+                hk_safe_halt = hk_frame.empty
+                hk_warning = "港股通成分或有效报价不可用，已停止该市场主动推荐" if hk_safe_halt else ""
         else:
             hk_frame = pd.DataFrame(columns=("code", "name", "market"))
             hk_metadata = {"source": "market_closed", "session_status": "closed"}
@@ -1651,6 +1707,8 @@ class MarketScanService:
                 "hk_quote_requested_count": hk_metadata.get("requested_count"),
                 "hk_quote_fresh_count": hk_metadata.get("fresh_count"),
                 "hk_quote_route_stats": hk_metadata.get("route_stats") or [],
+                "hk_snapshot_coverage": hk_coverage,
+                "hk_close_daily_recovery": hk_daily_recovery,
                 "hk_membership_age_hours": hk_metadata.get("membership_age_hours"),
                 "hk_membership_source": hk_metadata.get("membership_source") or "",
                 "hk_membership_remaining_hours": hk_metadata.get(
@@ -1664,7 +1722,7 @@ class MarketScanService:
                     "membership_warning_threshold_hours"
                 ),
                 "a_full_market_strict": not a_safe_halt,
-                "hk_connect_strict": not hk_safe_halt,
+                "hk_connect_strict": not hk_safe_halt and not hk_coverage.get("missing_codes"),
                 "enabled_markets": list(self.config.enabled_markets),
                 "market_session_status": {
                     MARKET_A: "active" if a_enabled else "closed",
@@ -1723,6 +1781,7 @@ class MarketScanService:
                 }
                 _atomic_write_json(self.config.a_cache_path, cache_payload)
                 metadata["source"] = cache_payload["source"]
+                metadata["membership_codes"] = cache_payload["membership_codes"]
                 metadata["provider_errors"] = cache_payload["provider_errors"]
                 return frame.reset_index(drop=True), metadata, False, ""
             except Exception as exc:  # noqa: BLE001 - bounded retries precede cache fallback.
@@ -1886,6 +1945,7 @@ class MarketScanService:
                     metadata.update(
                         {
                             "source": quote_source,
+                            "membership_codes": cache_payload["membership_codes"],
                             "provider_errors": provider_errors,
                             "membership_age_hours": membership_metadata[
                                 "membership_age_hours"
@@ -1968,6 +2028,7 @@ class MarketScanService:
                     metadata.update(
                         {
                             "source": quote_source,
+                            "membership_codes": cache_payload["membership_codes"],
                             "provider_errors": provider_errors,
                             "membership_age_hours": membership_metadata[
                                 "membership_age_hours"
@@ -2007,6 +2068,9 @@ class MarketScanService:
             metadata["source"] = f"{metadata.get('source') or 'unknown'}:last_good_cache"
             metadata["provider_error"] = provider_errors[-1] if provider_errors else ""
             metadata["provider_errors"] = provider_errors
+            if membership is not None:
+                membership_codes, membership_metadata = membership
+                metadata.update(membership_metadata, membership_codes=sorted(membership_codes))
             return frame, metadata, False, ""
 
         reason = "港股通成分数据不可用或缓存过期，已安全停止本轮主动推送"
@@ -2018,10 +2082,82 @@ class MarketScanService:
                 "source": "unavailable",
                 "provider_error": provider_errors[-1] if provider_errors else "",
                 "provider_errors": provider_errors,
+                **(membership[1] if membership is not None else {}),
+                "membership_codes": sorted(membership[0]) if membership is not None else [],
             },
             True,
             reason,
         )
+
+    def _recover_hk_close_daily(
+        self, missing: Sequence[str], frame: pd.DataFrame, now: datetime
+    ) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+        """Fill missing L1 rows with verified, unadjusted same-day closing bars."""
+        trade_date = now.astimezone(SHANGHAI_TZ).date()
+        diagnostics: Dict[str, Any] = {
+            "source": HK_CLOSE_DAILY_SOURCE,
+            "trade_date": trade_date.isoformat(),
+            "attempts": {},
+            "recovered": {},
+        }
+        loader = self.hk_close_daily_loader
+        assert loader is not None
+        try:
+            budget, _ = self._remaining_call_budget(HK_CLOSE_DAILY_BUDGET_SECONDS)
+        except MarketScanDeadlineExceeded as exc:
+            if exc.scope == "total":
+                raise
+            diagnostics["stop_reason"] = "snapshot_budget_exhausted"
+            return pd.DataFrame(), diagnostics
+        deadline = self.monotonic() + budget
+        names = frame.set_index("code")["name"].to_dict()
+        for code in missing[:HK_CLOSE_DAILY_MAX_REQUESTS]:
+            remaining = deadline - self.monotonic()
+            if remaining <= 0:
+                diagnostics["stop_reason"] = "budget_exhausted"
+                break
+            try:
+                raw = run_isolated(
+                    lambda: loader(code, trade_date),
+                    min(remaining, HK_CLOSE_DAILY_REQUEST_SECONDS),
+                )
+            except ResearchCallError as exc:
+                diagnostics["attempts"][code] = exc.error_class
+                if exc.error_class in {"IsolationUnsupported", "WorkerCleanupFailed", "Push2RateLimitError"}:
+                    diagnostics["stop_reason"] = exc.error_class
+                    break
+                continue
+            if not isinstance(raw, pd.DataFrame) or "日期" not in raw:
+                diagnostics["attempts"][code] = "no_same_day_bar"
+                continue
+            day = raw.loc[raw["日期"].astype(str).eq(trade_date.isoformat())]
+            if len(day) != 1:
+                diagnostics["attempts"][code] = "no_unique_same_day_bar"
+                continue
+            row = day.iloc[0]
+            price = _finite_float(row.get("收盘"))
+            change = _finite_float(row.get("涨跌幅"))
+            volume = _finite_float(row.get("成交量"))
+            amount = _finite_float(row.get("成交额"))
+            if (
+                price is None or price <= 0 or change is None
+                or volume is None or volume < 0 or amount is None or amount < 0
+            ):
+                diagnostics["attempts"][code] = "invalid_close_fields"
+                continue
+            diagnostics["attempts"][code] = "recovered"
+            diagnostics["recovered"][code] = {
+                "code": code, "name": names.get(code) or code, "price": price,
+                "change_pct": change, "volume": volume, "amount": amount,
+                "turnover_rate": _finite_float(row.get("换手率")), "is_connect": True,
+            }
+        diagnostics.setdefault(
+            "stop_reason", "request_limit" if len(missing) > HK_CLOSE_DAILY_MAX_REQUESTS else "completed"
+        )
+        recovered = _normalise_snapshot(
+            pd.DataFrame(diagnostics["recovered"].values()), market=MARKET_HK, now=now,
+        )
+        return recovered, diagnostics
 
     def _write_hk_membership_cache(self, snapshot: Mapping[str, Any]) -> None:
         """Persist constituent membership separately from volatile quote data."""
@@ -2177,6 +2313,13 @@ class MarketScanService:
             "cache_age_hours": age_hours,
             trust_field: True,
         }
+        if market == MARKET_HK:
+            raw_codes = payload.get("membership_codes")
+            metadata["membership_codes"] = sorted(
+                {_normalise_symbol(code, MARKET_HK) for code in raw_codes} - {""}
+                if isinstance(raw_codes, list)
+                else set(frame["code"])
+            )
         if membership_fetched_at is not None:
             membership_age_hours = (
                 now_utc - membership_fetched_at
@@ -2438,9 +2581,12 @@ class MarketScanService:
         conditional_consensus_count = 0
         actionable_count = 0
         actionable_by_market = {MARKET_A: 0, MARKET_HK: 0}
+        hk_coverage_incomplete = bool(
+            l1.diagnostics["hk_snapshot_coverage"].get("missing_codes")
+        ) and not l1.hk_safe_halt
         market_snapshot_complete = {
             MARKET_A: not l1.a_safe_halt,
-            MARKET_HK: not l1.hk_safe_halt,
+            MARKET_HK: not (l1.hk_safe_halt or hk_coverage_incomplete),
         }
 
         def count_candidate_rejection(reason: str, market: str) -> None:
@@ -2718,6 +2864,8 @@ class MarketScanService:
             MARKET_HK: (
                 ["港股通成分或报价快照不可用，已阻止港股通主动推荐"]
                 if l1.hk_safe_halt
+                else ["港股通成分报价覆盖不完整，本轮仅作观察"]
+                if hk_coverage_incomplete
                 else []
             ),
         }
@@ -2750,6 +2898,8 @@ class MarketScanService:
             operational_failures.append("a_share_full_market_snapshot_unavailable")
         if l1.hk_safe_halt:
             operational_failures.append("hk_connect_snapshot_unavailable")
+        elif hk_coverage_incomplete:
+            operational_failures.append("hk_connect_snapshot_incomplete")
         if ranked and not review_complete:
             operational_failures.append("dual_model_review_incomplete")
         membership_warning_level = str(
@@ -2782,7 +2932,7 @@ class MarketScanService:
             operational_status = "failed"
         elif ranked and not review_complete:
             operational_status = "failed"
-        elif any_active_market_blocked:
+        elif any_active_market_blocked or hk_coverage_incomplete:
             operational_status = "degraded"
         else:
             operational_status = "healthy"
@@ -2876,6 +3026,8 @@ class MarketScanService:
                     if MARKET_HK not in enabled_markets
                     else "blocked"
                     if l1.hk_safe_halt
+                    else "degraded"
+                    if hk_coverage_incomplete
                     else "healthy"
                 ),
             },
@@ -3304,6 +3456,21 @@ def default_history_loader(stock_code: str, lookback_days: int) -> Any:
     return load_history_df(stock_code, days=lookback_days)
 
 
+def default_hk_close_daily_loader(stock_code: str, trade_date: date) -> pd.DataFrame:
+    import akshare as ak
+    from requests.exceptions import HTTPError
+
+    day = trade_date.strftime("%Y%m%d")
+    try:
+        return ak.stock_hk_hist(
+            symbol=stock_code[2:], period="daily", start_date=day, end_date=day, adjust="",
+        )
+    except HTTPError as exc:
+        if exc.response is not None and exc.response.status_code in {403, 429}:
+            raise ResearchCallError("Push2RateLimitError") from exc
+        raise
+
+
 def render_market_scan_markdown(result: Mapping[str, Any]) -> str:
     """Render a concise, mobile-friendly scanner report."""
 
@@ -3320,8 +3487,15 @@ def render_market_scan_markdown(result: Mapping[str, Any]) -> str:
                 "a_full_market_strict" if is_a_share else "hk_connect_strict"
             )
         )
-        if not strict:
-            return "不可用（该市场已安全阻断）"
+        coverage = diagnostics.get("hk_snapshot_coverage") or {}
+        coverage_summary = ""
+        if not is_a_share and coverage.get("expected_count"):
+            coverage_summary = (
+                f"；覆盖={coverage['covered_count']}/{coverage['expected_count']}"
+                f"；缺失={len(coverage['missing_codes'])}只（代码见JSON归档）"
+            )
+        if not strict and market_status != "degraded":
+            return f"不可用（该市场已安全阻断）{coverage_summary}"
         source = diagnostics.get(
             "a_snapshot_source" if is_a_share else "hk_snapshot_source"
         ) or "未知来源"
@@ -3329,9 +3503,10 @@ def render_market_scan_markdown(result: Mapping[str, Any]) -> str:
             "a_snapshot_fetched_at" if is_a_share else "hk_snapshot_fetched_at"
         ) or "未知"
         provider_time = as_of.get(market) or "提供方未返回"
+        label = "部分快照，仅作观察" if market_status == "degraded" else "研究快照可用"
         return (
-            f"研究快照可用；报价来源={source}；本轮抓取={fetched_at}；"
-            f"提供方时间={provider_time}"
+            f"{label}；报价来源={source}；本轮抓取={fetched_at}；"
+            f"提供方时间={provider_time}{coverage_summary}"
         )
 
     hk_membership_source = diagnostics.get("hk_membership_source") or "未单独提供"
