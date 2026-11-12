@@ -2,6 +2,7 @@ import multiprocessing
 import time
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import pytest
@@ -254,12 +255,21 @@ def test_hk_scanner_does_not_invent_profit_from_quarterly_revenue_and_ttm_margin
 
 def test_stale_valuation_advances_to_baidu_and_rejects_future_records(configured, monkeypatch):
     ak, _ = configured
+    instant = datetime(2026, 11, 13, 0, 30, tzinfo=ZoneInfo("Asia/Shanghai"))
+
+    class FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return instant.astimezone(tz) if tz is not None else instant.replace(tzinfo=None)
+
+    monkeypatch.setattr("src.services.market_scan_research.datetime", FixedDateTime)
+    trade_date = instant.date()
     monkeypatch.setattr(ak, "stock_value_em", lambda **kwargs: pd.DataFrame([
-        {"数据日期": (datetime.now() - timedelta(days=10)).date(), "PE(TTM)": 50, "市净率": 8},
-        {"数据日期": (datetime.now() + timedelta(days=1)).date(), "PE(TTM)": 60, "市净率": 9},
+        {"数据日期": trade_date - timedelta(days=10), "PE(TTM)": 50, "市净率": 8},
+        {"数据日期": trade_date + timedelta(days=1), "PE(TTM)": 60, "市净率": 9},
     ]))
     monkeypatch.setattr(ak, "stock_zh_valuation_baidu", lambda **kwargs: pd.DataFrame([
-        {"date": datetime.now().date(), "value": 12 if kwargs["indicator"] == "市盈率(TTM)" else 2}
+        {"date": trade_date, "value": 12 if kwargs["indicator"] == "市盈率(TTM)" else 2}
     ]))
     collector = ScanResearchCollector(2)
     result = collector({"code": "603259", "name": "药明康德"})
@@ -709,6 +719,12 @@ def test_conflicting_exact_issuer_is_not_bypassed_by_map_fallback(configured, mo
      "建设银行公告称，公司将召开临时股东会", True),
     ("HK01810", "小米集团-W", "小米集团-W(01810.HK)回购股份",
      "小米集团-W公告显示，公司已回购165.5万股", True),
+    ("HK09999", "网易", "“蔚小理”、百度、网易、美团、阿里、京东，集体下跌",
+     "热门股中，蔚来、小鹏集团、理想汽车齐跌；百度集团、网易、哔哩哔哩、美团、京东集团等集体下跌。", False),
+    ("HK09999", "网易", "港股收评：恒指、恒科集体收跌；网易、腾讯集体飘绿",
+     "热门个股方面，智谱、中芯国际联想集体上涨；比亚迪股份、美团、网易、理想汽车、腾讯、小米集体飘绿。", False),
+    ("HK09999", "网易", "港股收评：恒指收跌；网易发布财报",
+     "网易（09999.HK）披露三季报，腾讯下跌。", True),
 ])
 def test_market_scan_roundup_mentions_do_not_fill_direct_news(
     configured, monkeypatch, code, name, title, snippet, direct,
