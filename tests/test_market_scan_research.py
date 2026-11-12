@@ -2,6 +2,7 @@ import multiprocessing
 import time
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import pytest
@@ -254,12 +255,21 @@ def test_hk_scanner_does_not_invent_profit_from_quarterly_revenue_and_ttm_margin
 
 def test_stale_valuation_advances_to_baidu_and_rejects_future_records(configured, monkeypatch):
     ak, _ = configured
+    instant = datetime(2026, 11, 13, 0, 30, tzinfo=ZoneInfo("Asia/Shanghai"))
+
+    class FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return instant.astimezone(tz) if tz is not None else instant.replace(tzinfo=None)
+
+    monkeypatch.setattr("src.services.market_scan_research.datetime", FixedDateTime)
+    trade_date = instant.date()
     monkeypatch.setattr(ak, "stock_value_em", lambda **kwargs: pd.DataFrame([
-        {"数据日期": (datetime.now() - timedelta(days=10)).date(), "PE(TTM)": 50, "市净率": 8},
-        {"数据日期": (datetime.now() + timedelta(days=1)).date(), "PE(TTM)": 60, "市净率": 9},
+        {"数据日期": trade_date - timedelta(days=10), "PE(TTM)": 50, "市净率": 8},
+        {"数据日期": trade_date + timedelta(days=1), "PE(TTM)": 60, "市净率": 9},
     ]))
     monkeypatch.setattr(ak, "stock_zh_valuation_baidu", lambda **kwargs: pd.DataFrame([
-        {"date": datetime.now().date(), "value": 12 if kwargs["indicator"] == "市盈率(TTM)" else 2}
+        {"date": trade_date, "value": 12 if kwargs["indicator"] == "市盈率(TTM)" else 2}
     ]))
     collector = ScanResearchCollector(2)
     result = collector({"code": "603259", "name": "药明康德"})
