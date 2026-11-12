@@ -709,6 +709,12 @@ def test_conflicting_exact_issuer_is_not_bypassed_by_map_fallback(configured, mo
      "建设银行公告称，公司将召开临时股东会", True),
     ("HK01810", "小米集团-W", "小米集团-W(01810.HK)回购股份",
      "小米集团-W公告显示，公司已回购165.5万股", True),
+    ("HK09999", "网易", "“蔚小理”、百度、网易、美团、阿里、京东，集体下跌",
+     "热门股中，蔚来、小鹏集团、理想汽车齐跌；百度集团、网易、哔哩哔哩、美团、京东集团等集体下跌。", False),
+    ("HK09999", "网易", "港股收评：恒指、恒科集体收跌；网易、腾讯集体飘绿",
+     "热门个股方面，智谱、中芯国际联想集体上涨；比亚迪股份、美团、网易、理想汽车、腾讯、小米集体飘绿。", False),
+    ("HK09999", "网易", "港股收评：恒指收跌；网易发布财报",
+     "网易（09999.HK）披露三季报，腾讯下跌。", True),
 ])
 def test_market_scan_roundup_mentions_do_not_fill_direct_news(
     configured, monkeypatch, code, name, title, snippet, direct,
