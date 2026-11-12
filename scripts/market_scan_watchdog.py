@@ -19,8 +19,12 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from scripts.market_scan_artifact_trust import (  # noqa: E402
+    HK_COVERAGE_DEGRADED,
     atomic_write as _trusted_atomic_write,
+    completed_scan_source,
     read_market_scan_latest_from_artifact as _trusted_read_latest,
+    scan_state_artifacts,
+    validate_coverage_degraded_scan,
     validate_watchdog_market_scan as _trusted_validate_watchdog,
 )
 from scripts.market_scan_calendar import evaluate_market_sessions  # noqa: E402
@@ -196,6 +200,16 @@ class GitHubActionsClient:
             raise RuntimeError(f"GitHub artifact download returned {status_code}")
         return body
 
+    def jobs_for_run_attempt(self, run_id: int, attempt: int) -> list[Mapping[str, Any]]:
+        url = (
+            f"https://api.github.com/repos/{self.repo}/actions/runs/"
+            f"{run_id}/attempts/{attempt}/jobs?per_page=100"
+        )
+        status, body = self._call("GET", url)
+        if status != 200:
+            raise RuntimeError(f"GitHub run jobs query returned {status}")
+        return list(json.loads(body.decode("utf-8"))["jobs"])
+
 
 def _read_market_scan_latest_from_artifact(archive_bytes: bytes) -> bytes:
     return _trusted_read_latest(archive_bytes)
@@ -215,7 +229,7 @@ def _atomic_write(path: Path, content: bytes) -> None:
     _trusted_atomic_write(path, content)
 
 
-def _sync_successful_slot_artifact(
+def _sync_slot_artifact(
     *,
     client: GitHubActionsClient,
     workflow: str,
@@ -240,26 +254,10 @@ def _sync_successful_slot_artifact(
                 slot=slot,
                 session_date=observed_at.date(),
             )
-            successful_runs = [
-                run
-                for run in runs
-                if str(run.get("status") or "") == "completed"
-                and str(run.get("conclusion") or "") == "success"
-            ]
-            for successful in successful_runs:
-                run_id = int(successful.get("id") or 0)
+            for run in filter(completed_scan_source, runs):
+                run_id = int(run.get("id") or 0)
                 try:
-                    artifacts = client.artifacts_for_run(run_id)
-                    state_artifacts = [
-                        item
-                        for item in sorted(
-                            artifacts,
-                            key=lambda value: str(value.get("created_at") or ""),
-                            reverse=True,
-                        )
-                        if item.get("name") == "market-scan-state"
-                        and not item.get("expired")
-                    ]
+                    state_artifacts, attempt_window = scan_state_artifacts(client, run, ref=ref)
                     if not state_artifacts:
                         last_state = {
                             "status": "artifact_not_ready",
@@ -275,7 +273,7 @@ def _sync_successful_slot_artifact(
                                 raw_archive
                             )
                             (
-                                _payload,
+                                payload,
                                 generated_at,
                                 fingerprint,
                             ) = _validate_synced_market_scan(
@@ -283,6 +281,10 @@ def _sync_successful_slot_artifact(
                                 slot=slot,
                                 observed_at=observed_at,
                             )
+                            if attempt_window is not None:
+                                validate_coverage_degraded_scan(
+                                    payload, generated_at=generated_at, attempt_window=attempt_window,
+                                )
                         except Exception as exc:  # noqa: BLE001
                             last_state = {
                                 "status": "artifact_not_ready",
@@ -296,7 +298,8 @@ def _sync_successful_slot_artifact(
                             continue
                         _atomic_write(target_path, raw_latest)
                         return {
-                            "status": "synced",
+                            "status": "synced_degraded" if attempt_window is not None else "synced",
+                            **({"reason": HK_COVERAGE_DEGRADED} if attempt_window is not None else {}),
                             "attempts": attempt,
                             "run_id": run_id,
                             "artifact_id": artifact_id,
@@ -467,7 +470,7 @@ def run_watchdog(
             "active_markets": list(calendar.get("active_markets") or []),
         }
     if sync_latest_path is not None:
-        result["sync"] = _sync_successful_slot_artifact(
+        result["sync"] = _sync_slot_artifact(
             client=client,
             workflow=workflow,
             ref=ref,
@@ -478,6 +481,8 @@ def run_watchdog(
             timeout_seconds=sync_timeout_seconds,
             poll_seconds=sync_poll_seconds,
         )
+        if result["status"] == "already_failed" and result["sync"]["status"] == "synced_degraded":
+            result["status"] = "already_degraded"
     return result
 
 
@@ -543,7 +548,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     return (
         1
         if isinstance(sync, Mapping)
-        and sync.get("status") not in {"synced", "in_progress"}
+        and sync.get("status") not in {"synced", "synced_degraded", "in_progress"}
         else 0
     )
 

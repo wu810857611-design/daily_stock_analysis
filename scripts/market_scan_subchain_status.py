@@ -20,6 +20,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from scripts.pushplus_notify import send_markdown  # noqa: E402
+from scripts.market_scan_artifact_trust import HK_COVERAGE_DEGRADED  # noqa: E402
 
 
 SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
@@ -63,6 +64,8 @@ def classify_watchdog(
     sync = payload.get("sync")
     sync_status = str(sync.get("status") or "") if isinstance(sync, Mapping) else ""
     error = _safe_error(sync.get("error")) if isinstance(sync, Mapping) else ""
+    if exit_code == 0 and sync_status == "synced_degraded":
+        return "degraded", HK_COVERAGE_DEGRADED, True
     if exit_code == 0 and (not sync_status or sync_status == "synced"):
         return "healthy", "", False
     if sync_status == "in_progress":
@@ -195,6 +198,8 @@ def reconcile_subchain_status(
         "impact": (
             "none"
             if status == "healthy"
+            else "hk_connect_candidates_observation_only"
+            if reason == HK_COVERAGE_DEGRADED
             else "new_buy_candidate_hot_reload_pending"
             if status == "pending"
             else "new_buy_candidate_hot_reload_unavailable"
