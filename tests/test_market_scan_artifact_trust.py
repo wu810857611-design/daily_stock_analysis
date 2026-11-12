@@ -19,6 +19,9 @@ from scripts.market_scan_artifact_trust import (
     validate_watchdog_market_scan,
 )
 from scripts.market_scan_startup_restore import restore_latest_trusted_market_scan
+from scripts.market_scan_watchdog import run_watchdog
+from scripts.market_scan_subchain_status import classify_watchdog
+from scripts.intraday_session import read_candidate_plan_snapshot
 
 
 def _payload(*, generated_at: str, slot: str) -> dict[str, Any]:
@@ -215,3 +218,101 @@ def test_previous_day_afternoon_is_allowed_only_for_morning_startup() -> None:
             session="afternoon",
             observed_at=datetime(2026, 9, 29, 12, 50, tzinfo=SHANGHAI_TZ),
         )
+
+
+class CoverageDegradedClient(FakeClient):
+    def __init__(self):
+        payload = _payload(generated_at="2026-09-29T10:43:00+08:00", slot="morning")
+        payload["scheduler"]["trigger_source"] = "watchdog"
+        payload.update(
+            operational_status="degraded", safe_to_push=True, review_complete=True,
+            operational_failures=["hk_connect_snapshot_incomplete"],
+            market_operational_status={"A": "healthy", "HK_CONNECT": "degraded"},
+            diagnostics={"hk_snapshot_coverage": {
+                "expected_count": 2, "covered_count": 1, "missing_codes": ["HK00010"],
+            }},
+            candidates=[
+                {"market": "A", "code": "600802", "action": "conditional_buy",
+                 "eligible_for_intraday_review": True, "review_complete": True, "research_status": "actionable"},
+                {"market": "HK_CONNECT", "code": "HK09999", "action": "watch", "eligible_for_intraday_review": False},
+            ],
+        )
+        super().__init__(conclusion="failure", payload=payload)
+        self.steps = [
+            {"name": "执行分层选股（不连接券商）", "conclusion": "success"},
+            {"name": "上传固定名状态供其他模拟工作流恢复", "conclusion": "success"},
+            {"name": "严格确认买入链路健康", "conclusion": "failure"},
+        ]
+        self.artifact_created_at = "2026-09-29T02:49:33Z"
+
+    def recent_runs(self, workflow, ref):
+        runs = super().recent_runs(workflow, ref)
+        runs[0]["run_attempt"] = 2
+        return runs
+
+    def jobs_for_run_attempt(self, run_id, attempt):
+        assert (run_id, attempt) == (175, 2)
+        return [{"name": "scan", "status": "completed", "conclusion": "failure",
+                 "started_at": "2026-09-29T02:42:06Z", "completed_at": "2026-09-29T02:50:00Z",
+                 "steps": self.steps}]
+
+    def artifacts_for_run(self, run_id):
+        items = super().artifacts_for_run(run_id)
+        items[0]["created_at"] = self.artifact_created_at
+        return items
+
+
+@pytest.mark.parametrize("defect", [
+    None, "hk_buy", "market_mismatch", "review_incomplete", "other_failure",
+    "failed_archive_step", "previous_attempt_artifact", "inconsistent_coverage", "other_trigger",
+])
+def test_coverage_degraded_scan_requires_proven_artifact_and_market_isolation(tmp_path, defect):
+    client = CoverageDegradedClient()
+    if defect == "hk_buy":
+        client.payload["candidates"][1].update(action="conditional_buy", eligible_for_intraday_review=True)
+    elif defect == "market_mismatch":
+        client.payload["candidates"][1]["market"] = "A"
+    elif defect == "review_incomplete":
+        client.payload["review_complete"] = False
+    elif defect == "other_failure":
+        client.payload["operational_failures"].append("a_snapshot_unavailable")
+    elif defect == "failed_archive_step":
+        client.steps[1]["conclusion"] = "failure"
+    elif defect == "previous_attempt_artifact":
+        client.artifact_created_at = "2026-09-29T02:41:59Z"
+    elif defect == "inconsistent_coverage":
+        client.payload["diagnostics"]["hk_snapshot_coverage"]["missing_codes"] = []
+    elif defect == "other_trigger":
+        client.payload["scheduler"]["trigger_source"] = "manual"
+
+    target = tmp_path / "latest.json"
+    sync = run_watchdog(
+        slot="morning", now_fn=lambda: datetime(2026, 9, 29, 10, 55, tzinfo=SHANGHAI_TZ),
+        sleep_fn=lambda _: None, client=client, workflow="02-market-scan.yml", ref="main",
+        session_gate=lambda _: {"should_run": True}, sync_latest_path=target,
+        sync_timeout_seconds=0, observe_only=True,
+    )
+    if defect is None:
+        assert sync["status"] == "already_degraded"
+        assert sync["sync"]["status"] == "synced_degraded"
+        assert classify_watchdog(sync, exit_code=0) == ("degraded", "hk_connect_snapshot_incomplete", True)
+        assert json.loads(target.read_text()) == client.payload
+        plan = read_candidate_plan_snapshot(
+            target, now=datetime(2026, 9, 29, 10, 55, tzinfo=SHANGHAI_TZ),
+        )
+        assert [item["code"] for item in plan.plans] == ["600802"]
+    else:
+        assert sync["sync"]["status"] == "failed"
+        assert not target.exists()
+
+    restored = restore_latest_trusted_market_scan(
+        client=client, workflow="02-market-scan.yml", ref="main", session="afternoon",
+        observed_at=datetime(2026, 9, 29, 12, 50, tzinfo=SHANGHAI_TZ), target_path=target,
+    )
+    assert restored["trusted"] is (defect is None)
+    if defect is None:
+        assert restored["reason"] == "completed_degraded_artifact_validated"
+        assert restored["operational_status"] == "degraded"
+        assert json.loads(target.read_text()) == client.payload
+    else:
+        assert not target.exists()

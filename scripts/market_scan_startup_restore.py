@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Restore only a proven-success market-scan artifact for intraday startup."""
+"""Restore a market-scan artifact with proven intraday handoff eligibility."""
 
 from __future__ import annotations
 
@@ -18,7 +18,10 @@ if str(PROJECT_ROOT) not in sys.path:
 from scripts.market_scan_artifact_trust import (  # noqa: E402
     SHANGHAI_TZ,
     atomic_write,
+    completed_scan_source,
     read_market_scan_latest_from_artifact,
+    scan_state_artifacts,
+    validate_coverage_degraded_scan,
     validate_startup_market_scan,
 )
 from scripts.market_scan_watchdog import GitHubActionsClient  # noqa: E402
@@ -37,7 +40,7 @@ def restore_latest_trusted_market_scan(
     observed_at: datetime,
     target_path: Path,
 ) -> dict[str, Any]:
-    """Restore newest valid payload produced by a completed successful scan."""
+    """Restore the newest valid completed scan for this session."""
 
     rejected: list[dict[str, Any]] = []
     try:
@@ -56,23 +59,22 @@ def restore_latest_trusted_market_scan(
             "rejected": [],
         }
 
-    successful = [
+    completed = [
         run
         for run in sorted(runs, key=_run_created_at, reverse=True)
-        if str(run.get("status") or "") == "completed"
-        and str(run.get("conclusion") or "") == "success"
+        if completed_scan_source(run)
         and (
             not str(run.get("head_branch") or "")
             or str(run.get("head_branch") or "") == ref
         )
     ]
 
-    for run in successful:
+    for run in completed:
         run_id = int(run.get("id") or 0)
         if run_id <= 0:
             continue
         try:
-            artifacts = list(client.artifacts_for_run(run_id))
+            state_artifacts, attempt_window = scan_state_artifacts(client, run, ref=ref)
         except Exception as exc:  # noqa: BLE001
             rejected.append({
                 "run_id": run_id,
@@ -80,16 +82,6 @@ def restore_latest_trusted_market_scan(
             })
             continue
 
-        state_artifacts = [
-            item
-            for item in sorted(
-                artifacts,
-                key=lambda value: str(value.get("created_at") or ""),
-                reverse=True,
-            )
-            if item.get("name") == "market-scan-state"
-            and not item.get("expired")
-        ]
         if not state_artifacts:
             rejected.append({"run_id": run_id, "reason": "market_scan_state_missing"})
             continue
@@ -99,11 +91,13 @@ def restore_latest_trusted_market_scan(
             try:
                 archive = client.download_artifact(artifact_id)
                 raw_latest = read_market_scan_latest_from_artifact(archive)
-                _payload, generated_at, fingerprint = validate_startup_market_scan(
+                payload, generated_at, fingerprint = validate_startup_market_scan(
                     raw_latest,
                     session=session,
                     observed_at=observed_at,
                 )
+                if attempt_window is not None:
+                    validate_coverage_degraded_scan(payload, generated_at=generated_at, attempt_window=attempt_window)
             except Exception as exc:  # noqa: BLE001
                 rejected.append({
                     "run_id": run_id,
@@ -117,7 +111,11 @@ def restore_latest_trusted_market_scan(
                 "schema_version": 1,
                 "status": "trusted",
                 "trusted": True,
-                "reason": "completed_success_artifact_validated",
+                "reason": (
+                    "completed_degraded_artifact_validated" if attempt_window is not None
+                    else "completed_success_artifact_validated"
+                ),
+                **({"operational_status": "degraded"} if attempt_window is not None else {}),
                 "session": session,
                 "observed_at": observed_at.astimezone(SHANGHAI_TZ).isoformat(timespec="seconds"),
                 "run_id": run_id,
@@ -130,7 +128,7 @@ def restore_latest_trusted_market_scan(
             }
 
     # A cache file has no trustworthy run-conclusion provenance on its own.
-    # Remove it unless this invocation re-proves it through a successful run.
+    # Remove it unless this invocation validates its completed run and artifact.
     target_path.unlink(missing_ok=True)
     return {
         "schema_version": 1,
