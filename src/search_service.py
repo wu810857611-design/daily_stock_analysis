@@ -2177,13 +2177,18 @@ class SearchService:
     _MARKET_ROUNDUP_TITLE_RE = re.compile(
         r"强势股追踪|主力资金.{0,18}(?:净流入|净流出).{0,5}\d+\s*只?股"
         r"|(?:行业|板块|概念|指数).{0,12}(?:盘中|走强|走弱|集体|[涨跌]\s*\d|资金流向|排名|榜单)"
+        r"|(?:板块|概念).{0,12}(?:行情向好|震荡[上下]行|持续[上下]行|走势活跃)"
         r"|(?:个股|资金).{0,10}(?:排名|榜单)"
         r"|(?:港股|[Aa]股|美股)\s*收评"
         r"|集体(?:上涨|下跌|收涨|收跌|飘红|飘绿|走强|走弱)"
+        r"|(?:港股|[Aa]股|美股).{0,16}回购潮"
     )
+    _MAINLAND_LISTING_RE = re.compile(r"[AaＡａ]股")
+    _HONG_KONG_LISTING_RE = re.compile(r"[HhＨｈ]股|港股")
+    _QUOTE_MOVE_TITLE_RE = re.compile(r"股价|涨停|跌停|(?:持续|集体)(?:上涨|下跌|走高|走低)")
     _ISSUER_EVENT_AFTER_NAME = (
         r"(?:公告(?:称|显示)|披露|宣布|发布(?:公告|财报|业绩|年报|季报)|"
-        r"回购|增持|减持|召开|举行|签署|获批|中标|收购|被罚|被处罚|分红)"
+        r"回购(?!潮|队伍)|增持|减持|召开|举行|签署|获批|中标|收购|被罚|被处罚|分红)"
     )
     _MACRO_NEWS_TERMS = (
         "大盘", "市场", "指数", "宏观", "央行", "利率", "通胀", "a股", "港股",
@@ -3009,26 +3014,61 @@ class SearchService:
         )
 
     @classmethod
-    def _is_market_roundup_mention(
+    def _direct_news_context_rejection(
         cls, title: str, snippet: str, stock_code: str, stock_name: str,
-    ) -> bool:
-        """A sector or leaderboard mention needs a predicate about this issuer."""
-        if not cls._MARKET_ROUNDUP_TITLE_RE.search(title):
-            return False
+    ) -> str:
+        """Require issuer-specific evidence when a name hit has competing context."""
+        text = f"{title}\n{snippet}"
+        roundup = bool(cls._MARKET_ROUNDUP_TITLE_RE.search(title))
         codes = cls._stock_code_identity_terms(stock_code)
-        subjects = [re.escape(term) + r"(?![镇村县])"
-                    for term in cls._company_identity_terms(stock_name) if cls._contains_chinese_text(term)]
-        subjects.extend(r"(?<![A-Za-z0-9])" + re.escape(term) + r"(?![A-Za-z0-9])" for term in codes)
-        if not subjects:
-            return True
-        event = re.compile(
-            r"(?:" + "|".join(subjects) + r")\s*"
-            r"(?:[（(]\s*[\w.]+\s*[）)])?\s*[:：]?\s*"
-            r"(?:(?:近日|今日|昨日|已|拟|将)\s*)*"
-            + cls._ISSUER_EVENT_AFTER_NAME,
-            re.IGNORECASE,
+        names = cls._company_identity_terms(stock_name)
+        # A legal listed name ending in 股份 can share its shortened name with
+        # a parent group. Require an actual event about the listed issuer.
+        parent_pattern = None
+        if len(names) > 1 and re.search(r"股份(?:有限公司|公司)?$", names[-2]):
+            parent_pattern = re.compile(
+                re.escape(names[-1]) + r"(?:控股)?(?:集团|集團)(?:有限公司|公司)?"
+                r"(?:\s*[（(]\s*[\w.]+\s*[）)])?"
+            )
+        parent_group = parent_pattern is not None and bool(parent_pattern.search(text))
+        other_listing_quote = False
+        if cls._QUOTE_MOVE_TITLE_RE.search(title):
+            canonical = canonicalize_foreign_stock_code(stock_code)
+            is_hk = bool(re.fullmatch(r"\d{5}|HK\d{1,5}", canonical)) or (
+                canonical.isdigit() and stock_code.strip().upper().endswith(".HK")
+            )
+            is_a = bool(re.fullmatch(r"\d{6}(?:\.(?:SH|SS|SZ|BJ))?", canonical))
+            other_listing_quote = (
+                (is_hk and cls._MAINLAND_LISTING_RE.search(title) and not cls._HONG_KONG_LISTING_RE.search(text))
+                or (is_a and cls._HONG_KONG_LISTING_RE.search(title) and not cls._MAINLAND_LISTING_RE.search(text))
+            ) and not any(cls._contains_stock_code_identity_term(text, term) for term in codes)
+        if not (roundup or parent_group or other_listing_quote):
+            return ""
+
+        if parent_group:
+            names = names[:-1]
+            title = parent_pattern.sub(" ", title)
+            snippet = parent_pattern.sub(" ", snippet)
+        subjects = [re.escape(term) + r"(?![镇村县])" for term in names if cls._contains_chinese_text(term)]
+        subjects.extend(
+            r"(?<![A-Za-z0-9])" + re.escape(term) + r"(?![A-Za-z0-9])(?:\s*[）)])?"
+            for term in codes
         )
-        return not (event.search(title) or event.search(snippet))
+        if subjects:
+            event = re.compile(
+                r"(?:" + "|".join(subjects) + r")\s*(?:股份有限公司|有限责任公司|有限公司)?\s*"
+                r"(?:[（(]\s*[\w.]+\s*[）)])?\s*[:：,，]?\s*"
+                r"(?:(?:近日|今日|昨日|年内|今年|已|拟|将)\s*)*"
+                + cls._ISSUER_EVENT_AFTER_NAME,
+                re.IGNORECASE,
+            )
+            if event.search(title) or event.search(snippet):
+                return ""
+        if parent_group:
+            return "同名集团事项缺少上市主体的直接证据"
+        if other_listing_quote:
+            return "价格行情指向另一上市类别"
+        return "板块行情、榜单或市场汇总仅提及标的，无对应公司事件"
 
     @classmethod
     def _score_news_relevance(
@@ -3181,9 +3221,13 @@ class SearchService:
         has_sector_signal = cls._contains_any_news_term(full_text, cls._SECTOR_NEWS_TERMS)
         has_macro_signal = cls._contains_any_news_term(full_text, cls._MACRO_NEWS_TERMS)
 
-        if direct_signal >= 38 and cls._is_market_roundup_mention(title, snippet, stock_code, stock_name):
+        context_rejection = (
+            cls._direct_news_context_rejection(title, snippet, stock_code, stock_name)
+            if direct_signal >= 38 else ""
+        )
+        if context_rejection:
             category = cls._SECTOR_NEWS_CATEGORY
-            reasons.insert(0, "板块行情或榜单仅提及标的，无对应公司事件")
+            reasons.insert(0, context_rejection)
             reasons = reasons[:5]
         elif direct_signal >= 38:
             category = cls._DIRECT_NEWS_CATEGORY
