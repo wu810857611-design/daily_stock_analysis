@@ -624,6 +624,31 @@ def test_a_snapshot_provider_failure_uses_fresh_cache_without_rewriting_asof(
     assert cached_result.diagnostics["a_snapshot_source"].endswith(":last_good_cache")
 
 
+def test_a_snapshot_success_is_used_directly_after_cache_write(tmp_path: Path) -> None:
+    calls = []
+    snapshot = dict(_a_snapshot())
+    snapshot.pop("as_of")
+    snapshot["fetched_at"] = (NOW + timedelta(seconds=20)).isoformat()
+    snapshot["provider_errors"] = ["akshare.stock_zh_a_spot_em:Push2RateLimitError"]
+
+    def load_snapshot() -> Mapping[str, Any]:
+        calls.append(snapshot["source"])
+        return snapshot
+
+    result = _service(
+        tmp_path, qwen=ReviewRecorder(), deepseek=ReviewRecorder(), a_loader=load_snapshot,
+    ).run_l1()
+
+    cached = json.loads((tmp_path / "a_share.json").read_text(encoding="utf-8"))
+    assert calls == [snapshot["source"]]
+    assert result.a_safe_halt is False
+    assert result.diagnostics["a_snapshot_source"] == snapshot["source"]
+    assert result.diagnostics["a_snapshot_provider_errors"] == snapshot["provider_errors"]
+    assert result.diagnostics["a_snapshot_fetched_at"] == cached["fetched_at"] == snapshot["fetched_at"]
+    assert result.as_of[MARKET_A] == cached["as_of"] == ""
+    assert "membership_codes" not in cached
+
+
 def test_default_full_market_loaders_use_independent_fallbacks(monkeypatch: Any) -> None:
     a_calls: list[str] = []
     hk_calls: list[str] = []
