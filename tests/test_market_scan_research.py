@@ -58,7 +58,8 @@ def configured(monkeypatch):
     ))
     monkeypatch.setattr(ak, "stock_financial_abstract", financial)
     monkeypatch.setattr(ak, "stock_financial_analysis_indicator", financial)
-    monkeypatch.setattr(ak, "stock_financial_abstract_ths", lambda **kwargs: pd.DataFrame())
+    # Optional fallback; the adapter also supports releases without this entry point.
+    monkeypatch.setattr(ak, "stock_financial_abstract_ths", lambda **kwargs: pd.DataFrame(), raising=False)
     for name in ("stock_value_em", "stock_zh_valuation_baidu", "stock_hk_valuation_baidu", "stock_news_em"):
         monkeypatch.setattr(ak, name, lambda **kwargs: pd.DataFrame())
     monkeypatch.setattr("src.services.market_scan_research.announcement_excerpt",
