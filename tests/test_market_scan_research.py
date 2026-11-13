@@ -58,7 +58,8 @@ def configured(monkeypatch):
     ))
     monkeypatch.setattr(ak, "stock_financial_abstract", financial)
     monkeypatch.setattr(ak, "stock_financial_analysis_indicator", financial)
-    monkeypatch.setattr(ak, "stock_financial_abstract_ths", lambda **kwargs: pd.DataFrame())
+    # Optional fallback; the adapter also supports releases without this entry point.
+    monkeypatch.setattr(ak, "stock_financial_abstract_ths", lambda **kwargs: pd.DataFrame(), raising=False)
     for name in ("stock_value_em", "stock_zh_valuation_baidu", "stock_hk_valuation_baidu", "stock_news_em"):
         monkeypatch.setattr(ak, name, lambda **kwargs: pd.DataFrame())
     monkeypatch.setattr("src.services.market_scan_research.announcement_excerpt",
@@ -747,8 +748,12 @@ def test_conflicting_exact_issuer_is_not_bypassed_by_map_fallback(configured, mo
      "中国石油（00857.HK）宣布本公司参与合作的具体安排。", True),
     ("HK00300", "美的集团", "午后A股消费龙头股持续上涨 美的集团股价创五年新高",
      "美的集团A股上涨超过3%，格力电器等个股走高。", False),
+    ("HK00300", "美的集团", "港股科技股领涨，美的集团A股股价创五年新高",
+     "美的集团A股股价上涨，港股科技指数同步走高。", False),
     ("000333", "美的集团", "午后A股消费龙头股持续上涨 美的集团股价创五年新高",
      "美的集团A股（000333.SZ）股价创五年新高。", True),
+    ("600519", "贵州茅台", "港股市场回落，贵州茅台股价逆势上涨",
+     "贵州茅台成交活跃。", True),
     ("HK00300", "美的集团", "A股家电龙头上涨，美的集团披露回购方案",
      "美的集团股份有限公司（00300.HK）披露回购方案。", True),
     ("HK00300", "美的集团", "汇丰控股在美的集团的H股好仓比例下降0.30%至9.04%",

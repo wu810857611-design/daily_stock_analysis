@@ -3038,10 +3038,19 @@ class SearchService:
                 canonical.isdigit() and stock_code.strip().upper().endswith(".HK")
             )
             is_a = bool(re.fullmatch(r"\d{6}(?:\.(?:SH|SS|SZ|BJ))?", canonical))
-            other_listing_quote = (
-                (is_hk and cls._MAINLAND_LISTING_RE.search(title) and not cls._HONG_KONG_LISTING_RE.search(text))
-                or (is_a and cls._HONG_KONG_LISTING_RE.search(title) and not cls._MAINLAND_LISTING_RE.search(text))
-            ) and not any(cls._contains_stock_code_identity_term(text, term) for term in codes)
+            if is_hk or is_a:
+                hk, mainland = cls._HONG_KONG_LISTING_RE, cls._MAINLAND_LISTING_RE
+                own_listing, other_listing = (hk, mainland) if is_hk else (mainland, hk)
+                issuer_clauses = [
+                    part for part in re.split(r"[，,。；;！!\n]", text)
+                    if any(cls._contains_identity_term(part, name) for name in names)
+                ]
+                other_listing_quote = (
+                    any(other_listing.search(part) and cls._QUOTE_MOVE_TITLE_RE.search(part)
+                        for part in issuer_clauses)
+                    and not any(own_listing.search(part) for part in issuer_clauses)
+                    and not any(cls._contains_stock_code_identity_term(text, term) for term in codes)
+                )
         if not (roundup or parent_group or other_listing_quote):
             return ""
 
