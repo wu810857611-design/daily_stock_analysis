@@ -255,7 +255,15 @@ def test_hk_scanner_does_not_invent_profit_from_quarterly_revenue_and_ttm_margin
 
 
 def test_stale_valuation_advances_to_baidu_and_rejects_future_records(configured, monkeypatch):
+    from src.config import get_config
+
     ak, _ = configured
+    # This test exercises date admission across three isolated provider calls.
+    # The dedicated deadline tests exercise budget exhaustion separately.
+    config = get_config()
+    config.fundamental_stage_timeout_seconds = 2.0
+    config.fundamental_fetch_timeout_seconds = 0.5
+    monkeypatch.setattr("src.config.get_config", lambda: config)
     instant = datetime(2026, 11, 13, 0, 30, tzinfo=ZoneInfo("Asia/Shanghai"))
 
     class FixedDateTime(datetime):
@@ -272,7 +280,7 @@ def test_stale_valuation_advances_to_baidu_and_rejects_future_records(configured
     monkeypatch.setattr(ak, "stock_zh_valuation_baidu", lambda **kwargs: pd.DataFrame([
         {"date": trade_date, "value": 12 if kwargs["indicator"] == "市盈率(TTM)" else 2}
     ]))
-    collector = ScanResearchCollector(2)
+    collector = ScanResearchCollector(6)
     result = collector({"code": "603259", "name": "药明康德"})
     assert result["fundamentals"]["data"]["valuation"]["data"] == {"pe_ratio": 12, "pb_ratio": 2}
     assert any("stock_value_em:InvalidPayload" in error for error in result["errors"])
