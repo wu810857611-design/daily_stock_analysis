@@ -1781,7 +1781,6 @@ class MarketScanService:
                 }
                 _atomic_write_json(self.config.a_cache_path, cache_payload)
                 metadata["source"] = cache_payload["source"]
-                metadata["membership_codes"] = cache_payload["membership_codes"]
                 metadata["provider_errors"] = cache_payload["provider_errors"]
                 return frame.reset_index(drop=True), metadata, False, ""
             except Exception as exc:  # noqa: BLE001 - bounded retries precede cache fallback.
