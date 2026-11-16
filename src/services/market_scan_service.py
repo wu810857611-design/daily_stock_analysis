@@ -34,6 +34,7 @@ from zoneinfo import ZoneInfo
 import numpy as np
 import pandas as pd
 
+from data_provider.akshare_compat import AkshareAPIUnavailable, resolve_akshare_api
 from src.services.position_sizing_policy import (
     STANDARD_TIER,
     classify_opportunity,
@@ -2122,7 +2123,10 @@ class MarketScanService:
                 )
             except ResearchCallError as exc:
                 diagnostics["attempts"][code] = exc.error_class
-                if exc.error_class in {"IsolationUnsupported", "WorkerCleanupFailed", "Push2RateLimitError"}:
+                if exc.error_class in {
+                    "IsolationUnsupported", "WorkerCleanupFailed", "Push2RateLimitError",
+                    "AkshareAPIUnavailable",
+                }:
                     diagnostics["stop_reason"] = exc.error_class
                     break
                 continue
@@ -3241,7 +3245,7 @@ def default_a_snapshot_loader() -> Mapping[str, Any]:
     ):
         try:
             frame = _call_with_hard_timeout(
-                getattr(ak, provider_name),
+                resolve_akshare_api(ak, provider_name),
                 timeout_seconds=provider_timeouts[provider_name],
                 stage_name="a_share_snapshot_provider",
                 item_or_symbol=MARKET_A,
@@ -3299,7 +3303,7 @@ def default_hk_connect_snapshot_loader() -> Mapping[str, Any]:
 def _load_sina_hk_spot_bounded(*, total_timeout_seconds: float = 55.0) -> pd.DataFrame:
     """Fetch Sina's paginated HK universe with per-request and total deadlines.
 
-    AkShare's public ``stock_hk_spot`` currently performs up to 99 bare
+    AkShare's public Sina HK snapshot can perform up to 99 bare
     ``requests.get`` calls without timeouts.  Owning this narrow boundary makes
     the exact page visible and prevents one page from pinning the whole scan.
     """
@@ -3406,14 +3410,12 @@ def default_hk_all_snapshot_loader() -> Mapping[str, Any]:
     provider_errors: List[str] = []
     for provider_name in ("stock_hk_spot_em", "stock_hk_spot"):
         try:
-            provider_callback = getattr(ak, provider_name)
-            if (
-                provider_name == "stock_hk_spot"
-                and str(getattr(provider_callback, "__module__", "")).startswith(
-                    "akshare"
-                )
-            ):
-                provider_callback = _load_sina_hk_spot_bounded
+            # The dedicated Sina client needs neither SDK alias to be present.
+            provider_callback = (
+                _load_sina_hk_spot_bounded
+                if provider_name == "stock_hk_spot"
+                else resolve_akshare_api(ak, provider_name)
+            )
             frame = _call_with_hard_timeout(
                 provider_callback,
                 timeout_seconds=60.0,
@@ -3461,9 +3463,11 @@ def default_hk_close_daily_loader(stock_code: str, trade_date: date) -> pd.DataF
 
     day = trade_date.strftime("%Y%m%d")
     try:
-        return ak.stock_hk_hist(
+        return resolve_akshare_api(ak, "stock_hk_hist")(
             symbol=stock_code[2:], period="daily", start_date=day, end_date=day, adjust="",
         )
+    except AkshareAPIUnavailable as exc:
+        raise ResearchCallError("AkshareAPIUnavailable", str(exc)) from exc
     except HTTPError as exc:
         if exc.response is not None and exc.response.status_code in {403, 429}:
             raise ResearchCallError("Push2RateLimitError") from exc
