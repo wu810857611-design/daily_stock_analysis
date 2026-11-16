@@ -2176,19 +2176,28 @@ class SearchService:
     )
     _MARKET_ROUNDUP_TITLE_RE = re.compile(
         r"强势股追踪|主力资金.{0,18}(?:净流入|净流出).{0,5}\d+\s*只?股"
-        r"|(?:行业|板块|概念|指数).{0,12}(?:盘中|走强|走弱|集体|[涨跌]\s*\d|资金流向|排名|榜单)"
+        r"|(?:行业|板块|概念|指数).{0,12}(?:盘中|走强|走弱|拉升|领涨|领跌|集体|[涨跌]\s*\d|资金流向|排名|榜单)"
         r"|(?:板块|概念).{0,12}(?:行情向好|震荡[上下]行|持续[上下]行|走势活跃)"
-        r"|(?:个股|资金).{0,10}(?:排名|榜单)"
-        r"|(?:港股|[Aa]股|美股)\s*收评"
-        r"|集体(?:上涨|下跌|收涨|收跌|飘红|飘绿|走强|走弱)"
+        r"|(?:个股|资金).{0,12}(?:排名|榜单|流入榜|流出榜)"
+        r"|(?:港股|[AaＡａ]股|美股)\s*(?:早评|午评|收评)"
+        r"|集体(?:上涨|下跌|收涨|收跌|飘红|飘绿|走强|走弱|(?:创|刷新)?(?:历史|阶段|年内)?新[高低])"
         r"|(?:港股|[Aa]股|美股).{0,16}回购潮"
     )
+    _MARKET_ROUNDUP_SNIPPET_RE = re.compile(
+        r"(?:相关)?概念股(?:有|包括|包含)"
+        r"|(?:行业|板块).{0,14}资金(?:净)?流(?:入|出)榜"
+        r"|(?:齐创|多股(?:续)?创|等多股(?:续)?创)(?:历史|阶段|年内)?新[高低]"
+    )
+    _SUPPLIER_SUBJECT_TITLE_RE = re.compile(r"背后(?:的)?(?:代工厂|供应商)")
     _MAINLAND_LISTING_RE = re.compile(r"[AaＡａ]股")
     _HONG_KONG_LISTING_RE = re.compile(r"[HhＨｈ]股|港股")
-    _QUOTE_MOVE_TITLE_RE = re.compile(r"股价|涨停|跌停|(?:持续|集体)(?:上涨|下跌|走高|走低)")
+    _QUOTE_MOVE_RE = re.compile(
+        r"股价.{0,12}(?:[涨跌]|新[高低]|走强|走弱)|涨停|跌停|走强|走弱|(?:持续|集体)(?:上涨|下跌|走高|走低)"
+        r"|(?:创|刷新)(?:历史|阶段|年内)?新[高低]|历史新[高低]"
+    )
     _ISSUER_EVENT_AFTER_NAME = (
         r"(?:公告(?:称|显示)|披露|宣布|发布(?:公告|财报|业绩|年报|季报)|"
-        r"回购(?!潮|队伍)|增持|减持|召开|举行|签署|获批|中标|收购|被罚|被处罚|分红)"
+        r"回购(?!潮|队伍)|增持|减持|回应|召开|举行|签署|获批|中标|收购|被罚|被处罚|分红)"
     )
     _MACRO_NEWS_TERMS = (
         "大盘", "市场", "指数", "宏观", "央行", "利率", "通胀", "a股", "港股",
@@ -3019,7 +3028,11 @@ class SearchService:
     ) -> str:
         """Require issuer-specific evidence when a name hit has competing context."""
         text = f"{title}\n{snippet}"
-        roundup = bool(cls._MARKET_ROUNDUP_TITLE_RE.search(title))
+        roundup = bool(
+            cls._MARKET_ROUNDUP_TITLE_RE.search(title)
+            or cls._MARKET_ROUNDUP_SNIPPET_RE.search(snippet)
+        )
+        supplier_subject = bool(cls._SUPPLIER_SUBJECT_TITLE_RE.search(title))
         codes = cls._stock_code_identity_terms(stock_code)
         names = cls._company_identity_terms(stock_name)
         # A legal listed name ending in 股份 can share its shortened name with
@@ -3031,8 +3044,8 @@ class SearchService:
                 r"(?:\s*[（(]\s*[\w.]+\s*[）)])?"
             )
         parent_group = parent_pattern is not None and bool(parent_pattern.search(text))
-        other_listing_quote = False
-        if cls._QUOTE_MOVE_TITLE_RE.search(title):
+        listing_rejection = ""
+        if cls._QUOTE_MOVE_RE.search(title):
             canonical = canonicalize_foreign_stock_code(stock_code)
             is_hk = bool(re.fullmatch(r"\d{5}|HK\d{1,5}", canonical)) or (
                 canonical.isdigit() and stock_code.strip().upper().endswith(".HK")
@@ -3041,17 +3054,24 @@ class SearchService:
             if is_hk or is_a:
                 hk, mainland = cls._HONG_KONG_LISTING_RE, cls._MAINLAND_LISTING_RE
                 own_listing, other_listing = (hk, mainland) if is_hk else (mainland, hk)
-                issuer_clauses = [
+                issuer_quote_clauses = [
                     part for part in re.split(r"[，,。；;！!\n]", text)
-                    if any(cls._contains_identity_term(part, name) for name in names)
+                    if cls._QUOTE_MOVE_RE.search(part) and (
+                        any(cls._contains_identity_term(part, name) for name in names)
+                        or any(cls._contains_stock_code_identity_term(part, term) for term in codes)
+                    )
                 ]
-                other_listing_quote = (
-                    any(other_listing.search(part) and cls._QUOTE_MOVE_TITLE_RE.search(part)
-                        for part in issuer_clauses)
-                    and not any(own_listing.search(part) for part in issuer_clauses)
-                    and not any(cls._contains_stock_code_identity_term(text, term) for term in codes)
+                has_own_quote = any(
+                    own_listing.search(part)
+                    or any(cls._contains_stock_code_identity_term(part, term) for term in codes)
+                    for part in issuer_quote_clauses
                 )
-        if not (roundup or parent_group or other_listing_quote):
+                if not has_own_quote:
+                    if any(other_listing.search(part) for part in issuer_quote_clauses):
+                        listing_rejection = "价格行情指向另一上市类别"
+                    elif is_hk and issuer_quote_clauses:
+                        listing_rejection = "港股价格行情未明确该上市类别或证券代码"
+        if not (roundup or parent_group or supplier_subject or listing_rejection):
             return ""
 
         if parent_group:
@@ -3075,9 +3095,9 @@ class SearchService:
                 return ""
         if parent_group:
             return "同名集团事项缺少上市主体的直接证据"
-        if other_listing_quote:
-            return "价格行情指向另一上市类别"
-        return "板块行情、榜单或市场汇总仅提及标的，无对应公司事件"
+        if supplier_subject:
+            return "报道事项主体为供应商，目标发行人没有直接事项"
+        return listing_rejection or "板块行情、榜单或市场汇总仅提及标的，无对应公司事件"
 
     @classmethod
     def _score_news_relevance(
