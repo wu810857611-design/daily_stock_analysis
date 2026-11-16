@@ -45,6 +45,7 @@ from tenacity import (
 
 from src.patches.eastmoney_patch import eastmoney_patch
 from src.config import get_config
+from .akshare_compat import resolve_akshare_api
 from .base import BaseFetcher, DataFetchError, RateLimitError, STANDARD_COLUMNS, is_bse_code, is_st_stock, is_kc_cy_stock, normalize_stock_code
 from .realtime_types import (
     UnifiedRealtimeQuote, ChipDistribution, RealtimeSource,
@@ -546,7 +547,7 @@ class AkshareFetcher(BaseFetcher):
             import time as _time
             api_start = _time.time()
 
-            df = ak.stock_zh_a_hist(
+            df = resolve_akshare_api(ak, "stock_zh_a_hist")(
                 symbol=stock_code,
                 period="daily",
                 start_date=start_date.replace('-', ''),
@@ -583,7 +584,7 @@ class AkshareFetcher(BaseFetcher):
 
         try:
             df = _akshare_call_with_timeout(
-                ak.stock_zh_a_daily,
+                resolve_akshare_api(ak, "stock_zh_a_daily"),
                 symbol=symbol,
                 start_date=start_date.replace('-', ''),
                 end_date=end_date.replace('-', ''),
@@ -853,7 +854,7 @@ class AkshareFetcher(BaseFetcher):
             api_start = _time.time()
             
             # 调用 akshare 获取港股日线数据
-            df = ak.stock_hk_hist(
+            df = resolve_akshare_api(ak, "stock_hk_hist")(
                 symbol=code,
                 period="daily",
                 start_date=start_date.replace('-', ''),
@@ -1639,7 +1640,7 @@ class AkshareFetcher(BaseFetcher):
             import time as _time
             api_start = _time.time()
 
-            df_spot = ak.stock_hk_spot()
+            df_spot = resolve_akshare_api(ak, "stock_hk_spot")()
 
             api_elapsed = _time.time() - api_start
             logger.info(f"[API返回] ak.stock_hk_spot 成功: 返回 {len(df_spot)} 只港股, 耗时 {api_elapsed:.2f}s")
@@ -1896,7 +1897,7 @@ class AkshareFetcher(BaseFetcher):
                 "[MarketStats] component=market_stats provider=AkshareFetcher "
                 "api=ak.stock_zh_a_spot action=request_start"
             )
-            df = ak.stock_zh_a_spot()
+            df = resolve_akshare_api(ak, "stock_zh_a_spot")()
             elapsed = time.monotonic() - started_at
             logger.info(
                 "[MarketStats] component=market_stats provider=AkshareFetcher "

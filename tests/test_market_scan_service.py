@@ -649,7 +649,10 @@ def test_a_snapshot_success_is_used_directly_after_cache_write(tmp_path: Path) -
     assert "membership_codes" not in cached
 
 
-def test_default_full_market_loaders_use_independent_fallbacks(monkeypatch: Any) -> None:
+@pytest.mark.parametrize("a_sina_name", ["stock_zh_a_spot_sina", "stock_zh_a_spot"])
+def test_default_full_market_loaders_use_independent_fallbacks(
+    monkeypatch: Any, a_sina_name: str
+) -> None:
     a_calls: list[str] = []
     hk_calls: list[str] = []
 
@@ -681,11 +684,12 @@ def test_default_full_market_loaders_use_independent_fallbacks(monkeypatch: Any)
             stock_zh_a_spot_tx=lambda: (_ for _ in ()).throw(
                 TimeoutError("tencent unavailable")
             ),
-            stock_zh_a_spot=sina_a,
             stock_hk_spot_em=broken_hk,
-            stock_hk_spot=sina_hk,
+            **{a_sina_name: sina_a},
         ),
     )
+    # The bounded client must work even when the SDK exports neither Sina HK name.
+    monkeypatch.setattr(market_scan_service_module, "_load_sina_hk_spot_bounded", sina_hk)
 
     a_payload = default_a_snapshot_loader()
     hk_payload = default_hk_all_snapshot_loader()
@@ -3138,9 +3142,17 @@ def test_hk_close_backfill_requires_dated_usable_bar(tmp_path, day_offset, amoun
     assert result["as_of"][MARKET_HK] == ""
 
 
-def test_hk_daily_provider_is_close_only_and_requests_unadjusted_session(tmp_path, monkeypatch):
-    import akshare as ak
-
+@pytest.mark.parametrize(
+    ("api_name", "outcome"),
+    [
+        ("stock_hk_hist_em", "recovered"),
+        ("stock_hk_hist", "recovered"),
+        (None, "AkshareAPIUnavailable"),
+    ],
+)
+def test_hk_daily_provider_is_close_only_and_requests_unadjusted_session(
+    tmp_path, monkeypatch, api_name, outcome
+):
     def fake_hist(**kwargs):
         assert kwargs == {
             "symbol": "00981", "period": "daily", "start_date": "20260728",
@@ -3151,7 +3163,7 @@ def test_hk_daily_provider_is_close_only_and_requests_unadjusted_session(tmp_pat
             "成交量": 900_000, "成交额": 650_000_000,
         }])
 
-    monkeypatch.setattr(ak, "stock_hk_hist", fake_hist)
+    monkeypatch.setitem(sys.modules, "akshare", SimpleNamespace(**({api_name: fake_hist} if api_name else {})))
     _service(tmp_path, qwen=None, deepseek=None).run_l1()
     available = _hk_snapshot(include_non_connect=False)["records"][0]
     service = _service(
@@ -3162,7 +3174,9 @@ def test_hk_daily_provider_is_close_only_and_requests_unadjusted_session(tmp_pat
     service.hk_close_daily_loader = market_scan_service_module.default_hk_close_daily_loader
     assert service.run_l1().diagnostics["hk_close_daily_recovery"] == {}
     service.clock = lambda: NOW.replace(hour=19)
-    assert service.run_l1().diagnostics["hk_close_daily_recovery"]["attempts"] == {"HK00981": "recovered"}
+    recovery = service.run_l1().diagnostics["hk_close_daily_recovery"]
+    assert recovery["attempts"] == {"HK00981": outcome}
+    assert recovery["stop_reason"] == ("completed" if api_name else outcome)
 
 
 def test_hk_daily_recovery_respects_budget_and_reaps_hung_request(tmp_path, monkeypatch):
