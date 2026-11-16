@@ -653,7 +653,16 @@ def test_rejected_pdf_diagnostics_reach_candidate_artifact(configured, monkeypat
 def test_actual_https_index_transport_integrates_with_parent_cache(configured, monkeypatch, tmp_path):
     from contextlib import nullcontext
     import json
+    from src.config import get_config
     from src.services import research_evidence
+
+    # This test verifies successful subprocess transport and parent-cache reuse;
+    # the isolated timeout test below covers a hung upstream separately.
+    config = get_config()
+    config.fundamental_stage_timeout_seconds = 3.0
+    config.fundamental_fetch_timeout_seconds = 1.0
+    monkeypatch.setattr("src.config.get_config", lambda: config)
+
     calls = tmp_path / "http_calls.jsonl"
     def response(payload):
         return nullcontext(SimpleNamespace(status_code=200, raise_for_status=lambda: None,
@@ -679,7 +688,7 @@ def test_actual_https_index_transport_integrates_with_parent_cache(configured, m
     monkeypatch.setattr("src.services.market_scan_research.cninfo_issuer", research_evidence.cninfo_issuer)
     monkeypatch.setattr("src.services.market_scan_research.cninfo_issuers", research_evidence.cninfo_issuers)
     monkeypatch.setattr("src.services.market_scan_research.cninfo_announcement_index", research_evidence.cninfo_announcement_index)
-    collector = ScanResearchCollector(2)
+    collector = ScanResearchCollector(8)
     for code in ("603259", "603259", "300473"):
         result = collector({**CANDIDATE, "code": code})
         assert result["announcements"]["items"]

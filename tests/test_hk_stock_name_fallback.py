@@ -65,7 +65,7 @@ def _make_spot_em_df():
 
 
 def _make_spot_df():
-    """Simulate stock_hk_spot() return value (sina source)."""
+    """Simulate stock_hk_spot_sina() return value (sina source)."""
     return pd.DataFrame([{
         '代码': '00700',
         '名称': '腾讯控股',
@@ -84,7 +84,7 @@ def _make_spot_df():
 
 
 class TestHKRealtimeFallback(unittest.TestCase):
-    """stock_hk_spot_em 失败时应 fallback 到 stock_hk_spot。"""
+    """stock_hk_spot_em 失败时应 fallback 到 stock_hk_spot_sina。"""
 
     def setUp(self):
         self.fetcher = AkshareFetcher()
@@ -103,7 +103,7 @@ class TestHKRealtimeFallback(unittest.TestCase):
     def test_em_success_returns_quote_with_name(self, mock_cb):
         """stock_hk_spot_em 成功时直接返回含名称的 quote。"""
         mock_cb.return_value = _DummyCircuitBreaker()
-        ak_mock = MagicMock()
+        ak_mock = MagicMock(spec_set=["stock_hk_spot_em", "stock_hk_spot_sina"])
         ak_mock.stock_hk_spot_em.return_value = _make_spot_em_df()
 
         with patch.dict(sys.modules, {"akshare": ak_mock}):
@@ -117,7 +117,7 @@ class TestHKRealtimeFallback(unittest.TestCase):
     def test_repeated_em_lookup_uses_hot_cache_without_network_delay(self, mock_cb):
         """首次拉取后，TTL 内查询不应再次调用接口或执行限速等待。"""
         mock_cb.return_value = _DummyCircuitBreaker()
-        ak_mock = MagicMock()
+        ak_mock = MagicMock(spec_set=["stock_hk_spot_em", "stock_hk_spot_sina"])
         ak_mock.stock_hk_spot_em.return_value = _make_spot_em_df()
         self.fetcher._set_random_user_agent = MagicMock()
         self.fetcher._enforce_rate_limit = MagicMock()
@@ -141,7 +141,7 @@ class TestHKRealtimeFallback(unittest.TestCase):
             [_make_spot_em_df().assign(代码=code) for code in codes],
             ignore_index=True,
         )
-        ak_mock = MagicMock()
+        ak_mock = MagicMock(spec_set=["stock_hk_spot_em", "stock_hk_spot_sina"])
 
         def delayed_em_response():
             time.sleep(0.05)
@@ -163,21 +163,35 @@ class TestHKRealtimeFallback(unittest.TestCase):
 
         self.assertTrue(all(quote is not None for quote in quotes))
         ak_mock.stock_hk_spot_em.assert_called_once()
-        ak_mock.stock_hk_spot.assert_not_called()
+        ak_mock.stock_hk_spot_sina.assert_not_called()
 
     @patch("data_provider.akshare_fetcher.get_realtime_circuit_breaker")
     def test_em_failure_falls_back_to_spot(self, mock_cb):
-        """stock_hk_spot_em 抛异常时应 fallback 到 stock_hk_spot 并返回名称。"""
+        """stock_hk_spot_em 抛异常时应 fallback 到 stock_hk_spot_sina 并返回名称。"""
         mock_cb.return_value = _DummyCircuitBreaker()
-        ak_mock = MagicMock()
+        ak_mock = MagicMock(spec_set=["stock_hk_spot_em", "stock_hk_spot_sina"])
         ak_mock.stock_hk_spot_em.side_effect = Exception("接口异常：数据源不可用")
-        ak_mock.stock_hk_spot.return_value = _make_spot_df()
+        ak_mock.stock_hk_spot_sina.return_value = _make_spot_df()
 
         with patch.dict(sys.modules, {"akshare": ak_mock}):
             quote = self.fetcher._get_hk_realtime_quote("HK00700")
 
         self.assertIsNotNone(quote)
         self.assertEqual(quote.name, "腾讯控股")
+        self.assertAlmostEqual(quote.price, 368.0)
+        ak_mock.stock_hk_spot_sina.assert_called_once()
+
+    @patch("data_provider.akshare_fetcher.get_realtime_circuit_breaker")
+    def test_legacy_sina_export_used_when_current_export_is_absent(self, mock_cb):
+        mock_cb.return_value = _DummyCircuitBreaker()
+        ak_mock = MagicMock(spec_set=["stock_hk_spot_em", "stock_hk_spot"])
+        ak_mock.stock_hk_spot_em.side_effect = TimeoutError("Eastmoney unavailable")
+        ak_mock.stock_hk_spot.return_value = _make_spot_df()
+
+        with patch.dict(sys.modules, {"akshare": ak_mock}):
+            quote = self.fetcher._get_hk_realtime_quote("HK00700")
+
+        self.assertIsNotNone(quote)
         self.assertAlmostEqual(quote.price, 368.0)
         ak_mock.stock_hk_spot.assert_called_once()
 
@@ -186,14 +200,14 @@ class TestHKRealtimeFallback(unittest.TestCase):
         """并发冷启动失败时应只尝试一次主接口，其余线程复用失败结果后走备用链路。"""
         mock_cb.return_value = _DummyCircuitBreaker()
         codes = ["00700", "09988", "03690", "01810"]
-        ak_mock = MagicMock()
+        ak_mock = MagicMock(spec_set=["stock_hk_spot_em", "stock_hk_spot_sina"])
 
         def delayed_em_failure():
             time.sleep(0.05)
             raise Exception("东方财富接口超时")
 
         ak_mock.stock_hk_spot_em.side_effect = delayed_em_failure
-        ak_mock.stock_hk_spot.return_value = pd.concat(
+        ak_mock.stock_hk_spot_sina.return_value = pd.concat(
             [_make_spot_df().assign(代码=code) for code in codes],
             ignore_index=True,
         )
@@ -212,16 +226,16 @@ class TestHKRealtimeFallback(unittest.TestCase):
 
         self.assertTrue(all(quote is not None for quote in quotes))
         ak_mock.stock_hk_spot_em.assert_called_once()
-        self.assertEqual(ak_mock.stock_hk_spot.call_count, len(codes))
+        self.assertEqual(ak_mock.stock_hk_spot_sina.call_count, len(codes))
         self.assertEqual(akshare_fetcher_module._hk_realtime_cache["last_result"], "failure")
 
     @patch("data_provider.akshare_fetcher.get_realtime_circuit_breaker")
     def test_both_fail_returns_none(self, mock_cb):
-        """stock_hk_spot_em 和 stock_hk_spot 都失败时返回 None，不抛异常。"""
+        """stock_hk_spot_em 和 stock_hk_spot_sina 都失败时返回 None，不抛异常。"""
         mock_cb.return_value = _DummyCircuitBreaker()
-        ak_mock = MagicMock()
+        ak_mock = MagicMock(spec_set=["stock_hk_spot_em", "stock_hk_spot_sina"])
         ak_mock.stock_hk_spot_em.side_effect = Exception("东方财富接口超时")
-        ak_mock.stock_hk_spot.side_effect = Exception("新浪接口超时")
+        ak_mock.stock_hk_spot_sina.side_effect = Exception("新浪接口超时")
 
         with patch.dict(sys.modules, {"akshare": ak_mock}):
             quote = self.fetcher._get_hk_realtime_quote("HK00700")
@@ -230,11 +244,11 @@ class TestHKRealtimeFallback(unittest.TestCase):
 
     @patch("data_provider.akshare_fetcher.get_realtime_circuit_breaker")
     def test_em_returns_empty_df_falls_back_to_spot(self, mock_cb):
-        """stock_hk_spot_em 返回空 DataFrame 时应 fallback 到 stock_hk_spot。"""
+        """stock_hk_spot_em 返回空 DataFrame 时应 fallback 到 stock_hk_spot_sina。"""
         mock_cb.return_value = _DummyCircuitBreaker()
-        ak_mock = MagicMock()
+        ak_mock = MagicMock(spec_set=["stock_hk_spot_em", "stock_hk_spot_sina"])
         ak_mock.stock_hk_spot_em.return_value = pd.DataFrame(columns=['代码', '名称', '最新价'])
-        ak_mock.stock_hk_spot.return_value = _make_spot_df()
+        ak_mock.stock_hk_spot_sina.return_value = _make_spot_df()
 
         with patch.dict(sys.modules, {"akshare": ak_mock}):
             quote = self.fetcher._get_hk_realtime_quote("HK00700")
@@ -247,26 +261,26 @@ class TestHKRealtimeFallback(unittest.TestCase):
         self.assertIsNone(akshare_fetcher_module._hk_realtime_cache["data"])
         self.assertEqual(akshare_fetcher_module._hk_realtime_cache["last_result"], "failure")
         ak_mock.stock_hk_spot_em.assert_called_once()
-        self.assertEqual(ak_mock.stock_hk_spot.call_count, 2)
+        self.assertEqual(ak_mock.stock_hk_spot_sina.call_count, 2)
 
     @patch("data_provider.akshare_fetcher.get_realtime_circuit_breaker")
     def test_em_missing_code_column_falls_back_without_poisoning_cache(self, mock_cb):
         """主接口结构异常时应保留 fallback，且异常结果不得写入缓存。"""
         cb = _DummyCircuitBreaker()
         mock_cb.return_value = cb
-        ak_mock = MagicMock()
+        ak_mock = MagicMock(spec_set=["stock_hk_spot_em", "stock_hk_spot_sina"])
         ak_mock.stock_hk_spot_em.return_value = pd.DataFrame([{
             "名称": "腾讯控股",
             "最新价": 370.0,
         }])
-        ak_mock.stock_hk_spot.return_value = _make_spot_df()
+        ak_mock.stock_hk_spot_sina.return_value = _make_spot_df()
 
         with patch.dict(sys.modules, {"akshare": ak_mock}):
             quote = self.fetcher._get_hk_realtime_quote("HK00700")
 
         self.assertIsNotNone(quote)
         self.assertAlmostEqual(quote.price, 368.0)
-        ak_mock.stock_hk_spot.assert_called_once()
+        ak_mock.stock_hk_spot_sina.assert_called_once()
         self.assertIsNone(akshare_fetcher_module._hk_realtime_cache["data"])
         self.assertTrue(any(source == "akshare_hk_em" for source, _ in cb.failures))
 
@@ -278,8 +292,8 @@ class TestHKRealtimeFallback(unittest.TestCase):
             "data": pd.DataFrame([{"名称": "腾讯控股"}]),
             "timestamp": akshare_fetcher_module.time.time(),
         })
-        ak_mock = MagicMock()
-        ak_mock.stock_hk_spot.return_value = _make_spot_df()
+        ak_mock = MagicMock(spec_set=["stock_hk_spot_em", "stock_hk_spot_sina"])
+        ak_mock.stock_hk_spot_sina.return_value = _make_spot_df()
         self.fetcher._set_random_user_agent = MagicMock()
         self.fetcher._enforce_rate_limit = MagicMock()
 
@@ -289,7 +303,7 @@ class TestHKRealtimeFallback(unittest.TestCase):
         self.assertIsNotNone(quote)
         self.assertAlmostEqual(quote.price, 368.0)
         ak_mock.stock_hk_spot_em.assert_not_called()
-        ak_mock.stock_hk_spot.assert_called_once()
+        ak_mock.stock_hk_spot_sina.assert_called_once()
         self.fetcher._set_random_user_agent.assert_called_once()
         self.fetcher._enforce_rate_limit.assert_called_once()
 
@@ -299,7 +313,7 @@ class TestHKRealtimeFallback(unittest.TestCase):
         cb = _DummyCircuitBreaker()
         cb.is_available = lambda source: False
         mock_cb.return_value = cb
-        ak_mock = MagicMock()
+        ak_mock = MagicMock(spec_set=["stock_hk_spot_em", "stock_hk_spot_sina"])
 
         with patch.dict(sys.modules, {"akshare": ak_mock}):
             quote = self.fetcher._get_hk_realtime_quote("HK00700")
