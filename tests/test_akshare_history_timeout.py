@@ -140,6 +140,8 @@ def test_akshare_call_with_timeout_reaps_timed_out_worker_process() -> None:
 @pytest.mark.parametrize(
     ("method_name", "api_name", "call_name"),
     [
+        ("_fetch_stock_data_sina", "stock_zh_a_hist_sina", "ak.stock_zh_a_daily"),
+        ("_fetch_stock_data_sina", "stock_zh_a_daily_sina", "ak.stock_zh_a_daily"),
         ("_fetch_stock_data_sina", "stock_zh_a_daily", "ak.stock_zh_a_daily"),
         ("_fetch_stock_data_tx", "stock_zh_a_hist_tx", "ak.stock_zh_a_hist_tx"),
     ],
@@ -169,7 +171,9 @@ def test_sina_and_tencent_history_calls_use_timeout_wrapper(
             }
         )
 
-    fake_api_func = object()
+    def fake_api_func(**kwargs):
+        raise AssertionError("the timeout wrapper should own this call")
+
     fake_akshare = SimpleNamespace(**{api_name: fake_api_func})
     monkeypatch.setitem(sys.modules, "akshare", fake_akshare)
     monkeypatch.setattr("data_provider.akshare_fetcher._akshare_call_with_timeout", fake_call)
