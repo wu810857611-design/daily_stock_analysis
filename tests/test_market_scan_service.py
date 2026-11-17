@@ -695,11 +695,11 @@ def test_default_full_market_loaders_use_independent_fallbacks(
     hk_payload = default_hk_all_snapshot_loader()
 
     assert a_calls == ["eastmoney", "sina"]
-    assert hk_calls == ["eastmoney", "sina"]
+    assert hk_calls == ["sina"]
     assert a_payload["source"] == "akshare.stock_zh_a_spot"
     assert hk_payload["source"] == "akshare.stock_hk_spot"
     assert a_payload["provider_errors"]
-    assert hk_payload["provider_errors"]
+    assert hk_payload["provider_errors"] == []
 
 
 def test_default_a_snapshot_uses_tencent_before_sina(monkeypatch: Any) -> None:
@@ -861,7 +861,7 @@ def test_tencent_hk_membership_fallback_rejects_all_stale_quotes() -> None:
         )
 
 
-def test_hk_cached_membership_uses_fresh_targeted_quotes_before_all_market(
+def test_hk_cached_membership_keeps_fresh_targeted_quotes_when_gap_backup_fails(
     tmp_path: Path,
 ) -> None:
     _service(tmp_path, qwen=ReviewRecorder(), deepseek=ReviewRecorder()).run_l1()
@@ -894,7 +894,7 @@ def test_hk_cached_membership_uses_fresh_targeted_quotes_before_all_market(
 
     def all_hk_loader() -> Any:
         calls.append("all_hk")
-        raise AssertionError("targeted membership quotes should win")
+        raise TimeoutError("independent backup unavailable")
 
     result = _service(
         tmp_path,
@@ -907,12 +907,92 @@ def test_hk_cached_membership_uses_fresh_targeted_quotes_before_all_market(
         config_overrides={"hk_cache_max_age_hours": 0.1},
     ).run_l1()
 
-    assert calls == ["membership"]
+    assert calls == ["membership", "all_hk"]
     assert result.hk_safe_halt is False
     assert result.diagnostics["hk_snapshot_source"] == "tencent.hk_membership_batch"
     assert result.diagnostics["hk_quote_requested_count"] == 2
     assert result.diagnostics["hk_quote_fresh_count"] == 1
+    assert result.diagnostics["hk_quote_gap_recovery"]["error"].startswith("TimeoutError:")
     assert {item["code"] for item in result.hk_candidates} == {"HK00700"}
+
+
+@pytest.mark.parametrize(("age", "amount", "initially_full", "recovers"), [
+    (90, 1000, False, True),
+    (91, 1000, False, False),
+    (-31, 1000, False, False),
+    (None, 1000, False, False),
+    (10, 0, False, False),
+    (10, 1000, True, False),
+])
+def test_hk_partial_tencent_only_supplements_missing_verified_members(
+    tmp_path, age, amount, initially_full, recovers,
+):
+    _service(tmp_path, qwen=ReviewRecorder(), deepseek=ReviewRecorder()).run_l1()
+    observed = NOW + timedelta(hours=1)
+    calls = []
+
+    def connect_loader():
+        raise TimeoutError("connect endpoint unavailable")
+
+    def quote(code, price=101, **extra):
+        return {"code": code, "name": code, "price": price, "volume": 1000,
+                "amount": 1000, "change_pct": 1, **extra}
+
+    def tencent_loader(codes):
+        assert codes == ["HK00700", "HK00981"]
+        rows = [quote("HK00700", provider_timestamp=observed.isoformat())]
+        if initially_full:
+            rows.append(quote("HK00981", provider_timestamp=observed.isoformat()))
+        return {"is_connect_universe": True, "source": "tencent", "records": rows}
+
+    def all_hk_loader():
+        calls.append("sina")
+        stamp = None if age is None else (observed - timedelta(seconds=age)).isoformat()
+        return {"is_full_hk_universe": True, "source": "sina", "records": [
+            quote("HK00700", price=999, provider_timestamp=observed.isoformat()),
+            quote("HK09988", provider_timestamp=observed.isoformat()),
+            quote("HK00981", amount=amount, provider_timestamp=stamp),
+        ]}
+
+    service = _service(
+        tmp_path, qwen=ReviewRecorder(), deepseek=ReviewRecorder(),
+        hk_loader=connect_loader, hk_membership_loader=tencent_loader,
+        hk_all_loader=all_hk_loader, clock=lambda: observed,
+    )
+    result = service.run_l1()
+    cache = json.loads(service.config.hk_cache_path.read_text())
+    prices = {row["code"]: row["price"] for row in cache["records"]}
+    assert prices["HK00700"] == 101
+    assert "HK09988" not in prices
+    assert result.diagnostics["hk_snapshot_coverage"]["missing_codes"] == (
+        [] if recovers or initially_full else ["HK00981"]
+    )
+    assert result.diagnostics["hk_snapshot_source"] == ("tencent+sina" if recovers else "tencent")
+    gap = result.diagnostics["hk_quote_gap_recovery"]
+    if initially_full:
+        assert calls == [] and gap == {}
+    else:
+        assert calls == ["sina"]
+        assert gap["source"] == "sina" and gap["requested_count"] == 1
+        assert gap["remaining_missing_count"] == (0 if recovers else 1)
+        assert bool(gap["recovered"]) is recovers
+
+
+def test_hk_connect_primary_keeps_invalid_rows_in_expected_coverage(tmp_path):
+    result = _service(
+        tmp_path, qwen=ReviewRecorder(), deepseek=ReviewRecorder(),
+        hk_loader=lambda: {"is_connect_universe": True, "records": [
+            {"code": "HK00700", "name": "腾讯控股", "price": 101, "change_pct": 1,
+             "volume": 1000, "amount": 1000},
+            {"code": "HK00981", "name": "中芯国际", "price": 101, "change_pct": 1,
+             "volume": 1000, "amount": None},
+        ]},
+    ).run_l1()
+    coverage = result.diagnostics["hk_snapshot_coverage"]
+    assert coverage["expected_count"] == 2
+    assert coverage["covered_count"] == 1
+    assert coverage["missing_codes"] == coverage["invalid_codes"] == ["HK00981"]
+    assert [candidate["code"] for candidate in result.hk_candidates] == ["HK00700"]
 
 
 def test_snapshot_retry_uses_bounded_backoff_before_recovery(tmp_path: Path) -> None:

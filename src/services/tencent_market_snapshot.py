@@ -13,6 +13,7 @@ from zoneinfo import ZoneInfo
 SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
 PRIMARY_ENDPOINT = "https://qt.gtimg.cn/q="
 ALTERNATE_ENDPOINT = "https://web.sqt.gtimg.cn/q="
+HK_QUOTE_FRESHNESS_SECONDS = 90.0
 _RECORD = re.compile(r'v_((?:r_)?[A-Za-z0-9]+)="([^"]*)"')
 
 
@@ -100,7 +101,7 @@ def load_fresh_hk_membership_snapshot(
     symbols: Sequence[str],
     *,
     now: Optional[datetime] = None,
-    freshness_seconds: float = 90.0,
+    freshness_seconds: float = HK_QUOTE_FRESHNESS_SECONDS,
     timeout_seconds: float = 8.0,
     chunk_size: int = 50,
     opener: Callable[..., Any] = request.urlopen,
