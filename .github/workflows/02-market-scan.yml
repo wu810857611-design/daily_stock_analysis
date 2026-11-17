@@ -2,9 +2,9 @@ name: 全市场分层选股（仅模拟）
 
 on:
   schedule:
-    - cron: '30 2 * * 1-5'   # 北京时间 10:30
-    - cron: '30 6 * * 1-5'   # 北京时间 14:30
-    - cron: '15 11 * * 1-5'  # 北京时间 19:15，避开 18:00 收盘分析
+    - cron: '20 2 * * 1-5'  # 北京时间 10:20
+    - cron: '20 6 * * 1-5'  # 北京时间 14:20
+    - cron: '5 11 * * 1-5'  # 北京时间 19:05，避开 18:00 收盘分析
   workflow_dispatch:
     inputs:
       slot:
@@ -24,7 +24,7 @@ on:
         type: string
 
 concurrency:
-  group: market-scan-${{ github.ref }}-${{ github.event.schedule == '30 2 * * 1-5' && 'morning' || github.event.schedule == '30 6 * * 1-5' && 'afternoon' || github.event.schedule == '15 11 * * 1-5' && 'close' || inputs.slot || 'manual' }}
+  group: market-scan-${{ github.ref }}-${{ (github.event.schedule == '20 2 * * 1-5' || github.event.schedule == '30 2 * * 1-5') && 'morning' || (github.event.schedule == '20 6 * * 1-5' || github.event.schedule == '30 6 * * 1-5') && 'afternoon' || (github.event.schedule == '5 11 * * 1-5' || github.event.schedule == '15 11 * * 1-5') && 'close' || inputs.slot || 'manual' }}
   cancel-in-progress: false
 
 permissions:
