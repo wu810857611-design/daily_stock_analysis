@@ -42,6 +42,7 @@ from src.services.position_sizing_policy import (
 )
 from src.services.market_scan_research import has_announcement_excerpt, meaningful
 from src.services.research_execution import ResearchCallError, run_isolated
+from src.services.tencent_market_snapshot import HK_QUOTE_FRESHNESS_SECONDS
 
 
 SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
@@ -452,6 +453,7 @@ SNAPSHOT_ALIASES: Dict[str, Tuple[str, ...]] = {
     "list_date": ("list_date", "上市日期"),
     "listing_days": ("listing_days", "上市天数"),
     "is_connect": ("is_connect", "港股通", "is_hk_connect"),
+    "provider_timestamp": ("provider_timestamp", "日期时间"),
 }
 
 
@@ -1708,6 +1710,7 @@ class MarketScanService:
                 "hk_quote_requested_count": hk_metadata.get("requested_count"),
                 "hk_quote_fresh_count": hk_metadata.get("fresh_count"),
                 "hk_quote_route_stats": hk_metadata.get("route_stats") or [],
+                "hk_quote_gap_recovery": hk_metadata.get("quote_gap_recovery") or {},
                 "hk_snapshot_coverage": hk_coverage,
                 "hk_close_daily_recovery": hk_daily_recovery,
                 "hk_membership_age_hours": hk_metadata.get("membership_age_hours"),
@@ -1821,6 +1824,62 @@ class MarketScanService:
             reason,
         )
 
+    def _supplement_hk_membership_quotes(
+        self, frame: pd.DataFrame, membership_codes: set[str], now: datetime,
+    ) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+        """Try the full-market backup once, filling only verified fresh gaps."""
+        coverage = _hk_snapshot_coverage(frame, membership_codes)
+        missing = coverage["missing_codes"]
+        loader = self.hk_all_snapshot_loader
+        if not missing or loader is None:
+            return frame, {}
+        recovery: Dict[str, Any] = {
+            "initial_covered_count": coverage["covered_count"],
+            "requested_count": len(missing),
+            "source": "",
+            "recovered": {},
+            "remaining_missing_count": len(missing),
+        }
+        try:
+            raw = self._timed_call(
+                loader,
+                timeout_seconds=self.config.snapshot_provider_timeout_seconds,
+                item_or_symbol=f"{len(missing)}_missing_connect_symbols",
+                provider=getattr(loader, "__name__", "hk_all_snapshot_loader"),
+            )
+            rows, metadata = _coerce_snapshot_payload(raw, now=now)
+            if not metadata.get("is_full_hk_universe"):
+                raise MarketScanError("HK quote fallback did not prove full-market coverage")
+        except Exception as exc:  # A failed supplement must keep the fresh targeted rows.
+            if isinstance(exc, MarketScanDeadlineExceeded) and exc.scope == "total":
+                raise
+            recovery["error"] = f"{type(exc).__name__}:{exc}"
+            return frame, recovery
+
+        extra = _normalise_snapshot(rows, market=MARKET_HK, now=now)
+        extra = extra[extra["code"].isin(missing)].copy()
+        recovery["source"] = metadata.get("source") or "hk_full_market_provider"
+        recovery["provider_errors"] = list(metadata.get("provider_errors") or [])
+        if extra.empty or "provider_timestamp" not in extra:
+            return frame, recovery
+
+        selected_at = self.clock().astimezone(SHANGHAI_TZ)
+        trade_date = now.astimezone(SHANGHAI_TZ).date()
+        provider_times = extra["provider_timestamp"].map(_parse_datetime)
+        fresh = provider_times.map(
+            lambda stamp: pd.notna(stamp) and stamp.astimezone(SHANGHAI_TZ).date() == trade_date
+            and -30.0 <= (selected_at - stamp).total_seconds() <= HK_QUOTE_FRESHNESS_SECONDS
+        )
+        numbers = extra[["price", "change_pct", "volume", "amount"]]
+        usable = np.isfinite(numbers).all(axis=1) & numbers[["price", "volume", "amount"]].gt(0).all(axis=1)
+        extra = extra.loc[fresh & usable].assign(is_connect=True)
+        if extra.empty:
+            return frame, recovery
+
+        recovery["recovered"] = dict(zip(extra["code"], extra["provider_timestamp"]))
+        recovery["remaining_missing_count"] = len(missing) - len(extra)
+        return pd.concat([frame[~frame["code"].isin(extra["code"])], extra], ignore_index=True), recovery
+
     def _load_hk_connect_snapshot(
         self,
         now: datetime,
@@ -1873,6 +1932,7 @@ class MarketScanService:
                 self._write_hk_membership_cache(cache_payload)
                 metadata["source"] = cache_payload["source"]
                 metadata["provider_errors"] = cache_payload["provider_errors"]
+                metadata["membership_codes"] = cache_payload["membership_codes"]
                 metadata["membership_age_hours"] = 0.0
                 metadata["membership_source"] = cache_payload["membership_source"]
                 metadata.update(
@@ -1924,6 +1984,11 @@ class MarketScanService:
                     quote_source = str(
                         metadata.get("source") or "hk_membership_quote_provider"
                     )
+                    frame, gap_recovery = self._supplement_hk_membership_quotes(
+                        frame, membership_codes, now
+                    )
+                    if gap_recovery.get("recovered"):
+                        quote_source = f'{quote_source}+{gap_recovery["source"]}'
                     cache_payload = {
                         "schema_version": SCHEMA_VERSION,
                         "saved_at": _iso_datetime(now),
@@ -1940,6 +2005,7 @@ class MarketScanService:
                         "is_connect_universe": True,
                         "membership_codes": sorted(membership_codes),
                         "records": frame.to_dict(orient="records"),
+                        "quote_gap_recovery": gap_recovery,
                     }
                     _atomic_write_json(self.config.hk_cache_path, cache_payload)
                     metadata.update(
@@ -1947,6 +2013,7 @@ class MarketScanService:
                             "source": quote_source,
                             "membership_codes": cache_payload["membership_codes"],
                             "provider_errors": provider_errors,
+                            "quote_gap_recovery": gap_recovery,
                             "membership_age_hours": membership_metadata[
                                 "membership_age_hours"
                             ],
@@ -3408,7 +3475,9 @@ def default_hk_all_snapshot_loader() -> Mapping[str, Any]:
     import akshare as ak
 
     provider_errors: List[str] = []
-    for provider_name in ("stock_hk_spot_em", "stock_hk_spot"):
+    # The Connect membership path already tried Eastmoney. Prefer an
+    # independent transport first so a Push2 issue cannot stop both routes.
+    for provider_name in ("stock_hk_spot", "stock_hk_spot_em"):
         try:
             # The dedicated Sina client needs neither SDK alias to be present.
             provider_callback = (
