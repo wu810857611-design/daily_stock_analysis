@@ -199,6 +199,58 @@ def test_official_index_is_preserved_without_claiming_document_review(configured
     assert result["status"] == "partial"
 
 
+@pytest.mark.parametrize(("code", "published", "expected"), [
+    ("000100", "2026-11-14T00:00:00+08:00", "date"),
+    ("000100", "2026-11-14T12:00:00+08:00", None),
+    ("000100", "2026-11-13T00:00:00+08:00", None),
+    ("000100", "2026-11-18T00:00:00+08:00", None),
+    ("000100", "2026-11-17T18:00:00+08:00", None),
+    ("HK00939", "2026-11-14T00:00:00+08:00", None),
+])
+def test_official_index_uses_calendar_boundary_only_for_mainland_date_markers(
+    configured, monkeypatch, code, published, expected,
+):
+    from src.services.research_evidence import cninfo_announcement_index
+
+    as_of = datetime.fromisoformat("2026-11-17T14:45:00+08:00")
+
+    class FrozenDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return as_of.astimezone(tz)
+
+    def index_response(_url, query):
+        assert query["seDate"] == "2026-11-14~2026-11-17"
+        assert query["stock"] == f"{code.removeprefix('HK')},fixture"
+        return {"totalAnnouncement": 1, "announcements": [{
+            "secCode": code.removeprefix("HK"), "orgId": "fixture",
+            "announcementTime": int(datetime.fromisoformat(published).timestamp() * 1000),
+            "announcementTitle": "关于认购配套资金的公告", "announcementId": "1225672077",
+        }]}
+
+    def excerpt(url, candidate_code, _name):
+        assert candidate_code == "000100"
+        assert url == "https://static.cninfo.com.cn/finalpage/2026-11-14/1225672077.PDF"
+        return {"body_excerpt_available": True, "excerpt": "证券代码 000100",
+                "content_reviewed": False}
+
+    monkeypatch.setattr("src.services.market_scan_research.datetime", FrozenDatetime)
+    monkeypatch.setattr("src.services.research_evidence._cninfo_json", index_response)
+    monkeypatch.setattr("src.services.market_scan_research.cninfo_announcement_index", cninfo_announcement_index)
+    monkeypatch.setattr("src.services.market_scan_research.announcement_excerpt", excerpt)
+    result = ScanResearchCollector(2)({"code": code, "name": "测试公司"})["announcements"]
+    assert result["query"]["returned_rows"] == 1
+    if expected is None:
+        assert result["status"] == "invalid_payload"
+        assert result["rejected_rows"][0]["published_date"] == published
+        assert result["items"] == []
+    else:
+        assert result["status"] == "partial"
+        assert result["body_excerpt_count"] == 1
+        assert result["items"][0]["publication_precision"] == expected
+        assert result["items"][0]["content_reviewed"] is False
+
+
 def test_dated_valuation_fallback_and_field_provenance(configured, monkeypatch):
     ak, _ = configured
     monkeypatch.setattr(ak, "stock_value_em", lambda **kwargs: pd.DataFrame([
