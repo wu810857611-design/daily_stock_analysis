@@ -2203,7 +2203,7 @@ def test_market_scan_workflow_is_independent_simulation_with_fixed_state_artifac
 
     assert workflow["on"]["schedule"]
     assert any(
-        item.get("cron") == "15 11 * * 1-5"
+        item.get("cron") == "5 11 * * 1-5"
         for item in workflow["on"]["schedule"]
     )
     assert job["env"]["MARKET_SCAN_MODE"] == "simulation_only"

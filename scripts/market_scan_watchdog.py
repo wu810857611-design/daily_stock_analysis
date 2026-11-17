@@ -8,7 +8,7 @@ import json
 import os
 import sys
 import time
-from datetime import date, datetime, time as datetime_time
+from datetime import date, datetime, time as datetime_time, timedelta
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 from urllib import error, parse, request
@@ -28,19 +28,11 @@ from scripts.market_scan_artifact_trust import (  # noqa: E402
     validate_watchdog_market_scan as _trusted_validate_watchdog,
 )
 from scripts.market_scan_calendar import evaluate_market_sessions  # noqa: E402
+from scripts.market_scan_slot_guard import SLOT_WINDOWS  # noqa: E402
 
 
 SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
-SLOT_TIMES = {
-    "morning": (datetime_time(10, 42), datetime_time(11, 15)),
-    "afternoon": (datetime_time(14, 42), datetime_time(15, 15)),
-    "close": (datetime_time(19, 27), datetime_time(21, 0)),
-}
-SLOT_SEARCH_START = {
-    "morning": datetime_time(10, 20),
-    "afternoon": datetime_time(14, 20),
-    "close": datetime_time(19, 5),
-}
+WATCHDOG_GRACE = timedelta(minutes=5)
 
 
 def _parse_datetime(value: str) -> datetime:
@@ -52,7 +44,7 @@ def _parse_datetime(value: str) -> datetime:
 
 def resolve_slot(requested: str, now: datetime) -> str:
     slot = str(requested or "auto").strip().lower()
-    if slot in SLOT_TIMES:
+    if slot in SLOT_WINDOWS:
         return slot
     if slot != "auto":
         raise ValueError(f"unsupported watchdog slot: {slot}")
@@ -60,18 +52,17 @@ def resolve_slot(requested: str, now: datetime) -> str:
 
 
 def target_at(slot: str, now: datetime) -> tuple[datetime, datetime]:
-    target_time, latest_time = SLOT_TIMES[slot]
+    earliest, latest = SLOT_WINDOWS[slot]
     return (
-        datetime.combine(now.date(), target_time, tzinfo=SHANGHAI_TZ),
-        datetime.combine(now.date(), latest_time, tzinfo=SHANGHAI_TZ),
+        datetime.combine(now.date(), earliest, tzinfo=SHANGHAI_TZ) + WATCHDOG_GRACE,
+        datetime.combine(now.date(), latest, tzinfo=SHANGHAI_TZ),
     )
 
 
 def existing_run_covers_slot(
     runs: Sequence[Mapping[str, Any]], *, slot: str, session_date: Any
 ) -> bool:
-    earliest = SLOT_SEARCH_START[slot]
-    latest = SLOT_TIMES[slot][1]
+    earliest, latest = SLOT_WINDOWS[slot]
     for item in runs:
         try:
             created = _parse_datetime(str(item.get("created_at") or ""))
@@ -92,8 +83,7 @@ def existing_run_covers_slot(
 def _runs_for_slot(
     runs: Sequence[Mapping[str, Any]], *, slot: str, session_date: Any
 ) -> list[Mapping[str, Any]]:
-    earliest = SLOT_SEARCH_START[slot]
-    latest = SLOT_TIMES[slot][1]
+    earliest, latest = SLOT_WINDOWS[slot]
     matched: list[Mapping[str, Any]] = []
     for item in runs:
         try:

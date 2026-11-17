@@ -6,7 +6,7 @@ import json
 import io
 import tarfile
 import zipfile
-from datetime import datetime
+from datetime import datetime, time, timedelta
 from pathlib import Path
 from email.message import Message
 from typing import Any, Mapping
@@ -152,22 +152,40 @@ def _market_scan_artifact(payload: Mapping[str, Any], *, member_name: str = "dat
     return outer_buffer.getvalue()
 
 
-def test_schedule_slots_map_to_stable_names() -> None:
-    assert resolve_slot(
-        event_name="schedule",
-        event_schedule="30 2 * * 1-5",
-        requested_slot="auto",
-    ) == "morning"
-    assert resolve_slot(
-        event_name="schedule",
-        event_schedule="30 6 * * 1-5",
-        requested_slot="auto",
-    ) == "afternoon"
-    assert resolve_slot(
-        event_name="schedule",
-        event_schedule="15 11 * * 1-5",
-        requested_slot="auto",
-    ) == "close"
+@pytest.mark.parametrize(("cron", "legacy_cron", "slot", "planned"), [
+    ("20 2 * * 1-5", "30 2 * * 1-5", "morning", time(10, 20)),
+    ("20 6 * * 1-5", "30 6 * * 1-5", "afternoon", time(14, 20)),
+    ("5 11 * * 1-5", "15 11 * * 1-5", "close", time(19, 5)),
+])
+def test_native_schedule_and_watchdog_share_slot_window(cron, legacy_cron, slot, planned) -> None:
+    workflow = yaml.safe_load((ROOT / ".github/workflows/02-market-scan.yml").read_text())
+    assert cron in {item["cron"] for item in workflow[True]["schedule"]}
+    assert all(token in workflow["concurrency"]["group"] for token in (cron, legacy_cron, slot))
+    for expression in (cron, legacy_cron):
+        assert resolve_slot(event_name="schedule", event_schedule=expression, requested_slot="auto") == slot
+
+    opening = datetime.combine(datetime(2026, 11, 17).date(), planned, tzinfo=TZ)
+    now = opening - timedelta(minutes=1)
+    calls = []
+
+    def advance(seconds):
+        nonlocal now
+        now += timedelta(seconds=seconds)
+
+    class GitHub:
+        def recent_runs(self, *_args):
+            return []
+
+        def dispatch(self, _workflow, _ref, selected_slot):
+            calls.append((now, selected_slot))
+
+    result = run_watchdog(
+        slot=slot, now_fn=lambda: now, sleep_fn=advance, client=GitHub(),
+        workflow="02-market-scan.yml", ref="main",
+        session_gate=lambda _now: {"should_run": True},
+    )
+    assert result["status"] == "dispatched"
+    assert calls == [(opening + timedelta(minutes=5), slot)]
 
 
 def test_slot_guard_rejects_late_and_completed_slot(tmp_path: Path) -> None:

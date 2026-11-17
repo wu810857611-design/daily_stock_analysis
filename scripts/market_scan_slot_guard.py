@@ -22,6 +22,10 @@ from scripts.market_scan_calendar import evaluate_market_sessions  # noqa: E402
 
 SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
 SCHEDULE_TO_SLOT = {
+    "20 2 * * 1-5": "morning",
+    "20 6 * * 1-5": "afternoon",
+    "5 11 * * 1-5": "close",
+    # Older scheduled workflow runs can still be queued across a deployment.
     "30 2 * * 1-5": "morning",
     "30 6 * * 1-5": "afternoon",
     "15 11 * * 1-5": "close",
