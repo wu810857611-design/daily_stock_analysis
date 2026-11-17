@@ -2180,13 +2180,18 @@ class SearchService:
         r"|(?:板块|概念).{0,12}(?:行情向好|震荡[上下]行|持续[上下]行|走势活跃)"
         r"|(?:个股|资金).{0,12}(?:排名|榜单|流入榜|流出榜)"
         r"|(?:港股|[AaＡａ]股|美股)\s*(?:早评|午评|收评)"
-        r"|集体(?:上涨|下跌|收涨|收跌|飘红|飘绿|走强|走弱|(?:创|刷新)?(?:历史|阶段|年内)?新[高低])"
+        r"|^\s*(?:(?:\d{4}年)?\d{1,2}月\d{1,2}日\s*)?(?:港股|[AaＡａ]股|美股)\s*(?:早间|午间|午盘)?收盘"
+        r"|(?:集体|双双|齐齐|纷纷)(?:上涨|下跌|[涨跌]停|收涨|收跌|飘红|飘绿|走强|走弱|(?:创|刷新)?(?:历史|阶段|年内)?新[高低])"
         r"|(?:港股|[Aa]股|美股).{0,16}回购潮"
     )
     _MARKET_ROUNDUP_SNIPPET_RE = re.compile(
         r"(?:相关)?概念股(?:有|包括|包含)"
         r"|(?:行业|板块).{0,14}资金(?:净)?流(?:入|出)榜"
         r"|(?:齐创|多股(?:续)?创|等多股(?:续)?创)(?:历史|阶段|年内)?新[高低]"
+    )
+    _LISTING_CODE_IN_TEXT_RE = re.compile(
+        r"(?<![A-Za-z0-9])(?:(?:SH|SZ|BJ)?([034689]\d{5})|HK(\d{5})|(\d{5})\.HK)(?![A-Za-z0-9])",
+        re.IGNORECASE,
     )
     _SUPPLIER_SUBJECT_TITLE_RE = re.compile(r"背后(?:的)?(?:代工厂|供应商)")
     _MAINLAND_LISTING_RE = re.compile(r"[AaＡａ]股")
@@ -2197,7 +2202,8 @@ class SearchService:
     )
     _ISSUER_EVENT_AFTER_NAME = (
         r"(?:公告(?:称|显示)|披露|宣布|发布(?:公告|财报|业绩|年报|季报)|"
-        r"回购(?!潮|队伍)|增持|减持|回应|召开|举行|签署|获批|中标|收购|被罚|被处罚|分红)"
+        r"回购(?!潮|队伍)|增持|减持|回应|召开|举行|签署|获批|中标|收购|被罚|被处罚|分红|"
+        r"承诺(?:认购|出资)|(?:控股)?子公司[^，。；;\n、]{0,12}开业)"
     )
     _MACRO_NEWS_TERMS = (
         "大盘", "市场", "指数", "宏观", "央行", "利率", "通胀", "a股", "港股",
@@ -3028,9 +3034,17 @@ class SearchService:
     ) -> str:
         """Require issuer-specific evidence when a name hit has competing context."""
         text = f"{title}\n{snippet}"
+        quote_in_title = bool(cls._QUOTE_MOVE_RE.search(title))
+        # A list of distinct exchange codes paired with a price move is a
+        # market roundup even when the headline omits the sector name.
+        multiple_listings = quote_in_title and len({
+            mainland or hk_prefix or hk_suffix
+            for mainland, hk_prefix, hk_suffix in cls._LISTING_CODE_IN_TEXT_RE.findall(title)
+        }) > 1
         roundup = bool(
             cls._MARKET_ROUNDUP_TITLE_RE.search(title)
             or cls._MARKET_ROUNDUP_SNIPPET_RE.search(snippet)
+            or multiple_listings
         )
         supplier_subject = bool(cls._SUPPLIER_SUBJECT_TITLE_RE.search(title))
         codes = cls._stock_code_identity_terms(stock_code)
@@ -3045,7 +3059,7 @@ class SearchService:
             )
         parent_group = parent_pattern is not None and bool(parent_pattern.search(text))
         listing_rejection = ""
-        if cls._QUOTE_MOVE_RE.search(title):
+        if quote_in_title:
             canonical = canonicalize_foreign_stock_code(stock_code)
             is_hk = bool(re.fullmatch(r"\d{5}|HK\d{1,5}", canonical)) or (
                 canonical.isdigit() and stock_code.strip().upper().endswith(".HK")
@@ -3086,7 +3100,7 @@ class SearchService:
         if subjects:
             event = re.compile(
                 r"(?:" + "|".join(subjects) + r")\s*(?:股份有限公司|有限责任公司|有限公司)?\s*"
-                r"(?:[（(]\s*[\w.]+\s*[）)])?\s*[:：,，]?\s*"
+                r"(?:[（(][^）)\n]{1,60}[）)])?\s*[:：,，]?\s*"
                 r"(?:(?:近日|今日|昨日|年内|今年|已|拟|将)\s*)*"
                 + cls._ISSUER_EVENT_AFTER_NAME,
                 re.IGNORECASE,
