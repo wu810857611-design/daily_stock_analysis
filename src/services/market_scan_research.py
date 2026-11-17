@@ -9,7 +9,7 @@ import copy
 import json
 import math
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time as wall_time, timedelta, timezone
 from typing import Any, Callable, Mapping
 from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
@@ -271,6 +271,7 @@ class ScanResearchCollector:
             announcements["query"] = index["query"]
             items = []
             invalid_rows = 0
+            earliest = now - timedelta(days=config.news_max_age_days)
             for row in index["rows"]:
                 url = str(row.get("公告链接") or "")
                 host = (urlparse(url).hostname or "").lower()
@@ -279,16 +280,25 @@ class ScanResearchCollector:
                     published = datetime.fromisoformat(date.replace("Z", "+00:00")) if date else None
                 except ValueError:
                     published = None
-                if published is not None and published.tzinfo is None:
-                    published = published.replace(tzinfo=ZoneInfo("Asia/Shanghai"))
+                date_only = False
+                in_window = False
+                if published is not None:
+                    published = (published.replace(tzinfo=now.tzinfo) if published.tzinfo is None
+                                 else published.astimezone(now.tzinfo))
+                    # Mainland CNINFO indices use local midnight for date-only
+                    # rows. Match the calendar-date range sent to the index.
+                    date_only = not offshore and published.time() == wall_time.min
+                    if date_only:
+                        in_window = earliest.date() <= published.date() <= now.date()
+                    else:
+                        in_window = earliest <= published <= datetime.now(now.tzinfo)
                 identity = str(row.get("代码") or "").strip().zfill(5 if code.startswith("HK") else 6)
                 reason = ""
                 if identity != target or str(row.get("orgId") or "") != org_id:
                     reason = "identity_mismatch"
                 elif (not row.get("公告标题")
                         or host not in {"www.cninfo.com.cn", "static.cninfo.com.cn", "www.hkexnews.hk"}
-                        or urlparse(url).scheme not in {"http", "https"} or published is None
-                        or not now - timedelta(days=config.news_max_age_days) <= published <= datetime.now(now.tzinfo)):
+                        or urlparse(url).scheme not in {"http", "https"} or not in_window):
                     reason = "invalid_title_source_or_date"
                 if reason:
                     invalid_rows += 1
@@ -296,8 +306,11 @@ class ScanResearchCollector:
                         announcements["rejected_rows"].append({"reason": reason, "code": identity,
                             "title": str(row.get("公告标题") or "")[:300], "url": url[:1000], "published_date": date[:100]})
                     continue
-                items.append({"title": str(row["公告标题"]), "url": url,
-                              "published_date": published.isoformat(), "source": "cninfo"})
+                item = {"title": str(row["公告标题"]), "url": url,
+                        "published_date": published.isoformat(), "source": "cninfo"}
+                if date_only:
+                    item["publication_precision"] = "date"
+                items.append(item)
             announcements.update(status="partial" if items else "no_results", items=items[:3])
             # At most one document per candidate; preserve an index if its
             # body is inaccessible, and never claim an excerpt is full review.
