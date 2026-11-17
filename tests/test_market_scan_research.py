@@ -813,6 +813,8 @@ def test_conflicting_exact_issuer_is_not_bypassed_by_map_fallback(configured, mo
     # Titles from 2026-11-17 production archives, with issuer/market facts retained.
     ("002843", "泰嘉股份", "逆市拉升！000521、002843双双涨停",
      "家电板块反复活跃，泰嘉股份直线拉涨停。消息面上，美的集团持续推进股份回购。", False),
+    ("002843", "泰嘉股份", "泰嘉股份、长虹美菱双双涨停",
+     "家电板块盘中异动，泰嘉股份和长虹美菱涨停。", False),
     ("002035", "华帝股份", "7000亿龙头，历史新高！000521、002035，直线涨停",
      "早盘家电板块异动，长虹美菱（000521）、华帝股份（002035）涨停打开。", False),
     ("002035", "华帝股份", "11月16日A股午间收盘：创业板指半日下挫超2% 多只银行股创历史新高",
@@ -829,6 +831,8 @@ def test_conflicting_exact_issuer_is_not_bypassed_by_map_fallback(configured, mo
      "建设银行（00939.HK）股价上扬，北京银行公布年度分红。", False),
     ("HK00939", "建设银行", "HK00939（00939.HK）午后走强",
      "建设银行（00939.HK）股价上扬。", True),
+    ("HK00939", "建设银行", "建设银行港股收盘股价上涨3%",
+     "建设银行（00939.HK）股价上涨3%。", True),
 ])
 def test_market_scan_roundup_mentions_do_not_fill_direct_news(
     configured, monkeypatch, code, name, title, snippet, direct,
