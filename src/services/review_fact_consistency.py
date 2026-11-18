@@ -11,6 +11,8 @@ import re
 from datetime import date
 from typing import Any, Mapping
 
+from src.services.review_buyback_prices import buyback_price_errors, buyback_price_evidence
+
 
 def numeric_facts(candidate: Mapping[str, Any]) -> dict:
     result = {}
@@ -40,10 +42,16 @@ def fact_contract(candidate: Mapping[str, Any]) -> dict:
             continue
         unit = "%" if field == "change_pct" else currency if field in {"price", "amount"} else "倍"
         rendered.append(f"{labels[field]} {value:g}{unit}")
-    return {"values": values,
-            "nullable_missing_fields": [field for field in ("pe", "pb") if field not in values],
-            "units": {"price": currency, "amount": currency, "change_pct": "percentage_points", "pe": "multiple", "pb": "multiple"},
-            "rendered": "；".join(rendered)}
+    contract = {
+        "values": values,
+        "nullable_missing_fields": [field for field in ("pe", "pb") if field not in values],
+        "units": {"price": currency, "amount": currency, "change_pct": "percentage_points", "pe": "multiple", "pb": "multiple"},
+        "rendered": "；".join(rendered),
+    }
+    prices = buyback_price_evidence(candidate)
+    if prices:
+        contract["buyback_prices"] = prices
+    return contract
 
 
 def _matches(field: str, expected: Any, observed: Any) -> bool:
@@ -144,7 +152,11 @@ def validate_review_facts(review: Mapping[str, Any], candidate: Mapping[str, Any
         values = review.get(key) or []
         texts.extend((key, value) for value in
                      ([values] if isinstance(values, str) else [str(value) for value in values]))
+    buyback_prices = buyback_price_evidence(candidate)
+    facts = candidate.get("facts")
+    as_of = str(facts.get("as_of") or facts.get("snapshot_fetched_at") or "") if isinstance(facts, Mapping) else ""
     for text_field, text in texts:
+        errors.extend(buyback_price_errors(text, text_field, buyback_prices, as_of))
         for field, pattern in _CLAIMS.items():
             for match in re.finditer(pattern, text, flags=re.IGNORECASE):
                 literal = match.group("number") if field == "change_pct" else match.group(1)
