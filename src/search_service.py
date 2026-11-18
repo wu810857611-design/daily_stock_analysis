@@ -2176,7 +2176,7 @@ class SearchService:
     )
     _MARKET_ROUNDUP_TITLE_RE = re.compile(
         r"强势股追踪|主力资金.{0,18}(?:净流入|净流出).{0,5}\d+\s*只?股"
-        r"|(?:行业|板块|概念|指数).{0,12}(?:盘中|走强|走弱|拉升|领涨|领跌|集体|[涨跌]\s*\d|资金流向|排名|榜单)"
+        r"|(?:行业|产业链|板块|概念|指数).{0,12}(?:盘中|走强|走弱|拉升|领涨|领跌|集体|[涨跌]\s*\d|资金流向|排名|榜单)"
         r"|(?:板块|概念).{0,12}(?:行情向好|震荡[上下]行|持续[上下]行|走势活跃)"
         r"|(?:个股|资金).{0,12}(?:排名|榜单|流入榜|流出榜)"
         r"|(?:港股|[AaＡａ]股|美股)\s*(?:早评|午评|收评)"
@@ -2186,9 +2186,13 @@ class SearchService:
     )
     _MARKET_ROUNDUP_SNIPPET_RE = re.compile(
         r"(?:相关)?概念股(?:有|包括|包含)"
+        r"|(?:成[份分]股|板块多股|多只个股)\s*(?:多数|普遍|集体|同步)?(?:上涨|下跌|[涨跌]停|走强|走弱)"
         r"|(?:行业|板块).{0,14}资金(?:净)?流(?:入|出)榜"
         r"|(?:齐创|多股(?:续)?创|等多股(?:续)?创)(?:历史|阶段|年内)?新[高低]"
     )
+    # Lists clipped by news search can retain just one stock row. Column
+    # headings and an explicit ranking still identify the scope of that row.
+    _RANKING_COLUMNS_RE = re.compile(r"(?:证券|股票)代码\s*(?:证券|股票)(?:简称|名称)")
     _LISTING_CODE_IN_TEXT_RE = re.compile(
         r"(?<![A-Za-z0-9])(?:(?:SH|SZ|BJ)?([034689]\d{5})|HK(\d{5})|(\d{5})\.HK)(?![A-Za-z0-9])",
         re.IGNORECASE,
@@ -3035,16 +3039,23 @@ class SearchService:
         """Require issuer-specific evidence when a name hit has competing context."""
         text = f"{title}\n{snippet}"
         quote_in_title = bool(cls._QUOTE_MOVE_RE.search(title))
-        # A list of distinct exchange codes paired with a price move is a
-        # market roundup even when the headline omits the sector name.
-        multiple_listings = quote_in_title and len({
-            mainland or hk_prefix or hk_suffix
-            for mainland, hk_prefix, hk_suffix in cls._LISTING_CODE_IN_TEXT_RE.findall(title)
-        }) > 1
+        # Keep distinct codes in the same price-move sentence. A separate
+        # article paragraph mentioning a peer need not change the subject.
+        quote_list = any(
+            cls._QUOTE_MOVE_RE.search(part) and len({
+                mainland or hk_prefix or hk_suffix
+                for mainland, hk_prefix, hk_suffix in cls._LISTING_CODE_IN_TEXT_RE.findall(part)
+            }) > 1
+            for part in (title, *re.split(r"[。！？!?\n]", snippet))
+        )
+        ranking_table = (
+            cls._RANKING_COLUMNS_RE.search(snippet)
+            and re.search(r"排名|排行|榜单|\d+\s*只(?:个?股|股票)", text)
+        )
         roundup = bool(
             cls._MARKET_ROUNDUP_TITLE_RE.search(title)
             or cls._MARKET_ROUNDUP_SNIPPET_RE.search(snippet)
-            or multiple_listings
+            or ranking_table or quote_list
         )
         supplier_subject = bool(cls._SUPPLIER_SUBJECT_TITLE_RE.search(title))
         codes = cls._stock_code_identity_terms(stock_code)
