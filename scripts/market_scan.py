@@ -127,6 +127,7 @@ MARKET_SCAN_REVIEW_SYSTEM_PROMPT = """
 3. view：审慎观点，需说明短线、波段、中线和长线的数据边界。
 
 输入 numeric_fact_contract 由程序生成：change_pct 单位是百分数的百分点，0.27972 表示0.27972%，绝不能乘100；price/amount单位依currency为CNY或HKD。
+引用已执行回购的具体价格时，按 buyback_prices 对齐日期、币种及 low（最低）、high（最高）、average（均价）。仅引用有依据的角色；缺区间端点时可只写回购事项，不可用均价补齐。
 每条review必须返回 numeric_facts，逐字段复述契约values（缺失值不得补造），并核对自己的facts、推断和风险描述没有数字或币种矛盾。
 values中未提供的PE/PB应省略；仅nullable_missing_fields列出的缺失PE/PB可回传null，绝不能填0或猜测数字。numeric_facts须保留原始数值精度；文字摘要可按实际显示位数舍入，可使用科学计数法，但不得改变方向、单位或币种。
 历史公告或其他来源的估值与当前numeric_fact_contract冲突时，不得用历史数字覆盖快照，
@@ -389,13 +390,23 @@ def _review_retry_feedback(
         errors = numeric_errors.get(code)
         if not isinstance(errors, list):
             continue
-        values = fact_contract(candidate)["values"]
+        contract = fact_contract(candidate)
+        values = contract["values"]
         hints = []
         for error in errors[:8]:
             if not isinstance(error, Mapping):
                 continue
             field = error.get("field")
             kind = error.get("error")
+            if field in {"buyback_low", "buyback_high", "buyback_average"} and kind in {
+                "buyback_price_mismatch", "unsupported_buyback_price",
+            }:
+                # Only program-derived price/date/currency, never the model's prose.
+                source = next((record for record in contract.get("buyback_prices", [])
+                               if record["date"] == error.get("date") and record["currency"] == error.get("currency")), {})
+                hints.append({"field": field, "error": kind, "expected": source.get(field.removeprefix("buyback_")),
+                              "date": source.get("date"), "currency": source.get("currency")})
+                continue
             if field not in {"numeric_facts", "price", "change_pct", "amount", "pe", "pb", "currency"}:
                 continue
             if kind not in {"missing_or_invalid", "structured_mismatch", "unsupported_numeric_fact",
