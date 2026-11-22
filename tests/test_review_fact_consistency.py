@@ -493,3 +493,46 @@ def test_service_keeps_multiday_risk_without_upgrading_consensus(tmp_path):
             assert checked['numeric_consistency']['status'] == 'checked'
             assert checked['verdict'] == 'watch' and checked['hard_risk']
             assert checked['risks'] == [risk]
+
+
+def test_dated_announcement_pe_checks_the_issuer_value_and_today_separately():
+    item = {"source": "cninfo", "body_excerpt_available": True, "published_date": "2026-11-17",
+            "excerpt": "证券代码：000819 证券简称：岳阳兴长。公司股票价格短期波动较大，动态市盈率处于184.53倍的较高水平。"}
+    candidate = {"code": "000819", "name": "岳阳兴长", "pe": 6852.95,
+                 "facts": {"snapshot_fetched_at": "2026-11-19T14:26:31+08:00"},
+                 "research_evidence": {"announcements": {"items": [item]}}}
+    quote = "公司2026-11-17异常波动公告明确提示动态市盈率184.53倍，与快照PE 6852.95倍口径不同"
+    def errors(text):
+        return validate_review_facts({"facts": [text], "numeric_facts": numeric_facts(candidate)}, candidate)
+    assert not errors(quote)
+    assert errors(quote.replace("184.53", "6852.95"))[0]["expected"] == 184.53
+    assert errors(quote.replace("快照PE 6852.95", "快照PE 184.53"))
+    assert errors(quote.replace("11-17", "11-16"))
+    assert errors(quote.replace("动态市盈率", "同行动态市盈率"))
+    item["excerpt"] = item["excerpt"].replace("000819", "000820")
+    assert errors(quote)
+
+
+def test_dated_trade_disclosure_checks_turnover_for_that_session():
+    item = {"published_date": "2026-11-18", "title": "安泰集团600408龙虎榜数据(11-18",
+            "snippet": "交易所2026年11月18日公布的交易公开信息显示，安泰集团上榜。安泰集团当日收报3.71元，成交额8.78亿。"}
+    candidate = {"code": "600408", "name": "安泰集团", "amount": 701220000,
+                 "facts": {"snapshot_fetched_at": "2026-11-20T10:27:21+08:00"},
+                 "research_evidence": {"announcements_and_news": {"items": [item]}}}
+    quote = "11月18日因高换手登龙虎榜，当日换手率23.23%、成交额8.78亿"
+    def errors(text):
+        return validate_review_facts({"risks": [text]}, candidate)
+    assert not errors(quote)
+    assert errors(quote.replace("8.78亿", "7.0122亿"))[0]["error"] == "dated_claim_mismatch"
+    assert errors(quote + "，今天成交额8.78亿")
+    assert errors(quote.replace("8.78亿", "8.78亿港元"))
+    assert errors(quote.replace("18日", "17日"))
+    item["title"] = "多股龙虎榜排名"
+    assert errors(quote)
+
+
+def test_valuation_source_label_cannot_hide_a_wrong_snapshot_multiple():
+    risk = "PE/PB为2026-11-19百度口径研究估值，与快照非同一时点"
+    candidate = {"code": "HK06690", "pb": 1.45}
+    assert not validate_review_facts({"risks": [risk]}, candidate)
+    assert validate_review_facts({"risks": [risk + "，当前PB为2026倍"]}, candidate)
