@@ -26,7 +26,7 @@ import tempfile
 import threading
 import time
 from dataclasses import dataclass, field
-from datetime import date, datetime, time as wall_time, timezone
+from datetime import date, datetime, time as wall_time, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 from zoneinfo import ZoneInfo
@@ -571,6 +571,22 @@ def _normalise_snapshot(frame: pd.DataFrame, *, market: str, now: datetime) -> p
     normalised = normalised[normalised["code"].astype(bool)]
     normalised = normalised.drop_duplicates(subset=["code"], keep="first")
     return normalised.reset_index(drop=True)
+
+
+def _hk_rows_for_session(frame: pd.DataFrame, now: datetime, fetched_at: Any) -> pd.DataFrame:
+    """After the close auction, require a post-auction fetch and closing-session quote time."""
+    local = now.astimezone(SHANGHAI_TZ)
+    auction_end = local.replace(hour=16, minute=10, second=0, microsecond=0)
+    if local < auction_end or frame.empty:
+        return frame
+    fetched = _parse_datetime(fetched_at)
+    if fetched is None or not auction_end <= fetched <= local + timedelta(seconds=30):
+        return frame.iloc[:0]
+    if "provider_timestamp" not in frame:
+        return frame.iloc[:0]
+    close_start = auction_end.replace(minute=0)
+    stamps = pd.to_datetime(frame["provider_timestamp"].fillna("").map(_parse_datetime), utc=True)
+    return frame.loc[stamps.between(close_start, fetched + timedelta(seconds=30))]
 
 
 def _hk_snapshot_coverage(frame: pd.DataFrame, membership_codes: set[str]) -> Dict[str, Any]:
@@ -1643,6 +1659,9 @@ class MarketScanService:
             membership_codes = set(hk_metadata.get("membership_codes") or [])
             if membership_codes:
                 hk_frame = hk_frame[hk_frame["code"].isin(membership_codes)].copy()
+                membership_frame = hk_frame
+                if "cache_age_hours" in hk_metadata:
+                    hk_frame = _hk_rows_for_session(hk_frame, now, hk_metadata.get("fetched_at"))
                 hk_coverage = _hk_snapshot_coverage(hk_frame, membership_codes)
                 missing = hk_coverage["missing_codes"]
                 if (
@@ -1650,14 +1669,14 @@ class MarketScanService:
                     and now.astimezone(SHANGHAI_TZ).time() >= wall_time(16, 10)
                 ):
                     recovered, hk_daily_recovery = self._recover_hk_close_daily(
-                        missing, hk_frame, now
+                        missing, membership_frame, now
                     )
                     hk_daily_recovery["initial_covered_count"] = hk_coverage["covered_count"]
                     if not recovered.empty:
                         if hk_frame.empty:
                             hk_frame = recovered
                             hk_metadata.update(
-                                source=HK_CLOSE_DAILY_SOURCE,
+                                source=HK_CLOSE_DAILY_SOURCE, as_of="",
                                 fetched_at=_iso_datetime(self.clock()),
                             )
                         else:
@@ -1865,6 +1884,8 @@ class MarketScanService:
 
         selected_at = self.clock().astimezone(SHANGHAI_TZ)
         trade_date = now.astimezone(SHANGHAI_TZ).date()
+        if selected_at.time() >= wall_time(16, 10):
+            extra = _hk_rows_for_session(extra, selected_at, metadata["fetched_at"])
         provider_times = extra["provider_timestamp"].map(_parse_datetime)
         fresh = provider_times.map(
             lambda stamp: pd.notna(stamp) and stamp.astimezone(SHANGHAI_TZ).date() == trade_date
@@ -1926,10 +1947,13 @@ class MarketScanService:
                     "provider_errors": list(metadata.get("provider_errors") or []),
                     "is_connect_universe": True,
                     "membership_codes": sorted(set(frame["code"].astype(str))),
-                    "records": frame.to_dict(orient="records"),
                 }
-                _atomic_write_json(self.config.hk_cache_path, cache_payload)
                 self._write_hk_membership_cache(cache_payload)
+                frame = _hk_rows_for_session(frame, self.clock(), metadata["fetched_at"])
+                if frame.empty:
+                    raise MarketScanError("no verified closing-session HK quotes")
+                cache_payload["records"] = frame.to_dict(orient="records")
+                _atomic_write_json(self.config.hk_cache_path, cache_payload)
                 metadata["source"] = cache_payload["source"]
                 metadata["provider_errors"] = cache_payload["provider_errors"]
                 metadata["membership_codes"] = cache_payload["membership_codes"]
@@ -1973,6 +1997,7 @@ class MarketScanService:
                         )
                     frame = _normalise_snapshot(frame_raw, market=MARKET_HK, now=now)
                     frame = frame[frame["code"].isin(membership_codes)].copy()
+                    frame = _hk_rows_for_session(frame, self.clock(), metadata["fetched_at"])
                     if frame.empty:
                         raise MarketScanError(
                             "HK membership quote fallback returned no fresh constituents"
@@ -2063,6 +2088,7 @@ class MarketScanService:
                         raise MarketScanError("HK quote fallback did not prove full-market coverage")
                     frame = _normalise_snapshot(frame_raw, market=MARKET_HK, now=now)
                     frame = frame[frame["code"].isin(membership_codes)].copy()
+                    frame = _hk_rows_for_session(frame, self.clock(), metadata["fetched_at"])
                     if frame.empty:
                         raise MarketScanError(
                             "HK quote fallback had no overlap with cached Connect membership"
