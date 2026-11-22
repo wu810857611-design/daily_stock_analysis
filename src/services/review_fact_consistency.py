@@ -11,6 +11,7 @@ import re
 from datetime import date
 from typing import Any, Mapping
 
+from src.services.market_scan_research import has_announcement_excerpt
 from src.services.review_buyback_prices import buyback_price_errors, buyback_price_evidence
 
 
@@ -131,6 +132,76 @@ def _prose_matches(field: str, expected: float, observed: float, literal: str,
                         abs_tol=max(base, rounding) + 1e-12)
 
 
+# Only admit source-specific figures with an identifiable issuer, date and unit.
+# These values never replace numeric_facts in the required snapshot echo.
+def _dated_evidence(candidate: Mapping[str, Any]) -> dict:
+    facts = candidate.get("facts") or {}
+    research = candidate.get("research_evidence") or {}
+    if not isinstance(facts, Mapping) or not isinstance(research, Mapping):
+        return {}
+    cutoff = str(facts.get("snapshot_fetched_at") or facts.get("as_of") or "")[:10]
+    code = str(candidate.get("code") or "")
+    name = str(candidate.get("name") or "")
+    if not re.fullmatch(r"\d{6}", code) or not name or not cutoff:
+        return {}
+    records = {}
+    for block, field in (("announcements", "pe"), ("announcements_and_news", "amount")):
+        section = research.get(block)
+        if not isinstance(section, Mapping):
+            continue
+        for item in section.get("items") or []:
+            if not isinstance(item, Mapping):
+                continue
+            try:
+                day = date.fromisoformat(str(item.get("published_date") or "")[:10])
+            except ValueError:
+                continue
+            if day.isoformat() >= cutoff:
+                continue
+            if field == "pe":
+                body = re.sub(r"\s+", "", str(item.get("excerpt") or ""))
+                if not (has_announcement_excerpt(item) and re.search(rf"证券代码[:：]{code}(?!\d)", body)
+                        and name in body and item.get("source") == "cninfo"):
+                    continue
+                values = re.findall(r"(?:本公司|公司股票价格)[^。；]{0,48}?[，,]动态市盈率(?:处于|为)"
+                                    r"(\d+(?:\.\d+)?)倍", body)
+                amounts = [float(v) for v in values]
+            else:
+                title = str(item.get("title") or "")
+                if not title.startswith(f"{name}{code}龙虎榜数据"):
+                    continue
+                snippet = str(item.get("snippet") or "")
+                if f"交易所{day.year}年{day.month}月{day.day}日公布" not in snippet:
+                    continue
+                values = re.findall(re.escape(name) + r"当日收报[^。；]{0,100}?成交额(\d+(?:\.\d+)?)(亿|万)元?", snippet)
+                amounts = [float(v) * (1e8 if unit == "亿" else 1e4) for v, unit in values]
+            if amounts:
+                records.setdefault((field, day), set()).update(amounts)
+    return records
+
+
+def _dated_values(field: str, prefix: str, records: dict) -> set[float] | None:
+    """None denotes a snapshot claim; a dated claim needs one unambiguous source value."""
+    if field not in {"pe", "amount"}:
+        return None
+    clause = re.split(r"[。！？\n]", prefix)[-1]
+    if field == "pe":
+        scope = re.search(r"(\d{4}-\d{2}-\d{2})(?:公司发布[^，；]{0,18}|异常波动)?公告"
+                          r"[^。！？]{0,85}动态$", clause)
+    else:
+        scope = re.search(r"(?<![\d-])((?:\d{4}-)?\d{1,2}[-月]\d{1,2})日?"
+                          r"(?:因[^。；、，,]{1,16}[上登]龙虎榜|[上登]龙虎榜|涨停|收报|收盘)[^。；]{0,48}$", clause)
+    if not scope or re.search(r"当前|今日|今天|最新|快照|同行|行业|同业|板块|市场整体|另一|其他公司", scope[0]):
+        return None
+    token = scope[1].replace("月", "-")
+    parts = tuple(int(part) for part in token.split("-"))
+    values = set()
+    for (kind, day), numbers in records.items():
+        if kind == field and (day.year, day.month, day.day)[-len(parts):] == parts:
+            values.update(numbers)
+    return values
+
+
 def validate_review_facts(review: Mapping[str, Any], candidate: Mapping[str, Any], *, require_echo: bool = False) -> list[dict]:
     expected = numeric_facts(candidate)
     errors = []
@@ -152,6 +223,7 @@ def validate_review_facts(review: Mapping[str, Any], candidate: Mapping[str, Any
         values = review.get(key) or []
         texts.extend((key, value) for value in
                      ([values] if isinstance(values, str) else [str(value) for value in values]))
+    dated = _dated_evidence(candidate)
     buyback_prices = buyback_price_evidence(candidate)
     facts = candidate.get("facts")
     as_of = str(facts.get("as_of") or facts.get("snapshot_fetched_at") or "") if isinstance(facts, Mapping) else ""
@@ -179,7 +251,7 @@ def validate_review_facts(review: Mapping[str, Any], candidate: Mapping[str, Any
                     continue
                 if field in {"pe", "pb"}:
                     research_date = re.match(
-                        r"(\d{4}-\d{2}-\d{2})\s*(?:研究|估值)(?:口径|日期|时点)",
+                        r"(\d{4}-\d{2}-\d{2})\s*(?:[A-Za-z\u4e00-\u9fff]{2,12}口径研究估值|(?:研究|估值)(?:口径|日期|时点))",
                         text[match.start(1):match.start(1) + 32],
                     )
                     if research_date and literal == research_date.group(1)[:4]:
@@ -208,7 +280,14 @@ def validate_review_facts(review: Mapping[str, Any], candidate: Mapping[str, Any
                     # echoes and any absolute amount claims still get checked.
                     continue
                 value = float(literal.replace(",", ""))
-                if field not in expected:
+                sourced = _dated_values(field, text[context_start:match.start()], dated)
+                if sourced is not None and len(sourced) != 1:
+                    errors.append({"field": field, "error": "unsupported_dated_claim",
+                                   "claim": match.group(0), **context})
+                    continue
+                dated_value = next(iter(sourced)) if sourced else None
+                reference = dated_value if dated_value is not None else expected.get(field)
+                if reference is None:
                     errors.append({"field": field, "observed": value,
                                    "error": "unsupported_snapshot_claim", "claim": match.group(0), **context})
                     continue
@@ -223,10 +302,10 @@ def validate_review_facts(review: Mapping[str, Any], candidate: Mapping[str, Any
                 if field == "amount":
                     multiplier = {"亿": 1e8, "万": 1e4}.get(match.group(2), 1)
                     value *= multiplier
-                    valid = _prose_matches(field, expected[field], value, literal, multiplier)
+                    valid = _prose_matches(field, reference, value, literal, multiplier)
                     currency = match.group(3)
                 else:
-                    valid = _prose_matches(field, expected[field], value, literal)
+                    valid = _prose_matches(field, reference, value, literal)
                     currency = match.group(2) if field == "price" else None
                 if field == "change_pct" and direction:
                     if direction * expected[field] < 0 or (direction > 0 and value < 0):
@@ -236,6 +315,6 @@ def validate_review_facts(review: Mapping[str, Any], candidate: Mapping[str, Any
                     if currency != expected.get("currency"):
                         valid = False
                 if not valid:
-                    errors.append({"field": field, "expected": expected[field], "observed": value,
-                                   "error": "snapshot_claim_mismatch", "claim": match.group(0), **context})
+                    errors.append({"field": field, "expected": reference, "observed": value,
+                                   "error": "dated_claim_mismatch" if dated_value is not None else "snapshot_claim_mismatch", "claim": match.group(0), **context})
     return errors

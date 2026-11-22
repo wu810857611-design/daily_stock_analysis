@@ -407,6 +407,9 @@ def _review_retry_feedback(
                 hints.append({"field": field, "error": kind, "expected": source.get(field.removeprefix("buyback_")),
                               "date": source.get("date"), "currency": source.get("currency")})
                 continue
+            if kind in {"dated_claim_mismatch", "unsupported_dated_claim"} and field in {"pe", "amount"}:
+                hints.append({"field": field, "error": kind, "expected": error.get("expected")})
+                continue
             if field not in {"numeric_facts", "price", "change_pct", "amount", "pe", "pb", "currency"}:
                 continue
             if kind not in {"missing_or_invalid", "structured_mismatch", "unsupported_numeric_fact",
