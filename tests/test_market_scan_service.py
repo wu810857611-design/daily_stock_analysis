@@ -3192,7 +3192,8 @@ def test_partial_connect_fallback_degrades_and_keeps_a_share_actionable(tmp_path
 )
 def test_hk_close_backfill_requires_dated_usable_bar(tmp_path, day_offset, amount, expected_status, outcome):
     _service(tmp_path, qwen=None, deepseek=None).run_l1()
-    available = _hk_snapshot(include_non_connect=False)["records"][0]
+    available = dict(_hk_snapshot(include_non_connect=False)["records"][0],
+                     provider_timestamp=NOW.replace(hour=16, minute=8).isoformat())
     close_time = NOW.replace(hour=19)
 
     def daily(code, trade_date):
@@ -3245,7 +3246,8 @@ def test_hk_daily_provider_is_close_only_and_requests_unadjusted_session(
 
     monkeypatch.setitem(sys.modules, "akshare", SimpleNamespace(**({api_name: fake_hist} if api_name else {})))
     _service(tmp_path, qwen=None, deepseek=None).run_l1()
-    available = _hk_snapshot(include_non_connect=False)["records"][0]
+    available = dict(_hk_snapshot(include_non_connect=False)["records"][0],
+                     provider_timestamp=NOW.replace(hour=16, minute=8).isoformat())
     service = _service(
         tmp_path, qwen=ReviewRecorder(), deepseek=ReviewRecorder(),
         hk_loader=lambda: (_ for _ in ()).throw(TimeoutError("connect endpoint unavailable")),
@@ -3264,7 +3266,8 @@ def test_hk_daily_recovery_respects_budget_and_reaps_hung_request(tmp_path, monk
 
     monkeypatch.setattr(market_scan_service_module, "HK_CLOSE_DAILY_BUDGET_SECONDS", 0.15)
     _service(tmp_path, qwen=None, deepseek=None).run_l1()
-    available = _hk_snapshot(include_non_connect=False)["records"][0]
+    available = dict(_hk_snapshot(include_non_connect=False)["records"][0],
+                     provider_timestamp=NOW.replace(hour=16, minute=8).isoformat())
     service = _service(
         tmp_path, qwen=ReviewRecorder(), deepseek=ReviewRecorder(),
         hk_loader=lambda: (_ for _ in ()).throw(TimeoutError("connect endpoint unavailable")),
@@ -3278,3 +3281,45 @@ def test_hk_daily_recovery_respects_budget_and_reaps_hung_request(tmp_path, monk
     assert result.diagnostics["hk_close_daily_recovery"]["attempts"] == {"HK00981": "TimeoutError"}
     assert result.diagnostics["hk_snapshot_coverage"]["missing_codes"] == ["HK00981"]
     assert not multiprocessing.active_children()
+
+
+@pytest.mark.parametrize("stamped", [False, True])
+def test_complete_afternoon_hk_cache_requires_same_day_closes(tmp_path, stamped):
+    afternoon = NOW.replace(hour=14, minute=27)
+    rows = _hk_snapshot(include_non_connect=False)["records"]
+    rows[0].update({"代码": "06166", "名称": "剑桥科技", "最新价": 54.75})
+    if stamped:
+        for record in rows:
+            record["provider_timestamp"] = afternoon.isoformat()
+    seed = _service(tmp_path, qwen=None, deepseek=None, clock=lambda: afternoon,
+                    hk_loader=lambda: {"is_connect_universe": True, "records": rows})
+    assert seed.run_l1().diagnostics["hk_snapshot_coverage"]["covered_count"] == 2
+
+    def unavailable():
+        raise TimeoutError("quote feed unavailable")
+
+    close = _service(tmp_path, qwen=ReviewRecorder(), deepseek=ReviewRecorder(),
+                     clock=lambda: afternoon.replace(hour=19), hk_loader=unavailable)
+    blocked = close.run()
+    assert blocked["diagnostics"]["hk_snapshot_coverage"]["covered_count"] == 0
+    assert blocked["market_operational_status"][MARKET_HK] != "healthy"
+    assert not any(c["market"] == MARKET_HK for c in blocked["candidates"])
+
+    def daily(code, day):
+        return pd.DataFrame([{"日期": day, "收盘": 53.85 if code == "HK06166" else 100,
+                              "涨跌幅": 2, "成交量": 900_000, "成交额": 650_000_000}])
+    close.hk_close_daily_loader = daily
+    l1 = close.run_l1()
+    assert l1.diagnostics["hk_snapshot_coverage"]["covered_count"] == 2
+    recovered = l1.diagnostics["hk_close_daily_recovery"]["recovered"]["HK06166"]
+    assert (recovered["price"], recovered["name"]) == (53.85, "剑桥科技")
+
+
+def test_close_quote_row_times_cannot_be_replaced_by_batch_fetch_time():
+    close = NOW.replace(hour=19)
+    timestamps = ["2026-07-28T16:08:04+08:00", "2026-07-28T14:27:38+08:00",
+                  None, "2026-07-27T16:10:00+08:00", "2026-07-29T16:10:00+08:00"]
+    rows = pd.DataFrame({"provider_timestamp": timestamps})
+    eligible = market_scan_service_module._hk_rows_for_session(rows, close, close.isoformat())
+    assert eligible.index.tolist() == [0]
+    assert market_scan_service_module._hk_rows_for_session(rows, close, NOW.isoformat()).empty
