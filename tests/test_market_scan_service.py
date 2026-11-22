@@ -2697,15 +2697,22 @@ def test_reviewer_persistent_invalid_json_remains_failed_closed(monkeypatch: Any
     assert reviewer.diagnostics["completed_candidate_count"] == 0
 
 
-def test_reviewer_uses_one_same_channel_fallback_after_primary_retries(
-    monkeypatch: Any,
+@pytest.mark.parametrize("count,invalid_first", [(11, False), (12, True)])
+def test_qwen_close_timeout_preserves_budget_for_later_batches(
+    monkeypatch: Any, count: int, invalid_first: bool,
 ) -> None:
     models: list[str] = []
+    elapsed = [0.0]
 
     def completion(**kwargs: Any) -> Any:
         models.append(kwargs["model"])
         if kwargs["model"] == "openai/test-qwen":
+            if invalid_first and len(models) == 1:
+                elapsed[0] += 36
+                return _review_response([{"code": "wrong"}])
+            elapsed[0] += kwargs["timeout"]
             raise TimeoutError("primary temporarily unavailable")
+        elapsed[0] += 32
         batch = json.loads(kwargs["messages"][1]["content"])["candidates"]
         return _review_response(batch)
 
@@ -2714,12 +2721,13 @@ def test_reviewer_uses_one_same_channel_fallback_after_primary_retries(
         "LLM_DASHSCOPE_MODELS", "test-qwen,test-qwen-fallback,unused-qwen",
     )
     reviewer = build_litellm_reviewer("qwen")
-    result = reviewer([{"code": "600001"}])
+    monkeypatch.setattr(market_scan.time, "monotonic", lambda: elapsed[0])
+    candidates = [{"code": str(600001 + i)} for i in range(count)]
+    result = reviewer(candidates)
 
-    assert result["reviews"][0]["code"] == "600001"
-    assert models == [
-        "openai/test-qwen", "openai/test-qwen", "openai/test-qwen-fallback",
-    ]
+    assert [r["code"] for r in result["reviews"]] == [c["code"] for c in candidates]
+    assert elapsed[0] < 480
+    assert models == ["openai/test-qwen"] * (2 if invalid_first else 1) + ["openai/test-qwen-fallback"] * 3
     assert reviewer.diagnostics["configured_models"] == [
         "openai/test-qwen", "openai/test-qwen-fallback",
     ]

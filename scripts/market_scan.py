@@ -601,6 +601,7 @@ def build_litellm_reviewer(label: str) -> Optional[Callable[[Sequence[Mapping[st
             codes = [str(candidate["code"]) for candidate in candidates]
             if any(not code for code in codes) or len(set(codes)) != len(codes):
                 raise ValueError("review candidate codes must be nonempty and unique")
+            timeout_fallback = None
             for offset in range(0, len(candidates), REVIEW_BATCH_SIZE):
                 batch = candidates[offset:offset + REVIEW_BATCH_SIZE]
                 batch_number = offset // REVIEW_BATCH_SIZE + 1
@@ -623,15 +624,24 @@ def build_litellm_reviewer(label: str) -> Optional[Callable[[Sequence[Mapping[st
                         (REVIEW_MAX_ATTEMPTS if model_index == 0 else 1) + 1,
                     )
                 ]
-                for batch_attempt, (model, model_index, attempt) in enumerate(
-                    attempt_plan, start=1
-                ):
+                can_switch = label == "qwen" and len(settings["models"]) > 1
+                if timeout_fallback is not None:
+                    attempt_plan.sort(key=lambda entry: entry[0] != timeout_fallback)
+                batches_left = (len(candidates) - offset + REVIEW_BATCH_SIZE - 1) // REVIEW_BATCH_SIZE
+                primary_timed_out = False
+                while attempt_plan:
+                    model, model_index, attempt = attempt_plan.pop(0)
+                    batch_attempt = batch_summary["attempt_count"] + 1
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
                         raise ReviewProviderError(
                             "total_budget_exhausted", retryable=False,
                             provider_error_type="TimeoutError",
                         )
+                    # Reserve time for later batches, and for an alternate on the first call.
+                    shares = batches_left + int(model_index == 0 and batch_attempt == 1)
+                    request_timeout = min(REVIEW_REQUEST_TIMEOUT_SECONDS, remaining / shares
+                                          if can_switch else remaining)
                     record = {
                         "batch": batch_number,
                         "attempt": attempt,
@@ -641,7 +651,7 @@ def build_litellm_reviewer(label: str) -> Optional[Callable[[Sequence[Mapping[st
                         "candidate_count": len(batch),
                         "status": "running",
                         "started_at": datetime.now(SHANGHAI_TZ).isoformat(timespec="milliseconds"),
-                        "timeout_seconds": round(min(REVIEW_REQUEST_TIMEOUT_SECONDS, remaining), 3),
+                        "timeout_seconds": round(request_timeout, 3),
                     }
                     diagnostics["requests"].append(record)
                     if retry_feedback is not None:
@@ -649,7 +659,6 @@ def build_litellm_reviewer(label: str) -> Optional[Callable[[Sequence[Mapping[st
                     batch_summary["attempt_count"] = batch_attempt
                     request_started = time.monotonic()
                     try:
-                        request_timeout = min(REVIEW_REQUEST_TIMEOUT_SECONDS, remaining)
                         payload = _isolated_review_request(
                             lambda: request_batch(batch, request_timeout, model, retry_feedback), request_timeout,
                             execution_diagnostics=record.setdefault("execution", {}),
@@ -668,8 +677,10 @@ def build_litellm_reviewer(label: str) -> Optional[Callable[[Sequence[Mapping[st
                         feedback = _review_retry_feedback(exc, batch)
                         if feedback is not None:
                             retry_feedback = feedback
-                        has_next_attempt = batch_attempt < len(attempt_plan)
-                        if not retryable or not has_next_attempt:
+                        if can_switch and model_index == 0 and record["error_code"] == "provider_timeout":
+                            primary_timed_out = True
+                            attempt_plan.sort(key=lambda entry: entry[1] == 0)
+                        if not retryable or not attempt_plan:
                             raise
                         remaining = deadline - time.monotonic()
                         if remaining <= REVIEW_RETRY_BACKOFF_SECONDS:
@@ -693,6 +704,8 @@ def build_litellm_reviewer(label: str) -> Optional[Callable[[Sequence[Mapping[st
                             "total_budget_exhausted", retryable=False,
                             provider_error_type="TimeoutError",
                         )
+                    if can_switch and (primary_timed_out or timeout_fallback is not None):
+                        timeout_fallback = model if model_index > 0 else None
                     record["status"] = "completed"
                     merged.extend(payload["reviews"])
                     diagnostics["completed_candidate_count"] = len(merged)

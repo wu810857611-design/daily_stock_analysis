@@ -135,7 +135,7 @@ def test_header_timeout_does_not_serialize_the_other_reviewer(monkeypatch, tmp_p
     result = _service(tmp_path, qwen=qwen, deepseek=deepseek).run()
 
     assert qwen_arrival[0] <= deepseek_arrival[0] < qwen_arrival[1]
-    assert [r['model_role'] for r in qwen.diagnostics['requests']] == ['primary', 'primary', 'fallback']
+    assert [r['model_role'] for r in qwen.diagnostics['requests']] == ['primary', 'fallback', 'primary']
     assert all(r['error_code'] == 'provider_timeout' for r in qwen.diagnostics['requests'])
     assert qwen.diagnostics['requests'][0]['execution']['last_phase'] == 'http11.receive_response_headers.started'
     assert deepseek.diagnostics['completed_candidate_count'] == len(result['candidates']) > 0
