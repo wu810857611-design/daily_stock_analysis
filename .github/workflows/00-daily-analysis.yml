@@ -105,7 +105,7 @@ jobs:
     # 兼容误将 STOCK_LIST 配到同名 Environment variables 的场景；
     # 推荐位置仍是 Settings -> Secrets and variables -> Actions -> Repository variables。
     environment: STOCK_LIST
-    # P0 PRIMARY 14只先按A/H批次完成；旁路观察层共享受限时间预算。
+    # P0 PRIMARY 先按A/H批次完成；旁路观察层共享受限时间预算。
     timeout-minutes: ${{ fromJSON(vars.ANALYSIS_TIMEOUT_MINUTES || '90') }}
     
     steps:

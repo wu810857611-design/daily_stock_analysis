@@ -209,7 +209,8 @@ def test_workflow_context_cli_emits_active_and_closed_primary_with_real_calendar
     assert context["trade_date"] == "2026-10-07"
     assert context["active_primary"] and context["closed_primary"]
     assert all(symbol.startswith("HK") for symbol in context["active_primary"])
-    assert len(context["active_primary"]) + len(context["closed_primary"]) == 14
+    assert "300308" in context["closed_primary"]
+    assert set(context["active_primary"] + context["closed_primary"]) == set(cli.priority_analysis_pools()["P0_PRIMARY"])
 
 
 def test_close_date_marker_survives_raw_result_persistence_without_context_snapshot():

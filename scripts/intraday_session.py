@@ -54,6 +54,7 @@ from scripts.adaptive_signal_policy import (  # noqa: E402
 )
 from scripts.account_watchlists import (  # noqa: E402
     PRIMARY_SYMBOLS,
+    PRIMARY_LIVE_HOLDINGS,
     all_quote_symbols as account_quote_symbols,
     load_private_watch_config,
     watch_contexts_by_symbol,
@@ -4148,6 +4149,7 @@ def _delivery_position_quantities(
                 and _positive_float(position.get("quantity")) is not None
             }
     account_layers = {
+        "primary_live": "PRIMARY_LIVE_HOLDINGS",
         "secondary_account": "SECONDARY_ACCOUNT_WATCH",
         "sister_managed": "SISTER_MANAGED_WATCH",
     }
@@ -4969,13 +4971,14 @@ def run_cycle(
         for event in state.get("event_ledger", [])[ledger_start:]
         if isinstance(event, MutableMapping)
     ]
+    live_holdings = {item.symbol for item in PRIMARY_LIVE_HOLDINGS.instruments}
     created += process_actionable_decisions(
         state,
         now=now,
         raw_events=[
             event
             for event in raw_events
-            if str(event.get("symbol") or "") not in watch_only_symbols
+            if str(event.get("symbol") or "") not in (watch_only_symbols | live_holdings)
         ],
         levels=levels,
         shadow_state=shadow_state,

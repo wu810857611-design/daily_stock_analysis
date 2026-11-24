@@ -45,7 +45,8 @@ def test_full_close_run_does_not_advance_or_push_legacy_paper_experiment() -> No
 def test_primary_pool_is_complete_first_and_watch_pools_are_disjoint() -> None:
     pools = priority_analysis_pools()
 
-    assert len(PRIMARY_SYMBOLS) == 14
+    assert "300308" in PRIMARY_SYMBOLS
+    assert len(PRIMARY_SYMBOLS) == 15
     assert pools["P0_PRIMARY"] == PRIMARY_SYMBOLS
     flattened = [symbol for symbols in pools.values() for symbol in symbols]
     assert len(flattened) == len(set(flattened))
