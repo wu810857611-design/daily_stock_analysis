@@ -757,6 +757,11 @@ def test_exact_issuer_timeout_uses_original_bounded_map_fallback(configured, mon
     result = ScanResearchCollector(2)(CANDIDATE)
     assert result["announcements"]["items"]
     assert "announcement_issuer_lookup:TimeoutError" in result["errors"]
+    issuer_calls = [event for event in result["diagnostics"]
+                    if event["provider"] == f"cninfo:issuer_lookup:{CANDIDATE['code']}"]
+    assert len(issuer_calls) == 1
+    # The 0.5-second stage reserves two thirds for directory, index and PDF.
+    assert 0 < issuer_calls[0]["timeout_budget"] <= round(0.5 / 3, 3)
     assert any(e["provider"] == "cninfo:issuers:szse" and e.get("fallback_result") == "recovered"
                for e in result["diagnostics"])
     assert not multiprocessing.active_children()
