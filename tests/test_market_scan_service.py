@@ -3331,3 +3331,46 @@ def test_close_quote_row_times_cannot_be_replaced_by_batch_fetch_time():
     eligible = market_scan_service_module._hk_rows_for_session(rows, close, close.isoformat())
     assert eligible.index.tolist() == [0]
     assert market_scan_service_module._hk_rows_for_session(rows, close, NOW.isoformat()).empty
+
+
+def test_hkex_close_bulk_recovery_filters_session_identity_and_currency(tmp_path):
+    from src.services.hkex_daily_quotes import parse_daily_quotes
+
+    def quotes(trade_date, codes):
+        data = b'''DATE: 28 JUL 2026 (TUESDAY)
+<a name = "quotations">QUOTATIONS</a>
+ CODE  NAME OF STOCK    CUR PRV.CLO./    ASK/    HIGH/      SHARES TRADED/
+                            CLOSING      BID     LOW        TURNOVER ($)
+*  981 SMIC             HKD   49.12    48.74    49.56           95,478,871
+</font></pre><pre><font size='1'>                              48.74    48.72    46.62        4,596,191,521
+   700 TENCENT          CNY  100.00    99.00   100.00            1,000,000
+                              99.00    98.00    98.00           99,000,000
+    10 HANG LUNG GROUP  HKD TRADING SUSPENDED
+<a name = "sales_all">'''
+        with pytest.raises(ValueError):
+            parse_daily_quotes(data, trade_date - timedelta(days=1), codes)
+        with pytest.raises(ValueError):
+            parse_daily_quotes(data[:-24], trade_date, codes)
+        return parse_daily_quotes(data, trade_date, codes)
+
+    seed = _service(tmp_path, qwen=None, deepseek=None)
+    seed.run_l1()
+    def unavailable():
+        raise TimeoutError("connect down")
+    service = _service(tmp_path, qwen=None, deepseek=None, clock=lambda: NOW.replace(hour=19),
+                       hk_loader=unavailable)
+    service.hk_close_bulk_loader = quotes
+    def limited(code, day):
+        from src.services.research_execution import ResearchCallError
+        raise ResearchCallError("Push2RateLimitError")
+    service.hk_close_daily_loader = limited
+    diag = service.run_l1().diagnostics
+    result = diag["hk_close_daily_recovery"]
+    row = result["recovered"]["HK00981"]
+    assert row["price"] == 48.74 and row["amount"] == 4596191521 and row["volume"] == 95478871
+    assert row["change_pct"] == pytest.approx((48.74 / 49.12 - 1) * 100)
+    assert diag["hk_snapshot_source"] == "hkex.daily_quotations"
+    assert diag["hk_snapshot_coverage"]["covered_count"] == 1
+    assert result["stop_reason"] == "Push2RateLimitError"
+    parsed = quotes(NOW.date(), {"HK00010", "HK00700"})
+    assert parsed == {"rows": {}, "suspended": ["HK00010"]}
