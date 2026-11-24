@@ -70,7 +70,7 @@ def _cninfo_json(url: str, data: dict | None = None, *, expected_type: type = di
     kwargs = {} if data is None else {"data": data}
     record_isolated_phase("official_request_started")
     with method(url, headers={"Referer": "https://www.cninfo.com.cn/"},
-                stream=True, timeout=(1.5, 2), allow_redirects=False, **kwargs) as response:
+                stream=True, timeout=(3, 4), allow_redirects=False, **kwargs) as response:
         raw = _official_body(response, "index")
     record_isolated_phase("official_json_decode_started")
     try:
@@ -303,7 +303,7 @@ def announcement_excerpt(url: str, code: str, name: str) -> dict:
     } or parsed.username or parsed.password or parsed.port not in (None, 443):
         raise AnnouncementEvidenceError("untrusted_announcement_document")
     record_isolated_phase("official_request_started")
-    with requests.get(url, stream=True, timeout=(1.5, 2), allow_redirects=False) as response:
+    with requests.get(url, stream=True, timeout=(3, 4), allow_redirects=False) as response:
         data = _official_body(response, "document")
         if not data.startswith(b"%PDF"):
             raise AnnouncementEvidenceError("announcement_not_pdf")

@@ -48,6 +48,7 @@ def news_error():
 def configured(monkeypatch):
     import akshare as ak
     import src.services.alphasift_service as alpha
+    monkeypatch.setattr("src.services.market_scan_research.rss_headlines", lambda *_: [])
     service = SearchService(searxng_public_instances_enabled=False)
     service._providers = [Provider("Fixture", no_news)]
     monkeypatch.setattr(alpha, "_get_dsa_search_service", lambda: service)
@@ -347,7 +348,7 @@ def test_news_fallback_uses_identity_date_and_existing_admission_filters(configu
         return pd.DataFrame([
             {"新闻标题": "药明康德发布研发业务更新", "新闻内容": "药明康德603259发布研发业务更新",
              "新闻链接": "https://finance.eastmoney.com/a/fixture.html", "文章来源": "东方财富",
-             "发布时间": datetime.now().isoformat()},
+             "发布时间": (datetime.now(ZoneInfo("Asia/Shanghai")) - timedelta(minutes=1)).isoformat()},
             {"新闻标题": "其他公司发布业务更新", "新闻内容": "与药明康德无关",
              "新闻链接": "https://finance.eastmoney.com/a/old.html", "发布时间": "2020-01-01"},
         ])
@@ -911,10 +912,38 @@ def test_market_scan_roundup_mentions_do_not_fill_direct_news(
     service._providers = [Provider("Failed", news_error)]
     monkeypatch.setattr(ak, "stock_news_em", lambda **kwargs: pd.DataFrame([{
         "新闻标题": title, "新闻内容": snippet, "新闻链接": "https://finance.eastmoney.com/a/test.html",
-        "文章来源": "测试媒体", "发布时间": datetime.now().isoformat(),
+        "文章来源": "测试媒体", "发布时间": (datetime.now(ZoneInfo("Asia/Shanghai")) - timedelta(minutes=1)).isoformat(),
     }]))
     result = ScanResearchCollector(2)({"code": code, "name": name})
     news = result["announcements_and_news"]
     assert news["fallback_status"] == ("partial" if direct else "no_results")
     assert ("news" not in result["missing_fields"]) is direct
     assert bool(news["items"]) is direct
+
+
+def test_secondary_issuer_headlines_after_empty_eastmoney(configured, monkeypatch):
+    ak, service = configured
+    service._providers = [Provider("Failed", news_error)]
+    now = datetime.now(ZoneInfo("Asia/Shanghai"))
+    monkeypatch.setattr(ak, "stock_news_em", lambda **_: pd.DataFrame([{
+        "新闻标题": "其他公司事件", "新闻链接": "https://example.com/old",
+        "发布时间": (now - timedelta(days=10)).isoformat(),
+    }]))
+    def feed(*_):
+        def item(title, stamp, key):
+            return SearchResult(title, "", "https://news.google.com/rss/articles/" + key, "测试媒体",
+                                published_date=stamp.isoformat())
+        return [
+            item("药明康德发布季度业绩", now - timedelta(hours=1), "one"),
+            item("药明康德公布分红计划", now + timedelta(minutes=10), "two"),
+            item("其他公司发布季报", now - timedelta(hours=1), "three"),
+        ]
+    monkeypatch.setattr("src.services.market_scan_research.rss_headlines", feed)
+    result = ScanResearchCollector(2)(CANDIDATE)
+    news = result["announcements_and_news"]
+    assert [item["title"] for item in news["items"]] == ["药明康德发布季度业绩"]
+    assert news["items"][0]["headline_only"] and not news["items"][0]["snippet"]
+    assert news["provider"] == "GoogleNewsRSS"
+    assert news["fallback_diagnostics"]["Eastmoney"]["rejected"] == {"stale": 1}
+    assert news["fallback_diagnostics"]["GoogleNewsRSS"] == {
+        "received": 3, "admitted": 1, "rejected": {"future": 1, "no_issuer_headline": 1}}
