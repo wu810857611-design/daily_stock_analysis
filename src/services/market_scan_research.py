@@ -14,6 +14,7 @@ from typing import Any, Callable, Mapping
 from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
+from src.services.scan_news_fallbacks import admit_news, eastmoney_news, rss_headlines
 from src.services.research_execution import ResearchCallError, run_isolated
 from src.services.research_evidence import (
     announcement_document_url, announcement_excerpt, cninfo_issuer, cninfo_announcement_index, cninfo_issuers, recent_valuation,
@@ -249,8 +250,13 @@ class ScanResearchCollector:
             target = code[2:] if offshore else code
             org_id = None
             try:
-                org_id = cached_call(budget, lambda: cninfo_issuer(code),
-                                     f"cninfo:issuer_lookup:{code}")
+                # Keep time for the official directory and issuer-scoped index if lookup stalls.
+                identity_budget = ResearchBudget(
+                    max(0, budget.deadline - time.monotonic()) / 3, code, "announcements", events,
+                    retry_max=1, request_timeout=budget.request_timeout,
+                )
+                org_id = cached_call(identity_budget, lambda: cninfo_issuer(code),
+                                     f"cninfo:issuer_lookup:{code}", reserve_for_fallback=False)
             except ResearchCallError as exc:
                 # Conflicting official identities must not be resolved by
                 # silently selecting a different endpoint's answer.
@@ -370,45 +376,34 @@ class ScanResearchCollector:
             errors.append(f"news:{getattr(exc, 'error_class', type(exc).__name__)}")
 
         if not has_company_news:
-            try:
-                import akshare as ak
-                from src.search_service import SearchResponse, SearchResult, SearchService
-                stock_name = str(candidate.get("name") or "")
-                keyword = code
-                if code.startswith("HK"):
-                    # Search by issuer without listing decorations such as -W.
-                    names = SearchService._company_identity_terms(stock_name)
-                    keyword = names[-1] if names else code[2:]
-                frame = cached_call(
-                    budget, lambda: ak.stock_news_em(symbol=keyword), f"eastmoney:news:{code}",
-                    reserve_for_fallback=False,
-                )
-                response = SearchResponse(code, [SearchResult(
-                    title=str(row.get("新闻标题") or ""), snippet=str(row.get("新闻内容") or ""),
-                    url=str(row.get("新闻链接") or ""), source=str(row.get("文章来源") or "Eastmoney"),
-                    published_date=str(row.get("发布时间") or ""),
-                ) for row in frame.to_dict("records") if urlparse(str(row.get("新闻链接") or "")).scheme in {"http", "https"}], "Eastmoney", success=True)
-                filters = SearchService(searxng_public_instances_enabled=False)
-                response = filters._filter_news_response(response, search_days=config.news_max_age_days,
-                                                          max_results=10, log_scope=f"{code}:fallback")
-                response = filters._rank_news_response(response, stock_code=code,
-                          stock_name=stock_name or code, prefer_chinese=True,
-                          max_results=10, log_scope=f"{code}:fallback")
-                response = filters._filter_ranked_news_for_context(response, log_scope=f"{code}:fallback")
-                # Company-specific evidence only; sector matches are not
-                # counted as a company's research coverage.
-                admitted = [item for item in response.results if item.relevance_category == filters._DIRECT_NEWS_CATEGORY
-                            and item.published_date <= now.date().isoformat()][:3]
-                if admitted:
-                    has_company_news = True
-                    news.update(status="partial", provider="Eastmoney", items=[{
-                        "title": item.title, "snippet": item.snippet[:500], "url": item.url,
-                        "source": item.source, "published_date": item.published_date,
-                    } for item in admitted])
-                news["fallback_status"] = "partial" if admitted else "no_results"
-            except Exception as exc:
-                news["fallback_status"] = "provider_error"
-                errors.append(f"news_fallback:{getattr(exc, 'error_class', type(exc).__name__)}")
+            from src.search_service import SearchService
+            stock_name = str(candidate.get("name") or code)
+            terms = SearchService._company_identity_terms(stock_name)
+            issuer = terms[-1] if terms else code.removeprefix("HK")
+            keyword = issuer if code.startswith("HK") else code
+            news["fallback_diagnostics"] = {}
+            sources = [
+                ("Eastmoney", f"eastmoney:news:{code}", lambda: eastmoney_news(keyword)),
+                ("GoogleNewsRSS", f"google:issuer_news:{code}:{now.date()}",
+                 lambda: rss_headlines(issuer, code, now, config.news_max_age_days)),
+            ]
+            for provider, key, fetch in sources:
+                try:
+                    rows = cached_call(budget, fetch, key, reserve_for_fallback=provider == "Eastmoney")
+                    admitted, counts = admit_news(rows, provider, code, stock_name, now,
+                                                  config.news_max_age_days)
+                    news["fallback_diagnostics"][provider] = counts
+                    if admitted:
+                        has_company_news = True
+                        news.update(status="partial", provider=provider, items=admitted,
+                                    fallback_status="partial")
+                        break
+                    news["fallback_status"] = "no_results"
+                except Exception as exc:
+                    reason = getattr(exc, "error_class", type(exc).__name__)
+                    news["fallback_diagnostics"][provider] = {"error": reason}
+                    news.setdefault("fallback_status", "provider_error")
+                    errors.append(f"news_fallback:{reason}")
 
         report = fundamental["earnings"]["data"].get("financial_report") or {}
         missing = [f"valuation.{field}" for field in ("pe_ratio", "pb_ratio") if field not in valuation]
