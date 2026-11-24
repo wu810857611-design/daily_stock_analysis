@@ -259,6 +259,21 @@ def write_fixed_candidate_signal(path, now, **overrides):
     connection.close()
 
 
+def test_primary_holding_reaches_both_production_pools_and_holding_alerts():
+    assert "300308" in priority_analysis_pools()["P0_PRIMARY"]
+    assert all_quote_symbols().count("300308") == 1
+    config = load_private_watch_config('{"primary_live":{"positions":['
+                                       '{"symbol":"300308","historical_cost":12,"purchase_amount":7200}]}}')
+    assert "quantity" not in config["primary_live"]["positions"][0]
+    now = datetime(2026, 11, 24, 10, 30, tzinfo=TZ)
+    state = intraday_session_module._empty_state(now)
+    event = dict(event_id="example", symbol="300308", condition="stop_loss", transition="activated",
+                 severity="warning", price=11, reference_price=12, payload={"data_quality": "fresh_l1"})
+    process_watch_account_decisions(state, now=now, raw_events=[event], levels={"300308": ReferenceLevels(stop_loss=12)})
+    alert = state["outbox"][0]["payload"]
+    assert alert["account_layer"] == "PRIMARY_LIVE_HOLDINGS" and alert["action_code"] == "clear"
+
+
 class AccountWatchLayerTests(unittest.TestCase):
     def test_priority_pools_are_canonical_and_cross_tier_deduplicated(self):
         pools = priority_analysis_pools()
@@ -3492,7 +3507,7 @@ class SessionLoopTests(unittest.TestCase):
             set(fetcher.calls[0][0]),
             set(all_quote_symbols()),
         )
-        self.assertEqual(tuple(fetcher.calls[0][0][:14]), PRIMARY_SYMBOLS)
+        self.assertEqual(tuple(fetcher.calls[0][0][:len(PRIMARY_SYMBOLS)]), PRIMARY_SYMBOLS)
         self.assertEqual(
             shadow["buy_and_hold_baseline"]["positions"],
             shadow["strategy_shadow_portfolio"]["positions"],

@@ -54,6 +54,7 @@ PRIMARY_SYMBOLS: Tuple[str, ...] = (
     "HK06181",
     "HK02522",
     "HK06166",
+    "300308",
 )
 
 
@@ -108,7 +109,15 @@ SISTER_MANAGED_WATCH = WatchLayer(
     ),
 )
 
+# Primary positions acquired after the immutable shadow experiment baseline.
+PRIMARY_LIVE_HOLDINGS = WatchLayer(
+    key="PRIMARY_LIVE_HOLDINGS",
+    push_prefix="【本人主账户持仓】",
+    instruments=(WatchInstrument("300308", "中际旭创", "held_private_size"),),
+)
+
 WATCH_LAYERS: Tuple[WatchLayer, ...] = (
+    PRIMARY_LIVE_HOLDINGS,
     FAMILY_WATCHLIST,
     SECONDARY_ACCOUNT_WATCH,
     SISTER_MANAGED_WATCH,
@@ -213,6 +222,7 @@ def load_private_watch_config(raw: Optional[str] = None) -> Dict[str, Any]:
         raise ValueError(f"{WATCH_ACCOUNTS_PRIVATE_ENV} must be a JSON object")
 
     permitted = {
+        "primary_live": {item.symbol for item in PRIMARY_LIVE_HOLDINGS.instruments},
         "secondary_account": {
             instrument.symbol
             for instrument in SECONDARY_ACCOUNT_WATCH.instruments
@@ -244,18 +254,21 @@ def load_private_watch_config(raw: Optional[str] = None) -> Dict[str, Any]:
             if symbol not in allowed_symbols or symbol in seen:
                 raise ValueError(f"{account} contains an unsupported or duplicate symbol")
             seen.add(symbol)
-            checked.append(
-                {
-                    "symbol": symbol,
-                    "quantity": _positive_number(
-                        item.get("quantity"), f"{account}.{symbol}.quantity"
-                    ),
-                    "historical_cost": _positive_number(
-                        item.get("historical_cost"),
-                        f"{account}.{symbol}.historical_cost",
-                    ),
-                }
-            )
+            position = {
+                "symbol": symbol,
+                "historical_cost": _positive_number(
+                    item.get("historical_cost"), f"{account}.{symbol}.historical_cost"
+                ),
+            }
+            if account != "primary_live" or item.get("quantity") is not None:
+                position["quantity"] = _positive_number(
+                    item.get("quantity"), f"{account}.{symbol}.quantity"
+                )
+            if account == "primary_live" and "purchase_amount" in item:
+                position["purchase_amount"] = _positive_number(
+                    item["purchase_amount"], f"{account}.{symbol}.purchase_amount"
+                )
+            checked.append(position)
         account_result: Dict[str, Any] = {"positions": checked}
         snapshot = raw_account.get("informational_snapshot")
         if snapshot is not None:
