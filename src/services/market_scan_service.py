@@ -40,6 +40,7 @@ from src.services.position_sizing_policy import (
     classify_opportunity,
     opportunity_policy,
 )
+from src.services.hkex_daily_quotes import SOURCE as HKEX_CLOSE_SOURCE
 from src.services.market_scan_research import has_announcement_excerpt, meaningful
 from src.services.research_execution import ResearchCallError, run_isolated
 from src.services.tencent_market_snapshot import HK_QUOTE_FRESHNESS_SECONDS
@@ -1404,6 +1405,7 @@ class MarketScanService:
         hk_all_snapshot_loader: Optional[SnapshotLoader] = None,
         hk_membership_snapshot_loader: Optional[MembershipSnapshotLoader] = None,
         hk_close_daily_loader: Optional[Callable[[str, date], pd.DataFrame]] = None,
+        hk_close_bulk_loader: Optional[Callable[[date, set[str]], dict]] = None,
         config: Optional[MarketScanConfig] = None,
         clock: Clock = _now_shanghai,
         sleeper: Sleeper = time.sleep,
@@ -1414,6 +1416,7 @@ class MarketScanService:
         self.hk_all_snapshot_loader = hk_all_snapshot_loader
         self.hk_membership_snapshot_loader = hk_membership_snapshot_loader
         self.hk_close_daily_loader = hk_close_daily_loader
+        self.hk_close_bulk_loader = hk_close_bulk_loader
         self.history_loader = history_loader
         self.qwen_reviewer = qwen_reviewer
         self.deepseek_reviewer = deepseek_reviewer
@@ -1676,10 +1679,11 @@ class MarketScanService:
                         if hk_frame.empty:
                             hk_frame = recovered
                             hk_metadata.update(
-                                source=HK_CLOSE_DAILY_SOURCE, as_of="",
+                                source=hk_daily_recovery["source"], as_of="",
                                 fetched_at=_iso_datetime(self.clock()),
                             )
                         else:
+                            hk_metadata["source"] = f"{hk_metadata.get('source') or 'snapshot'}+{hk_daily_recovery['source']}"
                             hk_frame = pd.concat(
                                 [hk_frame[~hk_frame["code"].isin(recovered["code"])], recovered],
                                 ignore_index=True,
@@ -2204,6 +2208,24 @@ class MarketScanService:
             return pd.DataFrame(), diagnostics
         deadline = self.monotonic() + budget
         names = frame.set_index("code")["name"].to_dict()
+        if self.hk_close_bulk_loader is not None:
+            try:
+                bulk = run_isolated(lambda: self.hk_close_bulk_loader(trade_date, set(missing)),
+                                    min(budget, 20.0), network_timeout_seconds=12.0)
+            except ResearchCallError as exc:
+                diagnostics["hkex_error"] = exc.error_class
+                if exc.error_class in {"IsolationUnsupported", "WorkerCleanupFailed"}:
+                    diagnostics["stop_reason"] = exc.error_class
+                    return pd.DataFrame(), diagnostics
+            else:
+                diagnostics["hkex_suspended_codes"] = bulk["suspended"]
+                for code, row in bulk["rows"].items():
+                    row["name"] = names.get(code) or row["name"]
+                    diagnostics["recovered"][code] = row
+                if bulk["rows"]:
+                    diagnostics["source"] = HKEX_CLOSE_SOURCE
+                missing = [code for code in missing if code not in bulk["rows"]
+                           and code not in bulk["suspended"]]
         for code in missing[:HK_CLOSE_DAILY_MAX_REQUESTS]:
             remaining = deadline - self.monotonic()
             if remaining <= 0:
@@ -2241,11 +2263,14 @@ class MarketScanService:
             ):
                 diagnostics["attempts"][code] = "invalid_close_fields"
                 continue
+            if diagnostics["source"] == HKEX_CLOSE_SOURCE:
+                diagnostics["source"] = f"{HKEX_CLOSE_SOURCE}+{HK_CLOSE_DAILY_SOURCE}"
             diagnostics["attempts"][code] = "recovered"
             diagnostics["recovered"][code] = {
                 "code": code, "name": names.get(code) or code, "price": price,
                 "change_pct": change, "volume": volume, "amount": amount,
                 "turnover_rate": _finite_float(row.get("换手率")), "is_connect": True,
+                "source": HK_CLOSE_DAILY_SOURCE, "trade_date": trade_date.isoformat(),
             }
         diagnostics.setdefault(
             "stop_reason", "request_limit" if len(missing) > HK_CLOSE_DAILY_MAX_REQUESTS else "completed"
