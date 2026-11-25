@@ -102,6 +102,7 @@ def report_metadata(text):
         if depth > 9:
             return
         if isinstance(obj, dict):
+            emit("SHAPE", {k:[type(v).__name__,len(v) if isinstance(v,(str,dict,list)) else 0] for k,v in obj.items()})
             meta = {}
             for k,v in obj.items():
                 if isinstance(v, (str,int)) and re.search(
@@ -111,7 +112,7 @@ def report_metadata(text):
                     meta[k] = v
             if meta:
                 emit("REPORT_METADATA", meta)
-            elif depth < 5:
+            if depth < 5:
                 emit("REPORT_FIELDS", list(obj)[:35])
             for key, v in obj.items():
                 if isinstance(v,(dict,list)) or isinstance(v,str) and v.lstrip().startswith(("{","[")):
@@ -126,7 +127,7 @@ def report_metadata(text):
             try:
                 visit(json.loads(obj),depth+1)
             except (ValueError, RecursionError):
-                return
+                cite_lines(obj)
     def cite_lines(body):
         lines = [l.strip() for l in body.splitlines() if l.strip()]
         shown = 0
