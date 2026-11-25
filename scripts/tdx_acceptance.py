@@ -75,74 +75,44 @@ def test_mcp():
     headers["MCP-Protocol-Version"] = init["protocolVersion"]
     rpc("notifications/initialized", {})
     tools = {t["name"]: t for t in rpc("tools/list", {}, 2)["tools"]}
-    queries = {
-        "tdx_quotes": {"code":"300308", "setcode":"0", "hasHQInfo":"1", "bspNum":"0"},
-        "wenda_report_query": {"query":"中际旭创 最新券商研报", "symbol":"300308", "name":"中际旭创"}
-    }
-    for i, (name, args) in enumerate(queries.items(), 3):
+    def call(name,args,number):
         schema = tools[name]["inputSchema"]
-        assert set(schema.get("required", [])) <= args.keys() <= schema["properties"].keys()
-        result = rpc("tools/call", {"name":name,"arguments":args}, i)
-        content = result.get("content", [])
-        emit("RESULT", {"tool":name, "error":result.get("isError",False), "blocks":len(content)})
-        for block in content[:1]:
-            body = block.get("text", "")
-            if name == "tdx_quotes":
-                emit("MCP_QUOTE", body[:1200])
-            else:
-                report_metadata(body)
+        if not set(schema.get("required", [])) <= args.keys() <= schema["properties"].keys():
+            raise ValueError("incompatible TDX tool schema")
+        result = rpc("tools/call", {"name":name,"arguments":args}, number)
         if result.get("isError"):
-            raise ValueError("query failed")
+            raise ValueError("TDX query failed")
+        return result["content"][0]["text"]
 
-
-def report_metadata(text):
-    # Log bibliographic metadata only. The licensed body stays in runner memory.
-    emit("REPORT_SHAPE", {"chars":len(text), "prefix":text[:90]})
-    def visit(obj, depth=0):
-        if depth > 9:
+    quote = call("tdx_quotes", {"code":"300308", "setcode":"0", "hasHQInfo":"1", "bspNum":"0"}, 3)
+    details = json.loads(quote[quote.index("{"):])
+    if details["BaseInfo"]["Code"] != "300308":
+        raise ValueError("wrong security")
+    hq = details["HQInfo"]
+    emit("MCP_QUOTE", {"code":"300308", "received_utc":datetime.now(timezone.utc).isoformat(),
+                       **{k:hq[k] for k in ("Now","HQDate","HQTime")}})
+    for index, args in enumerate([
+        {"name":"中际旭创","symbol":"300308","bdate":"20261029","edate":"20261125"},
+        {"name":"中际旭创","bdate":"20261105","edate":"20261109","keywords":"光模块"},
+        {"query":"中际旭创|20261101|20261109|业绩符合预期|"},
+    ],4):
+        body = json.loads(call("wenda_report_query", args, index))
+        table = body.get("data") or []
+        emit("REPORT_MATCH", {"query":body.get("query"), "rows":max(0,len(table)-1)})
+        if len(table)<2:
+            continue
+        headers = table[0]
+        emit("REPORT_COLUMNS",headers)
+        target = False
+        for values in table[1:]:
+            record = dict(zip(headers,values))
+            meta = {k:record[k] for k in ("标题","时间","链接","机构","证券公司","作者") if k in record}
+            emit("REPORT_CITATION", meta)
+            if any(x in str(meta.get("标题")) for x in ("中际旭创","300308","高速光模块持续放量","营收扣非环比高增","业绩符合预期，龙头优势凸显")):
+                target = True
+        if target:
             return
-        if isinstance(obj, dict):
-            emit("SHAPE", {k:[type(v).__name__,len(v) if isinstance(v,(str,dict,list)) else 0] for k,v in obj.items()})
-            meta = {}
-            for k,v in obj.items():
-                if isinstance(v, (str,int)) and re.search(
-                    r"title|机构|券商|标题|日期|作者|时间|公司名称|链接|来源|url|source|author|org|broker|rname|date|time|publish|link|reportid|infoCode",
-                    k,re.I
-                ) and len(str(v)) < 380:
-                    meta[k] = v
-            if meta:
-                emit("REPORT_METADATA", meta)
-            if depth < 5:
-                emit("REPORT_FIELDS", list(obj)[:35])
-            for key, v in obj.items():
-                if isinstance(v,(dict,list)) or isinstance(v,str) and v.lstrip().startswith(("{","[")):
-                    visit(v, depth+1)
-                elif isinstance(v,str) and len(v)>150:
-                    emit("TEXT_FIELD", [key, len(v)])
-                    cite_lines(v)
-        elif isinstance(obj,list):
-            for item in obj[:3]:
-                visit(item,depth+1)
-        elif isinstance(obj,str):
-            try:
-                visit(json.loads(obj),depth+1)
-            except (ValueError, RecursionError):
-                cite_lines(obj)
-    def cite_lines(body):
-        lines = [l.strip() for l in body.splitlines() if l.strip()]
-        shown = 0
-        for line in lines:
-            if len(line) < 420 and re.search(r"标题|机构|证券|发布日期|报告日期|原文|https?://|^[#|]|^\d+[.、]|\d{4}[-年/]",line):
-                emit("REPORT_CITATION",line[:220])
-                shown += 1
-                if shown == 10:
-                    break
-        if not shown and lines:
-            emit("REPORT_FIRST_LINE",lines[0][:90])
-    try:
-        visit(json.loads(text))
-    except ValueError:
-        cite_lines(text)
+    raise ValueError("no matched company report title")
 
 if __name__ == "__main__":
     if not TOKEN:
