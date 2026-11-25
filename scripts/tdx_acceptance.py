@@ -75,36 +75,62 @@ def test_mcp():
     headers["MCP-Protocol-Version"] = init["protocolVersion"]
     rpc("notifications/initialized", {})
     tools = {t["name"]: t for t in rpc("tools/list", {}, 2)["tools"]}
-    for i, (name, query) in enumerate([
-        ("tdx_quotes", "中际旭创 300308.SZ 最新成交价、交易日期和行情时间"),
-        ("wenda_report_query", "中际旭创 300308 最新一篇券商研报的标题、机构、发布日期、原文链接")], 3):
-        tool = tools.get(name)
-        if not tool:
-            emit("MISSING_TOOL", {"expected":name,"available":list(tools)})
-            continue
-        schema = tool["inputSchema"]
-        emit("SCHEMA", {name:schema})
-        args = {}
-        for field in schema.get("required", []):
-            if field.lower() in ("query", "question", "input", "keyword", "keywords", "prompt"):
-                args[field] = query
-            elif field.lower() in ("code", "stock_code", "symbol"):
-                args[field] = SYMBOL
-        if not args or set(schema.get("required", [])) - args.keys():
-            continue
+    queries = {
+        "tdx_quotes": {"code":"300308", "setcode":"0", "hasHQInfo":"1", "bspNum":"0"},
+        "wenda_report_query": {"query":"中际旭创 最新券商研报", "symbol":"300308", "name":"中际旭创"}
+    }
+    for i, (name, args) in enumerate(queries.items(), 3):
+        schema = tools[name]["inputSchema"]
+        assert set(schema.get("required", [])) <= args.keys() <= schema["properties"].keys()
         result = rpc("tools/call", {"name":name,"arguments":args}, i)
-        for item in result.get("content", [])[:1]:
-            s = item.get("text", "")
+        content = result.get("content", [])
+        emit("RESULT", {"tool":name, "error":result.get("isError",False), "blocks":len(content)})
+        for block in content[:2]:
+            body = block.get("text", "")
             if name == "tdx_quotes":
-                emit("MCP_QUOTE",s[:1200])
+                emit("MCP_QUOTE", body[:1200])
             else:
-                # Only citation metadata; avoid publishing licensed report body.
-                for line in s.splitlines():
-                    if re.search(r"标题|机构名称|研究机构|发布日期|报告日期|原文链接|https?://|^#",line) and len(line)<350:
-                        emit("REPORT_REFERENCE",line[:300])
-                        if "http" in line:
-                            break
-                emit("REPORT_RESPONSE",{"chars":len(s),"error":result.get("isError",False),"format":s[:38]})
+                report_metadata(body)
+        if result.get("isError"):
+            raise ValueError("query failed")
+
+
+def report_metadata(text):
+    # Log bibliographic metadata only. The licensed body stays in runner memory.
+    emit("REPORT_SHAPE", {"chars":len(text), "prefix":text[:90]})
+    def visit(obj, depth=0):
+        if depth > 9:
+            return
+        if isinstance(obj, dict):
+            meta = {}
+            for k,v in obj.items():
+                if isinstance(v, (str,int)) and re.search(
+                    r"title|机构|券商|标题|日期|作者|时间|公司名称|链接|来源|url|source|author|org|broker|rname|date|time|publish|link|reportid|infoCode",
+                    k,re.I
+                ) and len(str(v)) < 380:
+                    meta[k] = v
+            if meta:
+                emit("REPORT_METADATA", meta)
+            elif depth < 5:
+                emit("REPORT_FIELDS", list(obj)[:35])
+            for v in obj.values():
+                if isinstance(v,(dict,list)) or isinstance(v,str) and v.lstrip().startswith(("{","[")):
+                    visit(v, depth+1)
+        elif isinstance(obj,list):
+            for item in obj[:3]:
+                visit(item,depth+1)
+        elif isinstance(obj,str):
+            try:
+                visit(json.loads(obj),depth+1)
+            except (ValueError, RecursionError):
+                return
+    try:
+        visit(json.loads(text))
+    except ValueError:
+        lines = [l.strip() for l in text.splitlines() if l.strip()]
+        for line in lines[:45]:
+            if 0<len(line)<420 and re.search(r"标题|机构|证券|发布日期|报告日期|原文|https?://|^#|^\|",line):
+                emit("REPORT_METADATA",line[:240])
 
 if __name__ == "__main__":
     if not TOKEN:
