@@ -939,8 +939,8 @@ jobs:
           fi
 
           # P1-P3 只复用分析数据库和公开 symbol；不进入 PRIMARY A/B 记账。
-          # 全库回测已由 P0 执行，旁路时间优先用于个股分析。共享上限30分钟，
-          # 仍按整个 job 的 timeout 预留至少8分钟用于数据库/旧历史打包与上传。
+          # 全库回测已由 P0 执行。P1/P2 共用 30 分钟，P3 优先使用剩余时间。
+          # 所有旁路批次均须为数据库与旧历史打包上传预留至少 8 分钟。
           OPTIONAL_SAFETY_MARGIN_SECONDS=$((8 * 60))
           if ! [[ "$ANALYSIS_TIMEOUT_MINUTES" =~ ^[0-9]+$ ]]; then
             ANALYSIS_TIMEOUT_MINUTES=90
@@ -956,6 +956,14 @@ jobs:
           fi
           run_analysis_layer "P1_FAMILY" "父亲账户观察" "$FAMILY_STOCKS" false
           run_analysis_layer "P2_ACCOUNT_HOLDINGS" "第二/妹妹账户持仓观察" "$ACCOUNT_HOLDING_STOCKS" false
+          # P1/P2 耗完共享预算时，P3 仍可在实际余量内使用最多 6 分钟。
+          candidate_deadline=$(( $(date +%s) + 6 * 60 ))
+          if [ "$candidate_deadline" -gt "$JOB_PERSIST_DEADLINE" ]; then
+            candidate_deadline="$JOB_PERSIST_DEADLINE"
+          fi
+          if [ "$candidate_deadline" -gt "$OPTIONAL_ANALYSIS_DEADLINE" ]; then
+            OPTIONAL_ANALYSIS_DEADLINE="$candidate_deadline"
+          fi
           run_analysis_layer "P3_CANDIDATES" "候选观察" "$CANDIDATE_STOCKS" false
       
       - name: 打包收盘分析与旧模拟历史
