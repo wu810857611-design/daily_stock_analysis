@@ -919,3 +919,27 @@ def test_background_watchdog_can_sync_after_old_120_second_window(
     assert result["sync"]["status"] == "synced"
     assert result["sync"]["run_id"] == 170
     assert json.loads(target.read_text(encoding="utf-8")) == payload
+
+
+@pytest.mark.parametrize("slot,markets,start,resumed,wait,run", [
+    ("close", ["cn", "hk"], "19:10", "20:05", 3300, True),
+    ("close", ["cn", "hk"], "19:10", "21:01", 3300, False),
+    ("close", ["hk"], "20:05", "", 0, True),
+    ("close", ["cn"], "19:10", "", 0, True),
+    ("morning", ["cn", "hk"], "10:26", "", 0, True),
+])
+def test_hk_close_wait_uses_original_slot_window(tmp_path, monkeypatch, slot, markets, start, resumed, wait, run):
+    from scripts import market_scan_slot_guard as guard
+    observed = [f"2026-11-25T{value}:00+08:00" for value in (start, resumed) if value]
+    monkeypatch.setattr(guard, "_parse_now", lambda _: datetime.fromisoformat(observed.pop(0)))
+    monkeypatch.setattr(guard, "evaluate_market_sessions",
+                        lambda _: {"should_run": True, "active_markets": markets})
+    delays = []
+    monkeypatch.setattr(guard, "sleep", delays.append)
+    report = tmp_path / "report.json"
+    guard.main(["--wait-for-hk-close", "--requested-slot", slot, "--state-dir", str(tmp_path),
+                "--report", str(report)])
+    assert delays == ([wait] if wait else [])
+    result = json.loads(report.read_text())
+    assert result["should_run"] is run
+    assert result["slot_key"] == f"2026-11-25:{slot}"

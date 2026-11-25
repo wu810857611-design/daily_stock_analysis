@@ -23,6 +23,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from scripts.pushplus_notify import send_markdown  # noqa: E402
+from src.services.hk_connect_membership import load_membership as load_hk_close_membership  # noqa: E402
 from src.services.hkex_daily_quotes import load_daily_quotes as load_hkex_daily_quotes  # noqa: E402
 from src.services.market_scan_service import (  # noqa: E402
     MARKET_A,
@@ -1274,6 +1275,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         hk_connect_snapshot_loader=default_hk_connect_snapshot_loader,
         hk_all_snapshot_loader=default_hk_all_snapshot_loader,
         hk_membership_snapshot_loader=default_hk_membership_snapshot_loader,
+        hk_close_membership_loader=load_hk_close_membership if args.slot == "close" else None,
         hk_close_bulk_loader=load_hkex_daily_quotes if args.slot == "close" else None,
         hk_close_daily_loader=default_hk_close_daily_loader if args.slot == "close" else None,
         history_loader=default_history_loader,

@@ -144,7 +144,8 @@ def test_completed_worker_still_kills_sdk_descendant_process():
         try:
             # A killed orphan may briefly remain a zombie until init reaps it.
             state = Path(f"/proc/{pid}/stat").read_text().split(") ", 1)[1][0]
-        except FileNotFoundError:
+        except (FileNotFoundError, ProcessLookupError):
+            # Linux can return ESRCH if the process exits after opening stat.
             break
         if state == "Z":
             break
