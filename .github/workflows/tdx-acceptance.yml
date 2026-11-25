@@ -1,0 +1,30 @@
+name: Tongdaxin read-only acceptance
+on:
+  push:
+    branches: ['verify/tdx-20261125']
+    paths: ['scripts/tdx_acceptance.py', '.github/workflows/tdx-acceptance.yml']
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Test official MCP endpoint
+        env:
+          TDX_DATA_TOKEN: ${{ secrets.TDX_DATA_TOKEN }}
+        run: python scripts/tdx_acceptance.py mcp
+      - name: Install official snapshot SDK
+        if: always()
+        run: pip install --disable-pip-version-check tdxaidata==1.3.1
+      - name: Test official quote SDK
+        if: always()
+        env:
+          TDX_DATA_TOKEN: ${{ secrets.TDX_DATA_TOKEN }}
+        run: timeout 45s python scripts/tdx_acceptance.py sdk
