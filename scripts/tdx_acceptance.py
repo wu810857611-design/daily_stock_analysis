@@ -92,21 +92,22 @@ def test_mcp():
     emit("MCP_QUOTE", {"code":"300308", "received_utc":datetime.now(timezone.utc).isoformat(),
                        **{k:hq[k] for k in ("Now","HQDate","HQTime")}})
     for index, args in enumerate([
-        {"name":"中际旭创","symbol":"300308","bdate":"20261029","edate":"20261125"},
+        {"name":"中际旭创","bdate":"20261108","edate":"20261108"},
         {"name":"中际旭创","bdate":"20261105","edate":"20261109","keywords":"光模块"},
-        {"query":"中际旭创|20261101|20261109|业绩符合预期|"},
+        {"name":"中际旭创","bdate":"20261105","edate":"20261105"},
+        {"query":"中际旭创|20261029|20261115|高速光模块持续放量|"},
     ],4):
         body = json.loads(call("wenda_report_query", args, index))
         table = body.get("data") or []
         emit("REPORT_MATCH", {"query":body.get("query"), "rows":max(0,len(table)-1)})
         if len(table)<2:
             continue
-        headers = table[0]
-        emit("REPORT_COLUMNS",headers)
+        columns = table[0]
+        emit("REPORT_COLUMNS",columns)
         target = False
         for values in table[1:]:
-            record = dict(zip(headers,values))
-            meta = {k:record[k] for k in ("标题","时间","链接","机构","证券公司","作者") if k in record}
+            record = dict(zip(columns,values))
+            meta = {k:record[k] for k in ("标题","时间","链接","来源","机构","证券公司","作者") if k in record}
             emit("REPORT_CITATION", meta)
             if any(x in str(meta.get("标题")) for x in ("中际旭创","300308","高速光模块持续放量","营收扣非环比高增","业绩符合预期，龙头优势凸显")):
                 target = True
