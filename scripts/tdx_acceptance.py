@@ -85,7 +85,7 @@ def test_mcp():
         result = rpc("tools/call", {"name":name,"arguments":args}, i)
         content = result.get("content", [])
         emit("RESULT", {"tool":name, "error":result.get("isError",False), "blocks":len(content)})
-        for block in content[:2]:
+        for block in content[:1]:
             body = block.get("text", "")
             if name == "tdx_quotes":
                 emit("MCP_QUOTE", body[:1200])
@@ -113,9 +113,12 @@ def report_metadata(text):
                 emit("REPORT_METADATA", meta)
             elif depth < 5:
                 emit("REPORT_FIELDS", list(obj)[:35])
-            for v in obj.values():
+            for key, v in obj.items():
                 if isinstance(v,(dict,list)) or isinstance(v,str) and v.lstrip().startswith(("{","[")):
                     visit(v, depth+1)
+                elif isinstance(v,str) and len(v)>150:
+                    emit("TEXT_FIELD", [key, len(v)])
+                    cite_lines(v)
         elif isinstance(obj,list):
             for item in obj[:3]:
                 visit(item,depth+1)
@@ -124,13 +127,21 @@ def report_metadata(text):
                 visit(json.loads(obj),depth+1)
             except (ValueError, RecursionError):
                 return
+    def cite_lines(body):
+        lines = [l.strip() for l in body.splitlines() if l.strip()]
+        shown = 0
+        for line in lines:
+            if len(line) < 420 and re.search(r"标题|机构|证券|发布日期|报告日期|原文|https?://|^[#|]|^\d+[.、]|\d{4}[-年/]",line):
+                emit("REPORT_CITATION",line[:220])
+                shown += 1
+                if shown == 10:
+                    break
+        if not shown and lines:
+            emit("REPORT_FIRST_LINE",lines[0][:90])
     try:
         visit(json.loads(text))
     except ValueError:
-        lines = [l.strip() for l in text.splitlines() if l.strip()]
-        for line in lines[:45]:
-            if 0<len(line)<420 and re.search(r"标题|机构|证券|发布日期|报告日期|原文|https?://|^#|^\|",line):
-                emit("REPORT_METADATA",line[:240])
+        cite_lines(text)
 
 if __name__ == "__main__":
     if not TOKEN:
