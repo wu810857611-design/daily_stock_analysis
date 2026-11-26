@@ -7,9 +7,12 @@ import re
 import sys
 import tempfile
 import shutil
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+from time import sleep
+from zoneinfo import ZoneInfo
 from pathlib import Path
-from urllib.request import build_opener, HTTPRedirectHandler, Request
+from urllib.request import build_opener, HTTPRedirectHandler, Request, urlopen
 
 SYMBOL = "300308.SZ"
 URL = "https://txmcp.tdx.com.cn:3001/txmcp"
@@ -33,14 +36,77 @@ def test_snapshot():
             config.write(handle, space_around_delimiters=False)
         os.environ["TDX_AI_DATA_LIB"] = str(lib)
         from tdxaidata import tqs
-        dates = tqs.get_more_info_batch(stock_list=[SYMBOL], field_list=["HqDate"])
-        quotes = tqs.get_market_snapshot_batch(stock_list=[SYMBOL])
-        row = (quotes or {}).get(SYMBOL) or {}
-        fields = {k: row[k] for k in ("Now", "RefreshTime", "Time", "Date") if k in row}
-        fields["HqDate"] = ((dates or {}).get(SYMBOL) or {}).get("HqDate")
-        emit("SDK_QUOTE", fields)
-        if not fields.get("Now") or not fields["HqDate"] or not (fields.get("Time") or fields.get("RefreshTime")):
-            raise ValueError("no dated quote")
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            for sample in range(1, 3):
+                started = datetime.now(timezone.utc)
+                comparison = pool.submit(sina_quote)
+                dates = tqs.get_more_info_batch(stock_list=[SYMBOL], field_list=["HqDate"])
+                quotes = tqs.get_market_snapshot_batch(stock_list=[SYMBOL])
+                received = datetime.now(timezone.utc)
+                row = (quotes or {}).get(SYMBOL) or {}
+                fields = {k: row[k] for k in (
+                    "Now", "LastClose", "PreClose", "RefreshTime", "Time", "Date",
+                    "Volume", "Vol", "TotalVol", "TotalVolume", "Amount", "TotalAmount",
+                    "Total", "Open", "High", "Low",
+                ) if k in row}
+                fields["HqDate"] = ((dates or {}).get(SYMBOL) or {}).get("HqDate")
+                age, ok = session_age(fields["HqDate"], fields.get("RefreshTime"), received)
+                emit("TDX_LIVE_SAMPLE", {
+                    "sample":sample, "security":SYMBOL, "started_utc":started.isoformat(),
+                    "received_utc":received.isoformat(), "age_s":age, "fresh":ok,
+                    "available_fields":sorted(row), "quote":fields,
+                })
+                try:
+                    other = comparison.result()
+                except Exception as exc:
+                    emit("CROSSCHECK_ERROR", {"sample":sample,"type":type(exc).__name__})
+                else:
+                    emit("SINA_LIVE_SAMPLE", {"sample":sample, **other})
+                if sample == 1:
+                    sleep(15)
+
+
+def session_age(day, stamp, received):
+    try:
+        exchange = datetime.strptime(str(day)+str(stamp).zfill(6), "%Y%m%d%H%M%S").replace(
+            tzinfo=ZoneInfo("Asia/Shanghai")
+        )
+    except (ValueError, TypeError):
+        return None, False
+    local = received.astimezone(exchange.tzinfo)
+    age = (received-exchange).total_seconds()
+    in_session = any(left <= local.strftime("%H:%M:%S") < right
+                     for left,right in [("09:30:00","11:30:00"),("13:00:00","15:00:00")])
+    return round(age,3), local.date() == exchange.date() and in_session and 0 <= age <= 90
+
+
+def sina_quote():
+    # Use the live, unadjusted Shenzhen quote and original cumulative share volume.
+    request = Request("https://hq.sinajs.cn/list=sz300308",headers={
+        "Referer":"https://finance.sina.com.cn/","User-Agent":"Mozilla/5.0"
+    })
+    with urlopen(request, timeout=8) as response:
+        name, body = response.read(4096).decode("gb18030").strip().split("=",1)
+    received = datetime.now(timezone.utc)
+    if name.strip() != "var hq_str_sz300308":
+        raise ValueError("Sina symbol mismatch")
+    data = body.split('"')[1].split(",")
+    day, stamp = data[30].replace("-",""), data[31].replace(":","")
+    age, ok = session_age(day, stamp, received)
+    return {"received_utc":received.isoformat(),"trade_date":data[30],"quote_time":data[31],
+            "fresh":ok,"age_s":age,"CNY":data[3],"previous_close":data[2],
+            "high":data[4],"low":data[5],"volume_shares":data[8],"amount_cny":data[9]}
+
+
+def test_time_gate():
+    now = datetime(2026,11,26,2,46,37,tzinfo=timezone.utc)
+    assert session_age("20261126", "104633", now)[1]
+    assert not session_age("20261126", "104638", now)[1]
+    assert session_age("20261126", "104507", now)[1]
+    assert not session_age("20261126", "104506", now)[1]
+    assert not session_age("20261125", "104637", now)[1]
+    emit("TIME_GATE", {"normal":"pass","future":"rejected","age_90s":"pass",
+                       "age_91s":"rejected","previous_day":"rejected"})
 
 
 class NoRedirect(HTTPRedirectHandler):
@@ -118,6 +184,7 @@ def test_mcp():
 if __name__ == "__main__":
     if not TOKEN:
         sys.exit("Missing credential")
+    test_time_gate()
     emit("REQUEST_AT_UTC", datetime.now(timezone.utc).isoformat())
     try:
         (test_snapshot if sys.argv[1] == "sdk" else test_mcp)()
