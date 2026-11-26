@@ -36,34 +36,38 @@ def test_snapshot():
             config.write(handle, space_around_delimiters=False)
         os.environ["TDX_AI_DATA_LIB"] = str(lib)
         from tdxaidata import tqs
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            for sample in range(1, 3):
-                started = datetime.now(timezone.utc)
-                comparison = pool.submit(sina_quote)
-                dates = tqs.get_more_info_batch(stock_list=[SYMBOL], field_list=["HqDate"])
-                quotes = tqs.get_market_snapshot_batch(stock_list=[SYMBOL])
-                received = datetime.now(timezone.utc)
-                row = (quotes or {}).get(SYMBOL) or {}
-                fields = {k: row[k] for k in (
-                    "Now", "LastClose", "PreClose", "RefreshTime", "Time", "Date",
-                    "Volume", "Vol", "TotalVol", "TotalVolume", "Amount", "TotalAmount",
-                    "Total", "Open", "High", "Low",
-                ) if k in row}
-                fields["HqDate"] = ((dates or {}).get(SYMBOL) or {}).get("HqDate")
-                age, ok = session_age(fields["HqDate"], fields.get("RefreshTime"), received)
-                emit("TDX_LIVE_SAMPLE", {
-                    "sample":sample, "security":SYMBOL, "started_utc":started.isoformat(),
-                    "received_utc":received.isoformat(), "age_s":age, "fresh":ok,
-                    "available_fields":sorted(row), "quote":fields,
+        symbols = ["300308.SZ", "000001.SZ", "600519.SH", "920002.BJ", "00700.HK", "00388.HK"]
+        phases = [("mixed", symbols), ("hong_kong", ["00700.HK", "00388.HK"])]
+        for label, codes in phases:
+            started = datetime.now(timezone.utc)
+            try:
+                quotes = tqs.get_market_snapshot_batch(
+                    stock_list=codes,
+                    field_list=["Now", "LastClose", "Volume", "Amount", "RefreshTime", "ErrorCode"],
+                )
+                dates = tqs.get_more_info_batch(stock_list=codes, field_list=["HqDate"])
+                info = tqs.get_stock_info_batch(
+                    stock_list=codes,
+                    field_list=["Name", "DelayMin", "IsHKGP", "BelongHSGT", "HKVolBaseRate", "HSStockKind", "Currency"],
+                )
+            except Exception as exc:
+                emit("MARKET_ERROR", {"group":label, "error":type(exc).__name__})
+                continue
+            received = datetime.now(timezone.utc)
+            q, d, i = (v if isinstance(v,dict) else {} for v in (quotes, dates, info))
+            emit("MARKET_RESPONSE", {"group":label, "started":started.isoformat(),
+                                    "received":received.isoformat(),
+                                    "elapsed_s":round((received-started).total_seconds(),3),
+                                    "quote_keys": [k for k in q if k in codes],
+                                    "date_keys": [k for k in d if k in codes],
+                                    "info_keys": [k for k in i if k in codes]})
+            for code in codes:
+                quote, stamp, static = (v.get(code) or {} for v in (q,d,i))
+                emit("MARKET_SAMPLE", {"group":label,"code":code,
+                    "quote":{k:quote[k] for k in ("Now","LastClose","Volume","Amount","RefreshTime","ErrorCode") if k in quote},
+                    "date":stamp.get("HqDate"),
+                    "metadata":{k:static[k] for k in ("Name","DelayMin","IsHKGP","BelongHSGT","HKVolBaseRate","HSStockKind","Currency") if k in static},
                 })
-                try:
-                    other = comparison.result()
-                except Exception as exc:
-                    emit("CROSSCHECK_ERROR", {"sample":sample,"type":type(exc).__name__})
-                else:
-                    emit("SINA_LIVE_SAMPLE", {"sample":sample, **other})
-                if sample == 1:
-                    sleep(15)
 
 
 def session_age(day, stamp, received):
