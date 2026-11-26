@@ -36,44 +36,78 @@ def test_snapshot():
             config.write(handle, space_around_delimiters=False)
         os.environ["TDX_AI_DATA_LIB"] = str(lib)
         from tdxaidata import tqs
-        phases = [
-            ("shenzhen", ["300308.SZ", "000001.SZ"]),
-            ("shenzhen_reverse", ["000001.SZ", "300308.SZ"]),
-            ("a_share_mixed", ["600519.SH", "300308.SZ", "920002.BJ"]),
-            ("shanghai", ["600519.SH", "600000.SH"]),
-            ("beijing", ["920002.BJ"]),
-            ("shenzhen_missing_first", ["999999.SZ", "300308.SZ", "000001.SZ"]),
-        ]
-        for label, codes in phases:
-            started = datetime.now(timezone.utc)
-            try:
-                quotes = tqs.get_market_snapshot_batch(
-                    stock_list=codes,
-                    field_list=["Now", "LastClose", "Volume", "Amount", "RefreshTime", "ErrorCode", "Code", "StockCode"],
-                )
-                dates = tqs.get_more_info_batch(stock_list=codes, field_list=["HqDate"])
-                info = tqs.get_stock_info_batch(
-                    stock_list=codes,
-                    field_list=["Name", "DelayMin", "IsHKGP", "BelongHSGT", "HKVolBaseRate", "HSStockKind", "Currency"],
-                )
-            except Exception as exc:
-                emit("MARKET_ERROR", {"group":label, "error":type(exc).__name__})
+        local = datetime.now(ZoneInfo("Asia/Shanghai"))
+        if local.weekday() >= 5 or not ("09:35" <= local.strftime("%H:%M") < "11:25"
+                                        or "13:05" <= local.strftime("%H:%M") < "14:55"):
+            emit("MARKET_CLOSED", {"time":local.isoformat()})
+            return
+
+        mainland = ["300308.SZ", "000001.SZ", "600519.SH", "600000.SH", "920002.BJ", "920799.BJ"]
+        hk = ["00700.HK", "00388.HK"]
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            for sample in (1, 2):
+                compare = pool.submit(public_quotes, mainland + hk)
+                for label, codes in (("mainland", mainland), ("hong_kong", hk)):
+                    started = datetime.now(timezone.utc)
+                    try:
+                        dates = tqs.get_more_info_batch(stock_list=codes, field_list=["HqDate"]) or {}
+                        quotes = tqs.get_market_snapshot_batch(
+                            stock_list=codes, field_list=["Now", "LastClose", "Volume", "Amount", "RefreshTime"],
+                        ) or {}
+                        received = datetime.now(timezone.utc)
+                        info = tqs.get_stock_info_batch(
+                            stock_list=codes, field_list=["Name", "DelayMin", "IsHKGP"],
+                        ) or {}
+                    except Exception as exc:
+                        emit("MARKET_ERROR", {"sample":sample,"group":label,"error":type(exc).__name__})
+                        continue
+                    for code in codes:
+                        q, d, meta = [v.get(code) or {} for v in (quotes, dates, info)]
+                        day, stamp = d.get("HqDate"), q.get("RefreshTime")
+                        age, valid_time = session_age(day, stamp, received)
+                        emit("LIVE_MARKET_SAMPLE", {"sample":sample,"code":code,
+                            "started":started.isoformat(),"received":received.isoformat(),
+                            "quote_date":day,"quote_time":stamp,"age_s":age,
+                            "fresh":valid_time and str(meta.get("DelayMin"))=="0",
+                            "price":q.get("Now"),"volume":q.get("Volume"),"amount":q.get("Amount"),
+                            "name":meta.get("Name"),"delay_min":meta.get("DelayMin"),
+                        })
+                for record in compare.result():
+                    emit("PUBLIC_COMPARISON", {"sample":sample, **record})
+                if sample == 1:
+                    sleep(12)
+
+
+def public_quotes(codes):
+    values = []
+    def vendor_code(code):
+        number, exchange = code.split(".")
+        return ("r_hk" if exchange == "HK" else exchange.lower()) + number
+    keys = {vendor_code(c):c for c in codes}
+    for _ in range(4):
+        request = Request("https://qt.gtimg.cn/q="+",".join(keys),headers={
+            "Referer":"https://finance.qq.com/","User-Agent":"Mozilla/5.0",
+        })
+        try:
+            with urlopen(request,timeout=4) as response:
+                payload = response.read(14000).decode("gb18030")
+        except Exception as exc:
+            values.append({"error":type(exc).__name__})
+            continue
+        received = datetime.now(timezone.utc)
+        for row in payload.splitlines():
+            m = re.fullmatch(r'v_(.+?)="(.*)";',row)
+            if not m or m[1] not in keys:
                 continue
-            received = datetime.now(timezone.utc)
-            q, d, i = (v if isinstance(v,dict) else {} for v in (quotes, dates, info))
-            emit("MARKET_RESPONSE", {"group":label, "started":started.isoformat(),
-                                    "received":received.isoformat(),
-                                    "elapsed_s":round((received-started).total_seconds(),3),
-                                    "quote_keys": [k for k in q if k in codes],
-                                    "date_keys": [k for k in d if k in codes],
-                                    "info_keys": [k for k in i if k in codes]})
-            for code in codes:
-                quote, stamp, static = (v.get(code) or {} for v in (q,d,i))
-                emit("MARKET_SAMPLE", {"group":label,"code":code,
-                    "quote":{k:quote[k] for k in ("Now","LastClose","Volume","Amount","RefreshTime","ErrorCode","Code","StockCode") if k in quote},
-                    "date":stamp.get("HqDate"),
-                    "metadata":{k:static[k] for k in ("Name","DelayMin","IsHKGP","BelongHSGT","HKVolBaseRate","HSStockKind","Currency") if k in static},
-                })
+            fields = m[2].split("~")
+            if len(fields) <= 30:
+                continue
+            raw = re.sub(r"\D","",fields[30])
+            age, valid = session_age(raw[:8],raw[8:],received)
+            values.append({"code":keys[m[1]],"quote_at":raw,"received":received.isoformat(),
+                           "price":fields[3],"volume":fields[6],"age_s":age,"fresh":valid})
+        sleep(0.7)
+    return values
 
 
 def session_age(day, stamp, received):
