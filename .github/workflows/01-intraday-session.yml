@@ -542,6 +542,7 @@ jobs:
           # PRIMARY 账户已经初始化完成；运行时只允许恢复现有加密状态。
           SHADOW_AB_STATE_KEY: ${{ secrets.SHADOW_AB_STATE_KEY }}
           TDX_DATA_TOKEN: ${{ secrets.TDX_DATA_TOKEN }}
+          TDX_FALLBACK_EXCHANGES: ${{ vars.TDX_FALLBACK_EXCHANGES || 'SH,SZ,BJ' }}
           WATCH_ACCOUNTS_PRIVATE_JSON: ${{ secrets.WATCH_ACCOUNTS_PRIVATE_JSON }}
           GH_TOKEN: ${{ github.token }}
         run: |

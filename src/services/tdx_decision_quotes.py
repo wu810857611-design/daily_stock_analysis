@@ -1,4 +1,4 @@
-"""Read-only Tongdaxin A-share snapshot fallback for the Linux intraday runner."""
+"""Read-only Tongdaxin snapshot fallback for the Linux intraday runner."""
 
 import configparser
 import importlib.util
@@ -16,15 +16,28 @@ def _read_snapshots(codes, library):
     os.environ["TDX_AI_DATA_LIB"] = str(library)
     from tdxaidata import tqs
 
-    dates = tqs.get_more_info_batch(stock_list=codes, field_list=["HqDate"])
-    quotes = tqs.get_market_snapshot_batch(stock_list=codes)
-    if not isinstance(quotes, dict) or not isinstance(dates, dict):
-        return {}
     rows = {}
-    for code in codes:
-        quote, dated = quotes.get(code), dates.get(code)
-        if isinstance(quote, dict) and isinstance(dated, dict):
-            rows[code] = {**quote, "HqDate": dated.get("HqDate")}
+    # The vendor rejects batches that mix mainland and extended markets.
+    for hong_kong in (False, True):
+        market_codes = [code for code in codes if code.endswith(".HK") == hong_kong]
+        for start in range(0, len(market_codes), 32):
+            batch = market_codes[start:start + 32]
+            dates = tqs.get_more_info_batch(stock_list=batch, field_list=["HqDate"])
+            quotes = tqs.get_market_snapshot_batch(
+                stock_list=batch, field_list=["Now", "LastClose", "Volume", "RefreshTime"],
+            )
+            metadata = tqs.get_stock_info_batch(
+                stock_list=batch, field_list=["Name", "DelayMin", "IsHKGP"],
+            )
+            if not all(isinstance(payload, dict) for payload in (dates, quotes, metadata)):
+                continue
+            for code in batch:
+                quote, dated, security = (payload.get(code) for payload in (quotes, dates, metadata))
+                if all(isinstance(item, dict) for item in (quote, dated, security)):
+                    rows[code] = {
+                        **quote, "HqDate": dated.get("HqDate"), "Name": security.get("Name"),
+                        "DelayMin": security.get("DelayMin"), "IsHKGP": security.get("IsHKGP"),
+                    }
     return rows
 
 

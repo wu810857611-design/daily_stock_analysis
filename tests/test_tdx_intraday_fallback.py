@@ -18,6 +18,9 @@ OBSERVED_ROW = {
     "Now": "426.35",
     "LastClose": "409.00",
     "Volume": "276961",
+    "Name": "中际旭创",
+    "DelayMin": "0",
+    "IsHKGP": "0",
 }
 
 
@@ -136,3 +139,80 @@ def test_sdk_config_is_private_and_removed_on_timeout(tmp_path, monkeypatch):
         adapter.fetch_dated_snapshots([TDX_KEY])
     assert not staged[0].parent.exists()
     assert default_ini.read_text() == "[Token]\ntoken=\n"
+
+
+def test_multi_market_fallback_only_queries_missing_rows_and_keeps_existing_sources():
+    baseline = RealtimeQuote("000001", price=12.4, provider_timestamp=NOW.isoformat(),
+                             is_stale=False, source="tencent_batch")
+    tencent, longbridge, hk_quote = providers({"000001": baseline})
+    loader = Mock(return_value={
+        "600519.SH": {**OBSERVED_ROW, "Name": "贵州茅台", "Now": "1469", "LastClose": "1474.84"},
+        "920002.BJ": {**OBSERVED_ROW, "Name": "万达轴承", "Now": "41.8", "LastClose": "42.65"},
+    })
+    fetcher = DecisionQuoteFetcher(
+        tencent_fetcher=tencent, longbridge_fetcher=longbridge, tdx_loader=loader,
+        tdx_exchanges=("SH", "SZ", "BJ", "HK"),
+    )
+    rows = fetcher.fetch(["600519", "000001", "920002", HK], now=NOW)
+    loader.assert_called_once_with(["600519.SH", "920002.BJ"])
+    assert rows["000001"] == baseline and rows[HK] == hk_quote
+    assert rows["600519"].price == 1469 and rows["920002"].price == 41.8
+    assert fetcher.last_diagnostics["tdx_fallback"]["recovered_by_market"] == {"SH": 1, "BJ": 1}
+
+
+@pytest.mark.parametrize("delay,market_flag,expected", [
+    ("0", "1", "recovered"), ("15", "1", "provider_delay_or_unverified"),
+    (None, "1", "provider_delay_or_unverified"), ("0", "0", "invalid_security_metadata"),
+])
+def test_hong_kong_requires_both_current_and_undelayed_provider_quote(delay, market_flag, expected):
+    tencent, longbridge, _ = providers({})
+    longbridge.fetch.side_effect = TimeoutError()
+    loader = Mock(return_value={
+        "00700.HK": {**OBSERVED_ROW, "IsHKGP": market_flag, "DelayMin": delay,
+                     "Name": "腾讯控股", "Now": "341", "LastClose": "337.4"},
+    })
+    fetcher = DecisionQuoteFetcher(
+        tencent_fetcher=tencent, longbridge_fetcher=longbridge, tdx_loader=loader,
+        tdx_exchanges=("HK",),
+    )
+    rows = fetcher.fetch([HK], now=NOW)
+    loader.assert_called_once_with(["00700.HK"])
+    assert fetcher.last_diagnostics["longbridge_fetch_error"] == "TimeoutError"
+    assert fetcher.last_diagnostics["tdx_fallback"]["status"] == expected
+    assert rows[HK].is_stale is (expected != "recovered")
+
+
+def test_hk_tencent_fallback_stays_ahead_of_tdx():
+    baseline = RealtimeQuote(HK, price=341, provider_timestamp=NOW.isoformat(),
+                             is_stale=False, source="tencent_batch")
+    tencent, longbridge, _ = providers({HK: baseline})
+    longbridge.fetch.return_value = {}
+    loader = Mock()
+    fetcher = DecisionQuoteFetcher(
+        tencent_fetcher=tencent, longbridge_fetcher=longbridge, tdx_loader=loader, tdx_exchanges=("HK",),
+    )
+    rows = fetcher.fetch([HK], now=NOW)
+    loader.assert_not_called()
+    assert rows[HK].source == "tencent_batch:fresh_hk_fallback"
+
+
+def test_sdk_never_batches_mainland_and_hong_kong_together(tmp_path, monkeypatch):
+    import sys
+
+    from src.services.tdx_decision_quotes import _read_snapshots
+
+    def rows(stock_list, field_list):
+        assert len(stock_list) <= 32
+        assert not any(c.endswith(".HK") for c in stock_list) or all(c.endswith(".HK") for c in stock_list)
+        return {c: OBSERVED_ROW for c in stock_list}
+
+    tqs = SimpleNamespace(
+        get_more_info_batch=Mock(side_effect=rows),
+        get_market_snapshot_batch=Mock(side_effect=rows),
+        get_stock_info_batch=Mock(side_effect=rows),
+    )
+    monkeypatch.setitem(sys.modules, "tdxaidata", SimpleNamespace(tqs=tqs))
+    monkeypatch.setenv("TDX_AI_DATA_LIB", "")
+    codes = [f"{i:06d}.SZ" for i in range(34)] + ["00700.HK"]
+    assert set(_read_snapshots(codes, tmp_path / "lib.so")) == set(codes)
+    assert tqs.get_market_snapshot_batch.call_count == 3
