@@ -296,12 +296,16 @@ HTTP 请求，不增加请求次数或研究预算，PDF 缺失、身份不符�
 `integration_verification.tencent_route_rejections`累计原因计数。此改动不调整90秒
 新鲜度门槛，也不把约15分钟延迟的港股报价提升为可执行行情。
 
-分钟监控为已实测的中际旭创（300308.SZ）接入通达信备用报价。Actions 从
-`TDX_DATA_TOKEN` Secret 读取凭据，具备凭据时按需安装官方 Linux SDK。腾讯主路由和
-备用路由均无法提供可用报价时，才在深市连续竞价时段查询通达信。使用 `HqDate` 和
-`RefreshTime` 核对同一交易日及实际收取时间，严格拒绝未来时间及超过 90 秒的报价。
-会话验收保留 `integration_verification.tdx_fallback_outcomes`，汇总实际接管和拒绝结果。
-港股继续走既有腾讯、长桥路径。去掉 `TDX_DATA_TOKEN` 可关闭该备用源。
+分钟监控可将通达信作为备用行情源。Actions 从 `TDX_DATA_TOKEN` Secret 读取
+凭据。本地未配置 `TDX_FALLBACK_EXCHANGES` 时，仅为中际旭创提供备用
+报价。Actions 默认配置 `SH,SZ,BJ`，可通过同名 Repository variable 缩小范围。
+只有验收了实时权限的港股才可在该配置中加入 `HK`。港股先按现有长桥和腾讯顺序选择，A 股先用腾讯。
+通达信仅在原线路没有可用报价时查询缺口，港股与 A 股分批调用。每只报价的
+`DelayMin` 必须明确为零，且必须有可核对的证券类型、同日 `HqDate` 和
+`RefreshTime`。以实际收到时间严格拒绝未来时间和超过 90 秒的报价。会话验收
+保留 `integration_verification.tdx_fallback_outcomes` 及分市场接管次数。
+服务方声明 15 分钟延迟的港股数据不能用于盘中信号。从配置值移除交易所可关闭对应市场（不保留任何扩展市场时设为 `none`），
+清除凭据会关闭整个通达信路径。全市场扫描仍使用独立覆盖率门槛与数据源。
 
 盘中候选事件的 `data_quality` 表示已通过既有新鲜度校验的行情状态 `fresh_l1`；
 数值型研究评分独立保存在 `research_data_quality`，仍按原规则参与策略与置信度计算。

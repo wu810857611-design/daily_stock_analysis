@@ -1229,7 +1229,7 @@ class LongbridgeBatchQuoteFetcher:
 
 
 class DecisionQuoteFetcher:
-    """Tencent baseline, Longbridge for Hong Kong, and optional TDX for 300308."""
+    """Tencent and Longbridge with an optional Tongdaxin fallback."""
 
     min_interval_seconds = 30.0
 
@@ -1240,6 +1240,7 @@ class DecisionQuoteFetcher:
         tencent_fetcher: Optional[TencentBatchQuoteFetcher] = None,
         longbridge_fetcher: Optional[LongbridgeBatchQuoteFetcher] = None,
         tdx_loader: Optional[Callable[[Sequence[str]], Mapping[str, Any]]] = None,
+        tdx_exchanges: Optional[Sequence[str]] = None,
     ):
         self.freshness_seconds = freshness_seconds
         self.tencent_fetcher = tencent_fetcher or TencentBatchQuoteFetcher(
@@ -1248,6 +1249,12 @@ class DecisionQuoteFetcher:
         self.longbridge_fetcher = longbridge_fetcher or LongbridgeBatchQuoteFetcher(
             freshness_seconds=freshness_seconds
         )
+        configured_exchanges = os.getenv("TDX_FALLBACK_EXCHANGES", "").split(",")
+        self.tdx_exchanges = {
+            value.strip().upper() for value in (
+                configured_exchanges if tdx_exchanges is None else tdx_exchanges
+            )
+        } & {"SH", "SZ", "BJ", "HK"}
         self.tdx_loader = tdx_loader
         if self.tdx_loader is None and os.getenv("TDX_DATA_TOKEN", "").strip():
             from src.services.tdx_decision_quotes import fetch_dated_snapshots
@@ -1269,53 +1276,96 @@ class DecisionQuoteFetcher:
                 return replace(quote, is_stale=True, stale_seconds=age)
         return quote
 
+    def _tdx_codes(self, symbols: Sequence[str], now: datetime) -> Dict[str, str]:
+        if self.tdx_loader is None:
+            return {}
+        offered = {}
+        for symbol in symbols:
+            if re.fullmatch(r"HK[0-9]{5}", symbol):
+                exchange, code = "HK", symbol[2:]
+            elif re.fullmatch(r"[0-9]{6}", symbol):
+                exchange, code = _a_share_exchange(symbol).upper(), symbol
+            else:
+                continue
+            if (symbol == "300308" or exchange in self.tdx_exchanges) and self._in_tdx_session(now, exchange):
+                offered[symbol] = f"{code}.{exchange}"
+        return offered
+
     def _tdx_fallback(
-        self, results: Dict[str, RealtimeQuote], selected_at: datetime,
+        self, results: Dict[str, RealtimeQuote], offered: Mapping[str, str], selected_at: datetime,
     ) -> Dict[str, Any]:
-        # Only the verified Shenzhen security is eligible during continuous trading.
-        symbol = "300308"
-        baseline = self._expire_trade(results.get(symbol), selected_at)
-        if baseline and baseline is not results[symbol]:
-            results[symbol] = baseline
-        if baseline and baseline.price is not None and baseline.provider_timestamp and not baseline.is_stale:
-            return {"status": "tencent_healthy"}
-        code = "300308.SZ"
+        missing = {}
+        for symbol, code in offered.items():
+            baseline = self._expire_trade(results.get(symbol), selected_at)
+            if baseline:
+                results[symbol] = baseline
+                if baseline.price is not None and baseline.provider_timestamp and not baseline.is_stale:
+                    continue
+            missing[symbol] = code
+        if not missing:
+            return {"status": "tencent_healthy" if tuple(offered) == ("300308",) else "primary_healthy"}
+
         started = time.monotonic()
         try:
-            rows = self.tdx_loader([code])
+            rows = self.tdx_loader(list(missing.values()))
         except Exception as exc:
-            return {"status": "provider_error", "error_class": type(exc).__name__}
+            return {"status": "provider_error", "error_class": type(exc).__name__, "requested": len(missing)}
         received = selected_at + timedelta(seconds=time.monotonic() - started)
-        row = rows.get(code) if isinstance(rows, Mapping) else None
+        outcomes: Dict[str, int] = {}
+        recovered_by_market: Dict[str, int] = {}
+        for symbol, code in missing.items():
+            row = rows.get(code) if isinstance(rows, Mapping) else None
+            exchange = code.rsplit(".", 1)[-1]
+            replacement, status = self._tdx_quote(symbol, exchange, row, results.get(symbol), received)
+            outcomes[status] = outcomes.get(status, 0) + 1
+            if replacement is not None:
+                results[symbol] = replacement
+                recovered_by_market[exchange] = recovered_by_market.get(exchange, 0) + 1
+        return {
+            "status": next(iter(outcomes)) if len(outcomes) == 1 else "partial",
+            "requested": len(missing), "recovered": outcomes.get("recovered", 0),
+            "recovered_by_market": recovered_by_market, "outcomes": outcomes,
+        }
+
+    def _tdx_quote(
+        self, symbol: str, exchange: str, row: Any, baseline: Optional[RealtimeQuote], received: datetime,
+    ) -> tuple[Optional[RealtimeQuote], str]:
         if not isinstance(row, Mapping):
-            return {"status": "missing_quote"}
+            return None, "missing_quote"
+        if _nonnegative_float(row.get("DelayMin")) != 0:
+            return None, "provider_delay_or_unverified"
+        if str(row.get("IsHKGP")) != ("1" if exchange == "HK" else "0") or not str(row.get("Name") or "").strip():
+            return None, "invalid_security_metadata"
         raw_stamp = f"{row.get('HqDate', '')}{row.get('RefreshTime', '')}"
         stamp = parse_tencent_timestamp(raw_stamp) if re.fullmatch(r"[0-9]{14}", raw_stamp) else None
         if stamp is None or stamp.date() != received.date():
-            return {"status": "invalid_quote_timestamp"}
+            return None, "invalid_quote_timestamp"
         age = (received - stamp).total_seconds()
         if age < 0 or age > min(self.freshness_seconds, 90.0):
-            return {"status": "stale_or_future_quote"}
-        if not self._in_tdx_session(received) or not self._in_tdx_session(stamp):
-            return {"status": "outside_continuous_trading"}
+            return None, "stale_or_future_quote"
+        if not self._in_tdx_session(received, exchange) or not self._in_tdx_session(stamp, exchange):
+            return None, "outside_continuous_trading"
         price = _positive_float(row.get("Now"))
         previous_close = _positive_float(row.get("LastClose"))
         if price is None or previous_close is None:
-            return {"status": "invalid_quote_price"}
-        results[symbol] = RealtimeQuote(
-            symbol=symbol, name=baseline.name if baseline else "",
+            return None, "invalid_quote_price"
+        return RealtimeQuote(
+            symbol=symbol, name=baseline.name if baseline and baseline.name else str(row["Name"]),
             price=price, change_pct=(price / previous_close - 1) * 100,
             volume=_nonnegative_float(row.get("Volume")),
             provider_timestamp=_iso(stamp), fetched_at=_iso(received),
             stale_seconds=age, is_stale=False, source="tdx_aidata_snapshot",
-        )
-        return {"status": "recovered"}
+        ), "recovered"
 
     @staticmethod
-    def _in_tdx_session(now: datetime) -> bool:
+    def _in_tdx_session(now: datetime, exchange: str) -> bool:
         local = now.astimezone(SHANGHAI_TZ).time()
-        return (datetime_time(9, 30) <= local < datetime_time(11, 30)
-                or datetime_time(13) <= local < datetime_time(14, 57))
+        morning_end, afternoon_end = (
+            (datetime_time(12), datetime_time(16)) if exchange == "HK"
+            else (datetime_time(11, 30), datetime_time(14, 57))
+        )
+        return (datetime_time(9, 30) <= local < morning_end
+                or datetime_time(13) <= local < afternoon_end)
 
     def fetch(
         self, symbols: Sequence[str], *, now: Optional[datetime] = None
@@ -1323,12 +1373,12 @@ class DecisionQuoteFetcher:
         started = time.monotonic()
         fetched_at = now or datetime.now(SHANGHAI_TZ)
         canonical = list(dict.fromkeys(canonical_symbol(symbol) for symbol in symbols))
-        try_tdx = self.tdx_loader is not None and "300308" in canonical and self._in_tdx_session(fetched_at)
+        tdx_codes = self._tdx_codes(canonical, fetched_at)
         tencent_error = ""
         try:
             results = self.tencent_fetcher.fetch(canonical, now=fetched_at)
         except Exception as exc:
-            if not try_tdx:
+            if not tdx_codes:
                 raise
             results = {}
             tencent_error = type(exc).__name__
@@ -1341,7 +1391,14 @@ class DecisionQuoteFetcher:
         inactive_price_timestamps = 0
         primary_fallback_covered = 0
         degradation_reasons: Dict[str, int] = {}
-        longbridge = self.longbridge_fetcher.fetch(hk_symbols, now=fetched_at)
+        longbridge_error = ""
+        try:
+            longbridge = self.longbridge_fetcher.fetch(hk_symbols, now=fetched_at)
+        except Exception as exc:
+            if not any(code.endswith(".HK") for code in tdx_codes.values()):
+                raise
+            longbridge = {}
+            longbridge_error = type(exc).__name__
         # Account for time spent pulling both sources before choosing a price.
         selected_at = fetched_at.astimezone(SHANGHAI_TZ) + timedelta(seconds=time.monotonic() - started)
         for symbol in hk_symbols:
@@ -1418,12 +1475,13 @@ class DecisionQuoteFetcher:
                 if fallback is not None:
                     results[symbol] = fallback
                     primary_fallback_covered += 1
-        tdx = self._tdx_fallback(results, selected_at) if try_tdx else {}
+        tdx = self._tdx_fallback(results, tdx_codes, selected_at) if tdx_codes else {}
         self.last_diagnostics = {
             "baseline": "tencent_batch",
             "baseline_diagnostics": baseline_diagnostics,
             "baseline_error": tencent_error,
             "tdx_fallback": tdx,
+            "longbridge_fetch_error": longbridge_error,
             "hk_realtime_source": "longbridge_batch",
             "longbridge_configured": bool(self.longbridge_fetcher.configured),
             "hk_realtime_entitled": bool(
@@ -4725,10 +4783,16 @@ def run_cycle(
                 quote_diagnostics.get("hk_primary_fallback_fresh_covered") or 0
             )
         if isinstance(verification, MutableMapping):
-            tdx_status = (quote_diagnostics.get("tdx_fallback") or {}).get("status")
+            tdx_fallback = quote_diagnostics.get("tdx_fallback") or {}
+            tdx_status = tdx_fallback.get("status")
             if tdx_status:
+                counts = tdx_fallback.get("outcomes") or {tdx_status: 1}
                 outcomes = verification.setdefault("tdx_fallback_outcomes", {})
-                outcomes[tdx_status] = int(outcomes.get(tdx_status, 0)) + 1
+                for status, count in counts.items():
+                    outcomes[status] = int(outcomes.get(status, 0)) + int(count)
+                markets = verification.setdefault("tdx_fallback_recovered_by_market", {})
+                for exchange, count in tdx_fallback.get("recovered_by_market", {}).items():
+                    markets[exchange] = int(markets.get(exchange, 0)) + int(count)
             baseline_diagnostics = quote_diagnostics.get("baseline_diagnostics")
             if isinstance(baseline_diagnostics, Mapping):
                 alternate_requests = int(
