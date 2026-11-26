@@ -10,6 +10,7 @@ from datetime import datetime, time, timedelta
 from pathlib import Path
 from email.message import Message
 from typing import Any, Mapping
+from unittest.mock import Mock
 from urllib import parse, request, response
 from zoneinfo import ZoneInfo
 
@@ -752,12 +753,106 @@ def test_existing_run_filter_is_market_slot_specific() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    ("event", "title_value", "status", "expected"),
+    [
+        ("schedule", "20 2 * * 1-5", "in_progress", "dispatched"),
+        ("schedule", "5 11 * * 1-5", "queued", "already_running"),
+        ("schedule", "15 11 * * 1-5", "in_progress", "already_running"),
+        ("workflow_dispatch", "close", "in_progress", "already_running"),
+        ("workflow_dispatch", "auto", "in_progress", "dispatched"),
+        ("workflow_dispatch", "afternoon", "queued", "dispatched"),
+    ],
+)
+def test_close_watchdog_verifies_the_slot_of_active_runs(event, title_value, status, expected) -> None:
+    now = datetime(2026, 11, 26, 19, 16, tzinfo=TZ)
+    client = Mock()
+    client.recent_runs.return_value = [{
+        "id": 45807387435,
+        "created_at": "2026-11-26T11:15:39Z",
+        "event": event,
+        "display_title": f"market-scan | {event} | {title_value}",
+        "status": status,
+    }]
+    outcome = run_watchdog(
+        slot="close", session_date=now.date(), now_fn=lambda: now,
+        sleep_fn=Mock(), client=client, workflow="02-market-scan.yml", ref="main",
+        session_gate=lambda _now: {"should_run": True},
+    )
+    assert outcome["status"] == expected
+    client.artifacts_for_run.assert_not_called()
+    if expected == "dispatched":
+        client.dispatch.assert_called_once_with("02-market-scan.yml", "main", "close")
+    else:
+        assert outcome["observed_run"]["run_id"] == 45807387435
+        client.dispatch.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("guard_slot", "admitted", "result_slot", "day", "report_attempt", "expected"),
+    [
+        ("morning", False, None, 26, 1, "dispatched"),
+        ("close", False, None, 26, 1, "dispatched"),
+        ("close", True, None, 26, 1, "dispatched"),
+        ("close", True, "afternoon", 26, 1, "dispatched"),
+        ("close", True, "close", 25, 1, "dispatched"),
+        ("close", True, "close", 26, 0, "dispatched"),
+        ("close", True, "close", 26, 1, "already_covered"),
+    ],
+)
+def test_close_watchdog_verifies_the_current_attempt_report(
+    guard_slot, admitted, result_slot, day, report_attempt, expected,
+) -> None:
+    now = datetime(2026, 11, 26, 20, 18, tzinfo=TZ)
+    client = Mock()
+    client.recent_runs.return_value = [{
+        "id": 45807387435, "run_number": 383, "run_attempt": 1,
+        "created_at": "2026-11-26T11:05:39Z",
+        "event": "schedule", "display_title": "全市场分层选股（仅模拟）",
+        "status": "completed", "conclusion": "success",
+    }]
+    client.artifacts_for_run.return_value = [{
+        "id": 15109069805, "name": f"market-scan-report-383-{report_attempt}", "expired": False,
+    }]
+    archive = io.BytesIO()
+    with zipfile.ZipFile(archive, "w") as package:
+        package.writestr("reports/market_scan_slot_guard.json", json.dumps({
+            "slot": guard_slot, "slot_key": f"2026-11-{day}:{guard_slot}", "should_run": admitted,
+            "skip_reason": "" if admitted else "slot_too_late",
+        }))
+        if result_slot is not None:
+            package.writestr("reports/market_scan.json", json.dumps({
+                "generated_at": f"2026-11-{day}T20:05:00+08:00",
+                "scheduler": {"slot": result_slot},
+                "simulation_only": True, "auto_order_enabled": False, "human_confirmation_required": True,
+            }))
+    client.download_artifact.return_value = archive.getvalue()
+    outcome = run_watchdog(
+        slot="close", session_date=now.date(), now_fn=lambda: now,
+        sleep_fn=Mock(), client=client, workflow="02-market-scan.yml", ref="main",
+        session_gate=lambda _now: {"should_run": True},
+    )
+    assert outcome["status"] == expected
+    if report_attempt == 1:
+        client.download_artifact.assert_called_once_with(15109069805)
+    else:
+        client.download_artifact.assert_not_called()
+    if expected == "dispatched":
+        client.dispatch.assert_called_once_with("02-market-scan.yml", "main", "close")
+    else:
+        assert outcome["observed_run"]["run_id"] == 45807387435
+        client.dispatch.assert_not_called()
+
+
 def test_workflows_wire_active_watchdogs_and_slot_guard() -> None:
     scan_text = (ROOT / ".github/workflows/02-market-scan.yml").read_text(
         encoding="utf-8"
     )
     scan = yaml.load(scan_text, Loader=yaml.BaseLoader)
     assert scan["on"]["workflow_dispatch"]["inputs"]["slot"]
+    assert scan["run-name"] == (
+        "market-scan | ${{ github.event_name }} | ${{ github.event.schedule || inputs.slot || 'auto' }}"
+    )
     assert "market_scan_slot_guard.py" in scan_text
     assert '--markets "${{ steps.slot_guard.outputs.active_markets }}"' in scan_text
     assert "snapshot-retry-backoff-seconds" in scan_text

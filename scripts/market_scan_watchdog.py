@@ -4,10 +4,12 @@
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import os
 import sys
 import time
+import zipfile
 from datetime import date, datetime, time as datetime_time, timedelta
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
@@ -28,11 +30,12 @@ from scripts.market_scan_artifact_trust import (  # noqa: E402
     validate_watchdog_market_scan as _trusted_validate_watchdog,
 )
 from scripts.market_scan_calendar import evaluate_market_sessions  # noqa: E402
-from scripts.market_scan_slot_guard import SLOT_WINDOWS  # noqa: E402
+from scripts.market_scan_slot_guard import SCHEDULE_TO_SLOT, SLOT_WINDOWS  # noqa: E402
 
 
 SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
 WATCHDOG_GRACE = timedelta(minutes=5)
+CLOSE_ACTIVE_RUN_STATUSES = {"queued", "in_progress", "waiting", "pending", "requested"}
 
 
 def _parse_datetime(value: str) -> datetime:
@@ -98,6 +101,82 @@ def _runs_for_slot(
         key=lambda item: str(item.get("created_at") or ""),
         reverse=True,
     )
+
+
+def _declared_scan_slot(run: Mapping[str, Any]) -> str | None:
+    title = str(run.get("display_title") or "").split(" | ", 2)
+    if len(title) != 3 or title[0] != "market-scan" or title[1] != run.get("event"):
+        return None
+    if title[1] == "schedule":
+        return SCHEDULE_TO_SLOT.get(title[2])
+    if title[1] == "workflow_dispatch":
+        return title[2] if title[2] in SLOT_WINDOWS else "manual"
+    return None
+
+
+def _has_close_scan_report(
+    client: GitHubActionsClient, run: Mapping[str, Any], observed_at: datetime
+) -> bool:
+    """Verify the current attempt entered the requested slot, and check its result on success."""
+    run_id, run_number, attempt = (int(run.get(key) or 0) for key in ("id", "run_number", "run_attempt"))
+    if min(run_id, run_number, attempt) <= 0:
+        return False
+    name = f"market-scan-report-{run_number}-{attempt}"
+    report = next(
+        (item for item in client.artifacts_for_run(run_id)
+         if item.get("name") == name and not item.get("expired")),
+        None,
+    )
+    if report is None:
+        return False
+    archive = client.download_artifact(int(report["id"]))
+    try:
+        with zipfile.ZipFile(io.BytesIO(archive)) as result:
+            guard_path = "reports/market_scan_slot_guard.json"
+            if result.getinfo(guard_path).file_size > 16 * 1024:
+                return False
+            guard = json.loads(result.read(guard_path))
+            if not (
+                isinstance(guard, Mapping)
+                and guard.get("slot") == "close"
+                and guard.get("slot_key") == f"{observed_at.date()}:close"
+                and guard.get("should_run") is True
+            ):
+                return False
+            if run.get("conclusion") == "success":
+                result_path = "reports/market_scan.json"
+                if result.getinfo(result_path).file_size > 8 * 1024 * 1024:
+                    return False
+                _, generated_at, _ = _trusted_validate_watchdog(
+                    result.read(result_path), slot="close", observed_at=observed_at,
+                )
+                return generated_at <= observed_at
+            return True
+    except (KeyError, ValueError, zipfile.BadZipFile):
+        return False
+
+
+def _find_close_scan(
+    client: GitHubActionsClient, runs: Sequence[Mapping[str, Any]], observed_at: datetime
+) -> tuple[Mapping[str, Any] | None, str]:
+    failed_run = None
+    for run in runs:
+        declared_slot = _declared_scan_slot(run)
+        if declared_slot not in {None, "close"}:
+            continue
+        status = run.get("status")
+        if status in CLOSE_ACTIVE_RUN_STATUSES and declared_slot == "close":
+            return run, "already_running"
+        if status != "completed":
+            continue
+        if run.get("conclusion") == "success":
+            if _has_close_scan_report(client, run, observed_at):
+                return run, "already_covered"
+        elif failed_run is None and (
+            declared_slot == "close" or _has_close_scan_report(client, run, observed_at)
+        ):
+            failed_run = run
+    return failed_run, "already_failed"
 
 
 class GitHubActionsClient:
@@ -421,25 +500,23 @@ def run_watchdog(
         }
     runs = client.recent_runs(workflow, ref)
     slot_runs = _runs_for_slot(runs, slot=resolved_slot, session_date=now.date())
-    covered = existing_run_covers_slot(runs, slot=resolved_slot, session_date=now.date())
-    if slot_runs:
-        latest = slot_runs[0]
-        latest_status = str(latest.get("status") or "")
-        latest_conclusion = str(latest.get("conclusion") or "")
+    if resolved_slot == "close":
+        observed_run, status = _find_close_scan(client, slot_runs, now)
+    else:
+        observed_run = slot_runs[0] if slot_runs else None
+        covered = existing_run_covers_slot(runs, slot=resolved_slot, session_date=now.date())
+        status = "already_covered" if covered else "already_failed"
+    if observed_run is not None:
         result = {
-            "status": (
-                "already_covered"
-                if covered
-                else "already_failed"
-            ),
+            "status": status,
             "slot": resolved_slot,
             "observed_at": now.isoformat(timespec="seconds"),
             "calendar_status": calendar.get("status") or "unknown",
             "active_markets": list(calendar.get("active_markets") or []),
             "observed_run": {
-                "run_id": latest.get("id"),
-                "status": latest_status,
-                "conclusion": latest_conclusion,
+                "run_id": observed_run.get("id"),
+                "status": str(observed_run.get("status") or ""),
+                "conclusion": str(observed_run.get("conclusion") or ""),
             },
         }
     elif not observe_only:
