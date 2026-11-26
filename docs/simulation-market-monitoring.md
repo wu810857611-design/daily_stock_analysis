@@ -296,6 +296,13 @@ HTTP 请求，不增加请求次数或研究预算，PDF 缺失、身份不符�
 `integration_verification.tencent_route_rejections`累计原因计数。此改动不调整90秒
 新鲜度门槛，也不把约15分钟延迟的港股报价提升为可执行行情。
 
+分钟监控为已实测的中际旭创（300308.SZ）接入通达信备用报价。Actions 从
+`TDX_DATA_TOKEN` Secret 读取凭据，具备凭据时按需安装官方 Linux SDK。腾讯主路由和
+备用路由均无法提供可用报价时，才在深市连续竞价时段查询通达信。使用 `HqDate` 和
+`RefreshTime` 核对同一交易日及实际收取时间，严格拒绝未来时间及超过 90 秒的报价。
+会话验收保留 `integration_verification.tdx_fallback_outcomes`，汇总实际接管和拒绝结果。
+港股继续走既有腾讯、长桥路径。去掉 `TDX_DATA_TOKEN` 可关闭该备用源。
+
 盘中候选事件的 `data_quality` 表示已通过既有新鲜度校验的行情状态 `fresh_l1`；
 数值型研究评分独立保存在 `research_data_quality`，仍按原规则参与策略与置信度计算。
 不得把研究评分当作行情状态交给交易门禁。旧版已因这一类型混淆被拒绝、且未形成

@@ -499,6 +499,16 @@ jobs:
           echo "LONGBRIDGE_OAUTH_CACHE_SOURCE=$OAUTH_SOURCE" >> "$GITHUB_ENV"
           echo "Longbridge OAuth cache source: $OAUTH_SOURCE"
 
+      - name: 安装可选通达信行情 SDK
+        if: steps.market_calendar.outputs.should_run == 'true'
+        env:
+          TDX_CONFIGURED: ${{ secrets.TDX_DATA_TOKEN != '' }}
+        run: |
+          if [ "$TDX_CONFIGURED" = "true" ]; then
+            python -m pip install --retries 1 --timeout 8 'tdxaidata==1.3.1' requests \
+              || echo "::warning::通达信 SDK 安装失败，本场继续使用原有行情"
+          fi
+
       - name: 运行分钟级 A/H 盘中模拟监控
         if: steps.market_calendar.outputs.should_run == 'true'
         shell: bash
@@ -531,6 +541,7 @@ jobs:
           # 公开仓库不得把真实数量/成本和绝对净值写入明文 artifact。
           # PRIMARY 账户已经初始化完成；运行时只允许恢复现有加密状态。
           SHADOW_AB_STATE_KEY: ${{ secrets.SHADOW_AB_STATE_KEY }}
+          TDX_DATA_TOKEN: ${{ secrets.TDX_DATA_TOKEN }}
           WATCH_ACCOUNTS_PRIVATE_JSON: ${{ secrets.WATCH_ACCOUNTS_PRIVATE_JSON }}
           GH_TOKEN: ${{ github.token }}
         run: |
