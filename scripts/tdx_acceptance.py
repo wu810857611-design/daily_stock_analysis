@@ -36,14 +36,20 @@ def test_snapshot():
             config.write(handle, space_around_delimiters=False)
         os.environ["TDX_AI_DATA_LIB"] = str(lib)
         from tdxaidata import tqs
-        symbols = ["300308.SZ", "000001.SZ", "600519.SH", "920002.BJ", "00700.HK", "00388.HK"]
-        phases = [("mixed", symbols), ("hong_kong", ["00700.HK", "00388.HK"])]
+        phases = [
+            ("shenzhen", ["300308.SZ", "000001.SZ"]),
+            ("shenzhen_reverse", ["000001.SZ", "300308.SZ"]),
+            ("a_share_mixed", ["600519.SH", "300308.SZ", "920002.BJ"]),
+            ("shanghai", ["600519.SH", "600000.SH"]),
+            ("beijing", ["920002.BJ"]),
+            ("shenzhen_missing_first", ["999999.SZ", "300308.SZ", "000001.SZ"]),
+        ]
         for label, codes in phases:
             started = datetime.now(timezone.utc)
             try:
                 quotes = tqs.get_market_snapshot_batch(
                     stock_list=codes,
-                    field_list=["Now", "LastClose", "Volume", "Amount", "RefreshTime", "ErrorCode"],
+                    field_list=["Now", "LastClose", "Volume", "Amount", "RefreshTime", "ErrorCode", "Code", "StockCode"],
                 )
                 dates = tqs.get_more_info_batch(stock_list=codes, field_list=["HqDate"])
                 info = tqs.get_stock_info_batch(
@@ -64,7 +70,7 @@ def test_snapshot():
             for code in codes:
                 quote, stamp, static = (v.get(code) or {} for v in (q,d,i))
                 emit("MARKET_SAMPLE", {"group":label,"code":code,
-                    "quote":{k:quote[k] for k in ("Now","LastClose","Volume","Amount","RefreshTime","ErrorCode") if k in quote},
+                    "quote":{k:quote[k] for k in ("Now","LastClose","Volume","Amount","RefreshTime","ErrorCode","Code","StockCode") if k in quote},
                     "date":stamp.get("HqDate"),
                     "metadata":{k:static[k] for k in ("Name","DelayMin","IsHKGP","BelongHSGT","HKVolBaseRate","HSStockKind","Currency") if k in static},
                 })
