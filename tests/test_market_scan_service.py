@@ -3374,3 +3374,79 @@ def test_hkex_close_bulk_recovery_filters_session_identity_and_currency(tmp_path
     assert result["stop_reason"] == "Push2RateLimitError"
     parsed = quotes(NOW.date(), {"HK00010", "HK00700"})
     assert parsed == {"rows": {}, "suspended": ["HK00010"]}
+
+
+@pytest.mark.parametrize("unresolved", [False, True])
+def test_close_official_roster_and_suspensions_control_coverage(tmp_path, unresolved):
+    _service(tmp_path, qwen=None, deepseek=None).run_l1()
+
+    def unavailable(*args):
+        raise TimeoutError("offline")
+
+    service = _service(tmp_path, qwen=None, deepseek=None, hk_loader=unavailable,
+                       clock=lambda: NOW.replace(hour=20, minute=5))
+    members = {"HK00981", "HK00010"} | ({"HK12345"} if unresolved else set())
+    service.hk_close_membership_loader = lambda day: members
+    service.hk_close_daily_loader = unavailable
+
+    def official(day, codes):
+        assert codes == members
+        return {"rows": {"HK00981": dict(code="HK00981", name="SMIC", price=48.74,
+                    change_pct=1, volume=3000000, amount=146220000, is_connect=True)},
+                "suspended": ["HK00010"]}
+
+    service.hk_close_bulk_loader = official
+    result = service.run_l1()
+    diag = result.diagnostics
+    coverage = diag["hk_snapshot_coverage"]
+    assert diag["hk_connect_strict"] is (not unresolved)
+    assert coverage["covered_count"] == 1
+    assert coverage["expected_count"] == len(members) - 1
+    assert coverage["universe_count"] == len(members)
+    assert coverage["suspended_codes"] == ["HK00010"]
+    assert coverage["missing_codes"] == (["HK12345"] if unresolved else [])
+    assert set(diag["hk_close_daily_recovery"]["attempts"]) == set(coverage["missing_codes"])
+    saved = json.loads(service.config.hk_membership_cache_path.read_text())
+    assert set(saved["membership_codes"]) == members
+    assert saved["membership_source"] == diag["hk_membership_source"] == "sse.szse.eligible_stocks"
+    assert all(row["code"] == "HK00981" for row in result.hk_candidates)
+
+
+def test_bad_official_roster_keeps_prior_membership_and_expiry(tmp_path):
+    seed = _service(tmp_path, qwen=None, deepseek=None)
+    seed.run_l1()
+    previous = seed.config.hk_membership_cache_path.read_bytes()
+
+    def unavailable(*args):
+        raise ValueError("date mismatch")
+
+    service = _service(tmp_path, qwen=None, deepseek=None, hk_loader=unavailable,
+                       clock=lambda: NOW.replace(hour=20))
+    service.hk_close_membership_loader = unavailable
+    diag = service.run_l1().diagnostics
+    assert any("official_membership:" in error for error in diag["hk_snapshot_provider_errors"])
+    assert service.config.hk_membership_cache_path.read_bytes() == previous
+    assert diag["hk_snapshot_coverage"]["expected_count"] == 2
+
+
+
+def test_close_suspension_without_recovered_prices_and_http_failure(tmp_path):
+    _service(tmp_path, qwen=None, deepseek=None).run_l1()
+    def unavailable(*args):
+        raise TimeoutError("offline")
+    service = _service(tmp_path, qwen=None, deepseek=None, hk_loader=unavailable,
+                       clock=lambda: NOW.replace(hour=20))
+    service.hk_close_daily_loader = unavailable
+    service.hk_close_bulk_loader = lambda *_: {"rows": {}, "suspended": ["HK00981"]}
+    diag = service.run_l1().diagnostics
+    cover = diag["hk_snapshot_coverage"]
+    assert (cover["covered_count"], cover["expected_count"], cover["missing_codes"]) == (0, 1, ["HK00700"])
+    assert "成分共2只，港交所确认停牌1只" in render_market_scan_markdown({"diagnostics": diag})
+
+    def http_failure(*args):
+        from requests import HTTPError
+        raise HTTPError("404 Client Error: Not Found")
+    service.hk_close_bulk_loader = http_failure
+    diag = service.run_l1().diagnostics
+    assert diag["hk_snapshot_coverage"]["expected_count"] == 2
+    assert diag["hk_close_daily_recovery"]["hkex_http_status"] == 404

@@ -8,6 +8,7 @@ import json
 import os
 import sys
 import tempfile
+from time import sleep
 from datetime import datetime, time
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -219,6 +220,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--now", default="")
     parser.add_argument("--github-output", default="")
     parser.add_argument("--report", type=Path, default=Path("reports/market_scan_slot_guard.json"))
+    parser.add_argument("--wait-for-hk-close", action="store_true")
     parser.add_argument("--mark-complete", action="store_true")
     parser.add_argument("--slot-key", default="")
     parser.add_argument("--run-id", default="")
@@ -245,6 +247,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         now=now,
         ledger=_read_ledger(ledger_path),
     )
+    if (args.wait_for_hk_close and result["should_run"] and result["slot"] == "close"
+            and "hk" in result["active_markets"]):
+        ready = datetime.combine(now.date(), time(20, 5), tzinfo=SHANGHAI_TZ)
+        delay = (ready - now).total_seconds()
+        if delay > 0:
+            print(f"Waiting {delay:.0f}s for the HKEX daily quotations", flush=True)
+            sleep(delay)
+            resumed = _parse_now("")
+            result["waited_from"] = now.isoformat(timespec="seconds")
+            result["observed_at"] = resumed.isoformat(timespec="seconds")
+            if resumed < ready or resumed > datetime.combine(now.date(), SLOT_WINDOWS["close"][1], tzinfo=SHANGHAI_TZ):
+                result.update(should_run=False, skip_reason="outside_hk_close_window")
     args.report.parent.mkdir(parents=True, exist_ok=True)
     _atomic_write_json(args.report, result)
     _write_outputs(args.github_output, result)

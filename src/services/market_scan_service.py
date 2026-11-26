@@ -40,6 +40,7 @@ from src.services.position_sizing_policy import (
     classify_opportunity,
     opportunity_policy,
 )
+from src.services.hk_connect_membership import SOURCE as HK_MEMBERSHIP_SOURCE
 from src.services.hkex_daily_quotes import SOURCE as HKEX_CLOSE_SOURCE
 from src.services.market_scan_research import has_announcement_excerpt, meaningful
 from src.services.research_execution import ResearchCallError, run_isolated
@@ -49,6 +50,7 @@ from src.services.tencent_market_snapshot import HK_QUOTE_FRESHNESS_SECONDS
 SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
 HK_CLOSE_DAILY_SOURCE = "akshare.stock_hk_hist"
 HK_CLOSE_DAILY_BUDGET_SECONDS = 30.0
+HK_CLOSE_MEMBERSHIP_BUDGET_SECONDS = 35.0
 HK_CLOSE_DAILY_MAX_REQUESTS = 20
 HK_CLOSE_DAILY_REQUEST_SECONDS = 4.0
 SCHEMA_VERSION = 1
@@ -590,20 +592,26 @@ def _hk_rows_for_session(frame: pd.DataFrame, now: datetime, fetched_at: Any) ->
     return frame.loc[stamps.between(close_start, fetched + timedelta(seconds=30))]
 
 
-def _hk_snapshot_coverage(frame: pd.DataFrame, membership_codes: set[str]) -> Dict[str, Any]:
-    present = set(frame["code"]) & membership_codes
+def _hk_snapshot_coverage(
+    frame: pd.DataFrame, membership_codes: set[str], suspended_codes: Iterable[str] = (),
+) -> Dict[str, Any]:
+    suspended = membership_codes.intersection(suspended_codes)
+    active = membership_codes - suspended
+    present = set(frame["code"]) & active
     usable = set()
     if not frame.empty:
         numeric = frame[["price", "change_pct", "volume", "amount"]]
         valid = numeric.notna().all(axis=1) & np.isfinite(numeric).all(axis=1)
         valid &= numeric[["price", "volume", "amount"]].ge(0).all(axis=1)
-        usable = set(frame.loc[valid, "code"]) & membership_codes
+        usable = set(frame.loc[valid, "code"]) & active
     return {
-        "expected_count": len(membership_codes),
+        "expected_count": len(active),
+        "universe_count": len(membership_codes),
+        "suspended_codes": sorted(suspended),
         "received_count": len(present),
         "covered_count": len(usable),
-        "missing_codes": sorted(membership_codes - usable),
-        "absent_codes": sorted(membership_codes - present),
+        "missing_codes": sorted(active - usable),
+        "absent_codes": sorted(active - present),
         "invalid_codes": sorted(present - usable),
     }
 
@@ -1405,6 +1413,7 @@ class MarketScanService:
         hk_all_snapshot_loader: Optional[SnapshotLoader] = None,
         hk_membership_snapshot_loader: Optional[MembershipSnapshotLoader] = None,
         hk_close_daily_loader: Optional[Callable[[str, date], pd.DataFrame]] = None,
+        hk_close_membership_loader: Optional[Callable[[date], set[str]]] = None,
         hk_close_bulk_loader: Optional[Callable[[date, set[str]], dict]] = None,
         config: Optional[MarketScanConfig] = None,
         clock: Clock = _now_shanghai,
@@ -1416,6 +1425,7 @@ class MarketScanService:
         self.hk_all_snapshot_loader = hk_all_snapshot_loader
         self.hk_membership_snapshot_loader = hk_membership_snapshot_loader
         self.hk_close_daily_loader = hk_close_daily_loader
+        self.hk_close_membership_loader = hk_close_membership_loader
         self.hk_close_bulk_loader = hk_close_bulk_loader
         self.history_loader = history_loader
         self.qwen_reviewer = qwen_reviewer
@@ -1660,6 +1670,24 @@ class MarketScanService:
                 self._load_hk_connect_snapshot(now)
             )
             membership_codes = set(hk_metadata.get("membership_codes") or [])
+            if self.hk_close_membership_loader is not None and now.astimezone(SHANGHAI_TZ).time() >= wall_time(16, 10):
+                # Quote retries can exhaust the snapshot stage. Reserve a separate,
+                # bounded close window inside the existing whole-scan deadline.
+                self._begin_stage("hk_close_official", HK_CLOSE_MEMBERSHIP_BUDGET_SECONDS + HK_CLOSE_DAILY_BUDGET_SECONDS)
+                trade_date = now.astimezone(SHANGHAI_TZ).date()
+                budget, _ = self._remaining_call_budget(HK_CLOSE_MEMBERSHIP_BUDGET_SECONDS)
+                try:
+                    official = run_isolated(lambda: self.hk_close_membership_loader(trade_date),
+                                            budget, network_timeout_seconds=15.0)
+                except ResearchCallError as exc:
+                    hk_metadata.setdefault("provider_errors", []).append(f"official_membership:{exc}")
+                else:
+                    membership_codes = official
+                    hk_metadata.update(membership_source=HK_MEMBERSHIP_SOURCE, membership_age_hours=0.0,
+                                       membership_fetched_at=_iso_datetime(self.clock()),
+                                       membership_codes=sorted(official),
+                                       **_membership_cache_warning(0.0, self.config.hk_membership_cache_max_age_hours))
+                    self._write_hk_membership_cache(hk_metadata)
             if membership_codes:
                 hk_frame = hk_frame[hk_frame["code"].isin(membership_codes)].copy()
                 membership_frame = hk_frame
@@ -1688,8 +1716,11 @@ class MarketScanService:
                                 [hk_frame[~hk_frame["code"].isin(recovered["code"])], recovered],
                                 ignore_index=True,
                             )
-                        hk_coverage = _hk_snapshot_coverage(hk_frame, membership_codes)
-                hk_frame = hk_frame[~hk_frame["code"].isin(hk_coverage["missing_codes"])]
+                    hk_coverage = _hk_snapshot_coverage(
+                        hk_frame, membership_codes, hk_daily_recovery.get("hkex_suspended_codes", ()),
+                    )
+                excluded = hk_coverage["missing_codes"] + hk_coverage["suspended_codes"]
+                hk_frame = hk_frame[~hk_frame["code"].isin(excluded)]
                 hk_safe_halt = hk_frame.empty
                 hk_warning = "港股通成分或有效报价不可用，已停止该市场主动推荐" if hk_safe_halt else ""
         else:
@@ -2214,6 +2245,10 @@ class MarketScanService:
                                     min(budget, 20.0), network_timeout_seconds=12.0)
             except ResearchCallError as exc:
                 diagnostics["hkex_error"] = exc.error_class
+                if exc.error_class == "HTTPError":
+                    status = re.search(r"\b([45][0-9]{2}) (?:Client|Server) Error\b", str(exc))
+                    if status:
+                        diagnostics["hkex_http_status"] = int(status[1])
                 if exc.error_class in {"IsolationUnsupported", "WorkerCleanupFailed"}:
                     diagnostics["stop_reason"] = exc.error_class
                     return pd.DataFrame(), diagnostics
@@ -3612,11 +3647,13 @@ def render_market_scan_markdown(result: Mapping[str, Any]) -> str:
         )
         coverage = diagnostics.get("hk_snapshot_coverage") or {}
         coverage_summary = ""
-        if not is_a_share and coverage.get("expected_count"):
+        if not is_a_share and "expected_count" in coverage:
             coverage_summary = (
                 f"；覆盖={coverage['covered_count']}/{coverage['expected_count']}"
                 f"；缺失={len(coverage['missing_codes'])}只（代码见JSON归档）"
             )
+            if coverage.get("suspended_codes"):
+                coverage_summary += f"；成分共{coverage['universe_count']}只，港交所确认停牌{len(coverage['suspended_codes'])}只"
         if not strict and market_status != "degraded":
             return f"不可用（该市场已安全阻断）{coverage_summary}"
         source = diagnostics.get(

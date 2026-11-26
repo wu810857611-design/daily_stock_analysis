@@ -35,7 +35,7 @@ jobs:
   scan:
     runs-on: ubuntu-latest
     environment: STOCK_LIST
-    timeout-minutes: 75
+    timeout-minutes: ${{ (inputs.slot == 'close' || github.event.schedule == '5 11 * * 1-5' || github.event.schedule == '15 11 * * 1-5') && 135 || 75 }}
     env:
       MARKET_SCAN_MODE: simulation_only
       MARKET_SCAN_STATE_DIR: data/market_scan
@@ -187,6 +187,7 @@ jobs:
         run: |
           set -euo pipefail
           python3 scripts/market_scan_slot_guard.py \
+            --wait-for-hk-close \
             --state-dir "$MARKET_SCAN_STATE_DIR" \
             --event-name "${GITHUB_EVENT_NAME}" \
             --event-schedule "${EVENT_SCHEDULE:-}" \
