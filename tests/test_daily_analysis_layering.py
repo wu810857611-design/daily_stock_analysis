@@ -215,3 +215,32 @@ class ReportArchiveTests(unittest.TestCase):
         self.assertEqual(optional.returncode, 0, optional.stderr)
         self.assertIn("PRIMARY 不受影响", optional.stdout)
         self.assertNotIn("analysis false", optional.stdout)
+
+
+def test_candidate_budget_uses_job_headroom_after_the_first_two_optional_layers():
+    text = _workflow_text()
+    begin = text.index("          OPTIONAL_SAFETY_MARGIN_SECONDS=")
+    end = text.index('run_analysis_layer "P3_CANDIDATES"', begin)
+    block = textwrap.dedent(text[begin:text.index("\n", end)])
+    setup = """
+        set -eu
+        elapsed=0
+        date() { echo "$elapsed"; }
+        run_analysis_layer() {
+            if [ "$1" = P2_ACCOUNT_HOLDINGS ]; then elapsed=$P2_END; fi
+            if [ "$1" = P3_CANDIDATES ]; then echo "$((OPTIONAL_ANALYSIS_DEADLINE - elapsed))"; fi
+        }
+        JOB_BUDGET_STARTED_EPOCH=$1
+        P2_END=$2
+        ANALYSIS_TIMEOUT_MINUTES=90
+        FAMILY_STOCKS= ACCOUNT_HOLDING_STOCKS= CANDIDATE_STOCKS=
+    """
+    # Job end includes the eight minutes needed for persistence.
+    for job_end, p2_end, expected in [(5400, 1533, 360), (2280, 1533, 267),
+                                      (5400, 600, 1200), (2280, 1800, 0)]:
+        run = subprocess.run(
+            ["bash", "-c", textwrap.dedent(setup) + block, "budget-test",
+             str(job_end - 5400), str(p2_end)],
+            capture_output=True, text=True, check=True, timeout=5,
+        )
+        assert int(run.stdout) == expected
