@@ -1229,7 +1229,7 @@ class LongbridgeBatchQuoteFetcher:
 
 
 class DecisionQuoteFetcher:
-    """Tencent baseline plus authenticated Longbridge upgrades for HK quotes."""
+    """Tencent baseline, Longbridge for Hong Kong, and optional TDX for 300308."""
 
     min_interval_seconds = 30.0
 
@@ -1239,6 +1239,7 @@ class DecisionQuoteFetcher:
         freshness_seconds: float = DEFAULT_FRESHNESS_SECONDS,
         tencent_fetcher: Optional[TencentBatchQuoteFetcher] = None,
         longbridge_fetcher: Optional[LongbridgeBatchQuoteFetcher] = None,
+        tdx_loader: Optional[Callable[[Sequence[str]], Mapping[str, Any]]] = None,
     ):
         self.freshness_seconds = freshness_seconds
         self.tencent_fetcher = tencent_fetcher or TencentBatchQuoteFetcher(
@@ -1247,6 +1248,11 @@ class DecisionQuoteFetcher:
         self.longbridge_fetcher = longbridge_fetcher or LongbridgeBatchQuoteFetcher(
             freshness_seconds=freshness_seconds
         )
+        self.tdx_loader = tdx_loader
+        if self.tdx_loader is None and os.getenv("TDX_DATA_TOKEN", "").strip():
+            from src.services.tdx_decision_quotes import fetch_dated_snapshots
+
+            self.tdx_loader = fetch_dated_snapshots
         self.min_interval_seconds = max(
             float(getattr(self.tencent_fetcher, "min_interval_seconds", 0.0)),
             float(getattr(self.longbridge_fetcher, "min_interval_seconds", 0.0)),
@@ -1263,13 +1269,69 @@ class DecisionQuoteFetcher:
                 return replace(quote, is_stale=True, stale_seconds=age)
         return quote
 
+    def _tdx_fallback(
+        self, results: Dict[str, RealtimeQuote], selected_at: datetime,
+    ) -> Dict[str, Any]:
+        # Only the verified Shenzhen security is eligible during continuous trading.
+        symbol = "300308"
+        baseline = self._expire_trade(results.get(symbol), selected_at)
+        if baseline and baseline is not results[symbol]:
+            results[symbol] = baseline
+        if baseline and baseline.price is not None and baseline.provider_timestamp and not baseline.is_stale:
+            return {"status": "tencent_healthy"}
+        code = "300308.SZ"
+        started = time.monotonic()
+        try:
+            rows = self.tdx_loader([code])
+        except Exception as exc:
+            return {"status": "provider_error", "error_class": type(exc).__name__}
+        received = selected_at + timedelta(seconds=time.monotonic() - started)
+        row = rows.get(code) if isinstance(rows, Mapping) else None
+        if not isinstance(row, Mapping):
+            return {"status": "missing_quote"}
+        raw_stamp = f"{row.get('HqDate', '')}{row.get('RefreshTime', '')}"
+        stamp = parse_tencent_timestamp(raw_stamp) if re.fullmatch(r"[0-9]{14}", raw_stamp) else None
+        if stamp is None or stamp.date() != received.date():
+            return {"status": "invalid_quote_timestamp"}
+        age = (received - stamp).total_seconds()
+        if age < 0 or age > min(self.freshness_seconds, 90.0):
+            return {"status": "stale_or_future_quote"}
+        if not self._in_tdx_session(received) or not self._in_tdx_session(stamp):
+            return {"status": "outside_continuous_trading"}
+        price = _positive_float(row.get("Now"))
+        previous_close = _positive_float(row.get("LastClose"))
+        if price is None or previous_close is None:
+            return {"status": "invalid_quote_price"}
+        results[symbol] = RealtimeQuote(
+            symbol=symbol, name=baseline.name if baseline else "",
+            price=price, change_pct=(price / previous_close - 1) * 100,
+            volume=_nonnegative_float(row.get("Volume")),
+            provider_timestamp=_iso(stamp), fetched_at=_iso(received),
+            stale_seconds=age, is_stale=False, source="tdx_aidata_snapshot",
+        )
+        return {"status": "recovered"}
+
+    @staticmethod
+    def _in_tdx_session(now: datetime) -> bool:
+        local = now.astimezone(SHANGHAI_TZ).time()
+        return (datetime_time(9, 30) <= local < datetime_time(11, 30)
+                or datetime_time(13) <= local < datetime_time(14, 57))
+
     def fetch(
         self, symbols: Sequence[str], *, now: Optional[datetime] = None
     ) -> Dict[str, RealtimeQuote]:
         started = time.monotonic()
         fetched_at = now or datetime.now(SHANGHAI_TZ)
         canonical = list(dict.fromkeys(canonical_symbol(symbol) for symbol in symbols))
-        results = self.tencent_fetcher.fetch(canonical, now=fetched_at)
+        try_tdx = self.tdx_loader is not None and "300308" in canonical and self._in_tdx_session(fetched_at)
+        tencent_error = ""
+        try:
+            results = self.tencent_fetcher.fetch(canonical, now=fetched_at)
+        except Exception as exc:
+            if not try_tdx:
+                raise
+            results = {}
+            tencent_error = type(exc).__name__
         baseline_diagnostics = dict(
             getattr(self.tencent_fetcher, "last_diagnostics", {}) or {}
         )
@@ -1356,9 +1418,12 @@ class DecisionQuoteFetcher:
                 if fallback is not None:
                     results[symbol] = fallback
                     primary_fallback_covered += 1
+        tdx = self._tdx_fallback(results, selected_at) if try_tdx else {}
         self.last_diagnostics = {
             "baseline": "tencent_batch",
             "baseline_diagnostics": baseline_diagnostics,
+            "baseline_error": tencent_error,
+            "tdx_fallback": tdx,
             "hk_realtime_source": "longbridge_batch",
             "longbridge_configured": bool(self.longbridge_fetcher.configured),
             "hk_realtime_entitled": bool(
@@ -4660,6 +4725,10 @@ def run_cycle(
                 quote_diagnostics.get("hk_primary_fallback_fresh_covered") or 0
             )
         if isinstance(verification, MutableMapping):
+            tdx_status = (quote_diagnostics.get("tdx_fallback") or {}).get("status")
+            if tdx_status:
+                outcomes = verification.setdefault("tdx_fallback_outcomes", {})
+                outcomes[tdx_status] = int(outcomes.get(tdx_status, 0)) + 1
             baseline_diagnostics = quote_diagnostics.get("baseline_diagnostics")
             if isinstance(baseline_diagnostics, Mapping):
                 alternate_requests = int(
