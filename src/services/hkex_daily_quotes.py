@@ -5,6 +5,7 @@ import re
 
 import requests
 
+from src.services.research_execution import record_isolated_phase
 
 SOURCE = "hkex.daily_quotations"
 START = b'<a name = "quotations">'
@@ -65,7 +66,8 @@ def parse_daily_quotes(data: bytes, trade_date: date, symbols: set[str]) -> dict
 
 def load_daily_quotes(trade_date: date, symbols: set[str]) -> dict:
     url = f"https://www.hkex.com.hk/eng/stat/smstat/dayquot/d{trade_date:%y%m%d}e.htm"
-    with requests.get(url, stream=True, timeout=(8, 12)) as response:
+    with requests.get(url, headers={"Cache-Control": "no-cache"}, stream=True, timeout=(8, 12)) as response:
+        record_isolated_phase(f"official_http_status_{response.status_code}")
         response.raise_for_status()
         data = bytearray()
         for chunk in response.iter_content(65536):

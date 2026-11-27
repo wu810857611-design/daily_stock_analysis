@@ -3447,6 +3447,83 @@ def test_close_suspension_without_recovered_prices_and_http_failure(tmp_path):
         from requests import HTTPError
         raise HTTPError("404 Client Error: Not Found")
     service.hk_close_bulk_loader = http_failure
+    service.sleeper = lambda _: None
     diag = service.run_l1().diagnostics
     assert diag["hk_snapshot_coverage"]["expected_count"] == 2
     assert diag["hk_close_daily_recovery"]["hkex_http_status"] == 404
+
+
+@pytest.mark.parametrize(
+    ("responses", "total_budget", "expected_statuses", "expected_delays"),
+    [([404, 404, 200], 300, [404, 404, 200], [30.0, 60.0]),
+     ([404, 404, 404], 300, [404, 404, 404], [30.0, 60.0]),
+     ([403], 300, [403], []),
+     ([404, 200], 65, [404], [])],
+)
+def test_close_hkex_retries_dated_table_and_preserves_fallback_budget(
+    tmp_path, monkeypatch, responses, total_budget, expected_statuses, expected_delays,
+):
+    from io import BytesIO
+    from requests import Response
+    from src.services import hkex_daily_quotes
+
+    official_table = b'''DATE: 28 JUL 2026 (TUESDAY)
+<a name = "quotations">QUOTATIONS</a>
+ CODE  NAME OF STOCK    CUR PRV.CLO./    ASK/    HIGH/      SHARES TRADED/
+                            CLOSING      BID     LOW        TURNOVER ($)
+*  981 SMIC             HKD   49.12    48.74    49.56           95,478,871
+                              48.74    48.72    46.62        4,596,191,521
+   700 TENCENT          HKD TRADING SUSPENDED
+<a name = "sales_all">'''
+    requests_log = tmp_path / "hkex-requests.txt"
+
+    def request(url, *, headers, stream, timeout):
+        assert url.endswith("/d260728e.htm") and headers == {"Cache-Control": "no-cache"}
+        assert stream and timeout == (8, 12)
+        attempts = requests_log.read_text().splitlines() if requests_log.exists() else []
+        response = Response()
+        response.url = url
+        response.status_code = responses[len(attempts)]
+        response.raw = BytesIO(official_table if response.status_code == 200 else b"")
+        requests_log.write_text("\n".join([*attempts, str(response.status_code)]))
+        return response
+
+    monkeypatch.setattr(hkex_daily_quotes.requests, "get", request)
+    _service(tmp_path, qwen=None, deepseek=None).run_l1()
+    close_time = NOW.replace(hour=20, minute=5)
+    delays = []
+
+    def sleep(seconds):
+        delays.append(seconds)
+
+    def no_connect():
+        raise TimeoutError("connect unavailable")
+
+    service = _service(tmp_path, qwen=None, deepseek=None, hk_loader=no_connect,
+                       clock=lambda: close_time + timedelta(seconds=sum(delays)),
+                       config_overrides={"snapshot_retry_backoff_seconds": 0, "total_timeout_seconds": total_budget})
+    service.sleeper = sleep
+    service.monotonic = lambda: 1.0 + sum(delays)
+    service.hk_close_membership_loader = lambda day: {"HK00981", "HK00700"}
+    service.hk_close_bulk_loader = hkex_daily_quotes.load_daily_quotes
+    service.hk_close_daily_loader = lambda code, day: pd.DataFrame([{
+        "日期": day, "收盘": 50, "涨跌幅": 2, "成交量": 200000, "成交额": 10000000,
+    }])
+
+    diagnostics = service.run_l1().diagnostics
+    recovery = diagnostics["hk_close_daily_recovery"]
+    assert requests_log.read_text().splitlines() == [str(status) for status in expected_statuses]
+    assert delays == expected_delays
+    assert [attempt["http_status"] for attempt in recovery["hkex_attempts"]] == expected_statuses
+    for attempt, offset in zip(recovery["hkex_attempts"], (0, 30, 90)):
+        at = (close_time + timedelta(seconds=offset)).isoformat()
+        assert attempt["started_at"] == attempt["finished_at"] == at
+        assert attempt["error"] == ("" if attempt["http_status"] == 200 else "HTTPError")
+    if expected_statuses[-1] == 200:
+        assert recovery["recovered"]["HK00981"]["price"] == 48.74
+        assert recovery["attempts"] == {}
+        assert "hkex_error" not in recovery
+        assert diagnostics["hk_snapshot_coverage"]["suspended_codes"] == ["HK00700"]
+    else:
+        assert recovery["attempts"] == {"HK00700": "recovered", "HK00981": "recovered"}
+        assert diagnostics["hk_snapshot_coverage"]["covered_count"] == 2
