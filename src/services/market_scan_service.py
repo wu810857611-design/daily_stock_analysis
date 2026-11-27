@@ -53,6 +53,9 @@ HK_CLOSE_DAILY_BUDGET_SECONDS = 30.0
 HK_CLOSE_MEMBERSHIP_BUDGET_SECONDS = 35.0
 HK_CLOSE_DAILY_MAX_REQUESTS = 20
 HK_CLOSE_DAILY_REQUEST_SECONDS = 4.0
+HKEX_CLOSE_ATTEMPT_SECONDS = 20.0
+HKEX_CLOSE_RETRY_DELAYS = (0.0, 30.0, 60.0)
+HKEX_CLOSE_BUDGET_SECONDS = sum(HKEX_CLOSE_RETRY_DELAYS) + len(HKEX_CLOSE_RETRY_DELAYS) * HKEX_CLOSE_ATTEMPT_SECONDS
 SCHEMA_VERSION = 1
 MARKET_A = "A"
 MARKET_HK = "HK_CONNECT"
@@ -1673,7 +1676,11 @@ class MarketScanService:
             if self.hk_close_membership_loader is not None and now.astimezone(SHANGHAI_TZ).time() >= wall_time(16, 10):
                 # Quote retries can exhaust the snapshot stage. Reserve a separate,
                 # bounded close window inside the existing whole-scan deadline.
-                self._begin_stage("hk_close_official", HK_CLOSE_MEMBERSHIP_BUDGET_SECONDS + HK_CLOSE_DAILY_BUDGET_SECONDS)
+                bulk_budget = HKEX_CLOSE_BUDGET_SECONDS if self.hk_close_bulk_loader is not None else 0.0
+                self._begin_stage(
+                    "hk_close_official",
+                    HK_CLOSE_MEMBERSHIP_BUDGET_SECONDS + bulk_budget + HK_CLOSE_DAILY_BUDGET_SECONDS,
+                )
                 trade_date = now.astimezone(SHANGHAI_TZ).date()
                 budget, _ = self._remaining_call_budget(HK_CLOSE_MEMBERSHIP_BUDGET_SECONDS)
                 try:
@@ -2217,6 +2224,60 @@ class MarketScanService:
             reason,
         )
 
+    def _load_hkex_close_with_retry(
+        self, trade_date: date, codes: set[str], deadline: float, diagnostics: Dict[str, Any]
+    ) -> Optional[dict]:
+        loader = self.hk_close_bulk_loader
+        assert loader is not None
+        attempts: list[dict] = []
+        diagnostics["hkex_attempts"] = attempts
+        for delay in HKEX_CLOSE_RETRY_DELAYS:
+            if delay:
+                # Keep enough time for this fetch and the existing daily fallback.
+                if deadline - self.monotonic() < delay + HKEX_CLOSE_ATTEMPT_SECONDS + HK_CLOSE_DAILY_BUDGET_SECONDS:
+                    break
+                self.sleeper(delay)
+            remaining = deadline - self.monotonic() - (HK_CLOSE_DAILY_BUDGET_SECONDS if delay else 0.0)
+            if remaining <= 0:
+                break
+            started_at = _iso_datetime(self.clock())
+            execution: dict = {}
+            error = ""
+            result = None
+            status_match = None
+            try:
+                result = run_isolated(
+                    lambda: loader(trade_date, codes),
+                    min(remaining, HKEX_CLOSE_ATTEMPT_SECONDS),
+                    network_timeout_seconds=12.0,
+                    execution_diagnostics=execution,
+                )
+            except ResearchCallError as exc:
+                error = exc.error_class
+                # Custom loaders may raise a requests HTTPError without reporting the phase.
+                if error == "HTTPError":
+                    status_match = re.search(r"\b([45][0-9]{2}) (?:Client|Server) Error\b", str(exc))
+            status = next(
+                (int(item["phase"].rsplit("_", 1)[1]) for item in reversed(execution.get("phases", []))
+                 if item["phase"].startswith("official_http_status_")),
+                int(status_match[1]) if status_match else None,
+            )
+            attempts.append({
+                "started_at": started_at, "finished_at": _iso_datetime(self.clock()),
+                "http_status": status, "error": error,
+            })
+            if status is not None:
+                diagnostics["hkex_http_status"] = status
+            if not error:
+                diagnostics.pop("hkex_error", None)
+                return result
+            diagnostics["hkex_error"] = error
+            if error in {"IsolationUnsupported", "WorkerCleanupFailed"}:
+                diagnostics["stop_reason"] = error
+            if error != "HTTPError" or status != 404:
+                break
+        return None
+
     def _recover_hk_close_daily(
         self, missing: Sequence[str], frame: pd.DataFrame, now: datetime
     ) -> Tuple[pd.DataFrame, Dict[str, Any]]:
@@ -2231,7 +2292,8 @@ class MarketScanService:
         loader = self.hk_close_daily_loader
         assert loader is not None
         try:
-            budget, _ = self._remaining_call_budget(HK_CLOSE_DAILY_BUDGET_SECONDS)
+            bulk_budget = HKEX_CLOSE_BUDGET_SECONDS if self.hk_close_bulk_loader is not None else 0.0
+            budget, _ = self._remaining_call_budget(bulk_budget + HK_CLOSE_DAILY_BUDGET_SECONDS)
         except MarketScanDeadlineExceeded as exc:
             if exc.scope == "total":
                 raise
@@ -2240,19 +2302,10 @@ class MarketScanService:
         deadline = self.monotonic() + budget
         names = frame.set_index("code")["name"].to_dict()
         if self.hk_close_bulk_loader is not None:
-            try:
-                bulk = run_isolated(lambda: self.hk_close_bulk_loader(trade_date, set(missing)),
-                                    min(budget, 20.0), network_timeout_seconds=12.0)
-            except ResearchCallError as exc:
-                diagnostics["hkex_error"] = exc.error_class
-                if exc.error_class == "HTTPError":
-                    status = re.search(r"\b([45][0-9]{2}) (?:Client|Server) Error\b", str(exc))
-                    if status:
-                        diagnostics["hkex_http_status"] = int(status[1])
-                if exc.error_class in {"IsolationUnsupported", "WorkerCleanupFailed"}:
-                    diagnostics["stop_reason"] = exc.error_class
-                    return pd.DataFrame(), diagnostics
-            else:
+            bulk = self._load_hkex_close_with_retry(trade_date, set(missing), deadline, diagnostics)
+            if "stop_reason" in diagnostics:
+                return pd.DataFrame(), diagnostics
+            if bulk is not None:
                 diagnostics["hkex_suspended_codes"] = bulk["suspended"]
                 for code, row in bulk["rows"].items():
                     row["name"] = names.get(code) or row["name"]
@@ -2261,6 +2314,7 @@ class MarketScanService:
                     diagnostics["source"] = HKEX_CLOSE_SOURCE
                 missing = [code for code in missing if code not in bulk["rows"]
                            and code not in bulk["suspended"]]
+        deadline = min(deadline, self.monotonic() + HK_CLOSE_DAILY_BUDGET_SECONDS)
         for code in missing[:HK_CLOSE_DAILY_MAX_REQUESTS]:
             remaining = deadline - self.monotonic()
             if remaining <= 0:
